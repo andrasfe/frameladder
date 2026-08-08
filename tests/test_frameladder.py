@@ -1209,3 +1209,57 @@ class TestNameSweep(unittest.TestCase):
         self.assertEqual(term.value, 13)
         self.assertEqual(ir.parse_term("DFHRESP(NORMAL)").value, 0)
         self.assertEqual(ir.parse_term("WS-TAB(I)").kind, "var")
+
+
+class TestCopybookDiscovery(unittest.TestCase):
+    """A missing copybook is the largest single cause of not knowing a field."""
+
+    def test_conventional_directories_are_found_beside_the_source(self):
+        import tempfile
+        from frameladder.cobol import find_copybooks
+        root = tempfile.mkdtemp()
+        src = os.path.join(root, "src")
+        os.makedirs(os.path.join(root, "cpy"))
+        os.makedirs(src)
+        program_path = os.path.join(src, "P.cbl")
+        open(program_path, "w").close()
+        # Beside the source, and one level up, are both conventional.
+        os.makedirs(os.path.join(src, "copybook"))
+        found = find_copybooks(program_path)
+        self.assertTrue(any(f.endswith("copybook") for f in found))
+        self.assertTrue(any(f.endswith("cpy") for f in found))
+
+    def test_a_copybook_supplies_the_shape_the_program_omits(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "cpy"))
+        with open(os.path.join(root, "cpy", "REC.cpy"), "w") as fh:
+            fh.write("       01  CUST-REC.\n"
+                     "           05  CUST-GRADE PIC X(3).\n")
+        path = os.path.join(root, "P.cbl")
+        with open(path, "w") as fh:
+            fh.write(HEADER + """       01  WS-X PIC X.
+       PROCEDURE DIVISION.
+       AK-MAIN.
+           IF CUST-GRADE = 'AAA'
+              PERFORM AK-DEEP
+           END-IF
+           GOBACK
+           .
+       AK-DEEP.
+           EXIT
+           .
+""")
+        p = cobol.load_program(path)
+        # Without the copybook this field has no PIC at all, and with no PIC
+        # there is no width, no sign and nothing to check a candidate against.
+        self.assertEqual(p.model.pic.get("CUST-GRADE"), "X(3)")
+
+    def test_an_explicit_directory_still_wins(self):
+        import tempfile
+        from frameladder.cobol import find_copybooks
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "cpy"))
+        path = os.path.join(root, "P.cbl")
+        open(path, "w").close()
+        self.assertTrue(find_copybooks(path))

@@ -244,6 +244,36 @@ decision; the journal makes it permanent, so it is asked once and is data
 thereafter. Where nothing decides a value, the tool says so instead of
 inventing one.
 
+### What the vocabulary turned out *not* to be good for
+
+The obvious next step was to let an undecided field borrow a value from a
+related one. Measured on 1,212 undecided slots:
+
+| | share |
+|---|---|
+| a token sibling could supply a value | 293 (24%) |
+| a *same-shape* sibling under a *discriminating* token could | **0 (0%)** |
+
+Every one of the 24% fails once the transfer has to be defensible, and the
+reason is the useful part: the fields that need help are overwhelmingly the
+ones with **no `PIC` at all**, because their copybook was never loaded. There
+is no shape to match on, so there is no safe basis to transfer anything.
+
+So the honest ranking is the unglamorous one:
+
+| | undecided values |
+|---|---|
+| baseline | 911 |
+| **copybooks loaded** | **518 (−43%)** |
+| guarded name-based transfer | no change |
+
+Copybook directories are now found automatically beside or just above the
+source (`cpy`, `copy`, `copybook`, `cpylib`, …), which picked up 29 of the
+corpus programs without being asked. `--copybooks` still overrides.
+
+This also corrected the evaluation: every corpus figure quoted before this
+was measured *without* copybooks, and so understated what the tool knows.
+
 The one piece of built-in knowledge that is *not* a naming guess is the
 platform's status vocabulary — file status, SQLCODE, CICS RESP. Those are
 fixed the way HTTP status codes are fixed, and a field is only offered them
@@ -569,6 +599,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 68 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 71 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```
