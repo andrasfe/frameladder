@@ -8,7 +8,8 @@ from collections import deque
 from .conditions import CLASS_OP, CLASS_OP_NOT, condition_atoms
 from .faults import enrich_domain
 from .heuristics import preferred_value
-from .graph import build_graph, chain_via, execution_order, shortest_chain
+from .graph import (build_graph, chain_via, execution_order, shortest_chain,
+                    survival_atoms)
 from .ir import (Atom, Binding, Plan, Producer, Term, flip, holds,
                  negate_atom, parse_term)
 from .provenance import Provenance
@@ -293,6 +294,16 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     # condition at the target decision, so the run arrives with it settled
     # rather than left to whatever the defaults produce.
     atoms = [r for a in (extra or []) for r in _resolve_88(a, model)] + atoms
+
+    # Reaching a frame also means surviving everything performed before it.
+    survival = survival_atoms(program, path)
+    if survival and isinstance(survival[0], tuple) and survival[0][0] == "INFEASIBLE":
+        _, callee, caller, line = survival[0]
+        return Plan(target, [], [], [], [], [],
+                    [(None, "unreachable: %s at %s:%d always ends the run, and "
+                             "it is performed before the call to %s"
+                      % (callee, caller, line, target))], [], [])
+    atoms = atoms + [r for a in survival for r in _resolve_88(a, model)]
 
     bindings: list = []
     rendezvous: list = []

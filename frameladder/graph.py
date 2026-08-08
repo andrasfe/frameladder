@@ -288,6 +288,109 @@ def obligations_for_branch(program, paragraph: str, line: int,
     return found
 
 
+# Ways a paragraph ends the whole run, as opposed to merely ending itself.
+# GO TO is deliberately absent: inside a performed range it leaves the
+# paragraph, it does not stop the program.
+_ENDERS = {"GOBACK", "STOP", "EXIT_PROGRAM"}
+_ABEND_CALLS = {"CEE3ABD", "ILBOABN0", "ILBOABN", "CANCEL"}
+
+
+def _ends_run(stmt: dict) -> bool:
+    if stmt.get("type", "") in _ENDERS:
+        return True
+    if stmt.get("type", "") == "CALL":
+        target = norm(stmt.get("attributes", {}).get("target", "")).strip("'\" ")
+        return target.upper() in _ABEND_CALLS
+    return False
+
+
+def terminations(program, paragraph: str, seen=None) -> tuple[list, bool]:
+    """How this paragraph can stop the run: (guarded ways, stops_always).
+
+    Transitive, because a paragraph that performs a validator which abends on
+    bad input ends the run just as surely as if it abended itself.
+    """
+    seen = seen if seen is not None else set()
+    if paragraph in seen:
+        return [], False
+    seen.add(paragraph)
+    para = program.paragraph(paragraph)
+    if para is None:
+        return [], False
+
+    found: list = []
+    always = [False]
+
+    def visit(stmt, pname, own_guards, induction, literals):
+        if _ends_run(stmt):
+            if own_guards:
+                found.append(list(own_guards))
+            else:
+                always[0] = True
+            return
+        if stmt.get("type", "").startswith("PERFORM"):
+            callee = (stmt.get("attributes", {}).get("target") or "").strip()
+            if not callee or stmt.get("attributes", {}).get("condition"):
+                return
+            deeper, sub_always = terminations(program, callee, seen)
+            for guards in deeper:
+                found.append(list(own_guards) + guards)
+            if sub_always:
+                if own_guards:
+                    found.append(list(own_guards))
+                else:
+                    always[0] = True
+
+    walk_guarded(para, visit)
+    return found, always[0]
+
+
+def survival_atoms(program, path, limit: int = 24) -> list:
+    """What must hold for the run to still be alive at each step of a chain.
+
+    Reaching a frame is not only a matter of the guards on the calls that
+    lead to it. Everything performed *before* those calls has to have
+    returned. A batch program whose second act is `PERFORM 1100-OPEN-FILES`
+    and whose third is `PERFORM 2000-PROCESS` cannot reach the third at all
+    if the second abends, and no amount of solving the guards on 2000 will
+    say so - the ladder simply produces a plan that dies one paragraph
+    early and reports it as solved.
+
+    So for every earlier sibling call, each guarded way it could end the run
+    contributes the negation of that guard. An *un*guarded one is not an
+    obligation but a proof: nothing after it is reachable, and the caller
+    should hear that rather than a plan.
+
+    The obligations are capped. A program with many validators generates a
+    long tail of these, and past a point they stop discriminating and start
+    crowding out the guards that actually select the target - which is how
+    an earlier attempt at this over-produced and had to be reverted.
+    """
+    out: list = []
+    for site in path:
+        caller = program.paragraph(site.caller)
+        if caller is None:
+            continue
+        for stmt in caller.get("statements", []) or []:
+            line = stmt.get("line_start", 0)
+            if line >= site.line or not stmt.get("type", "").startswith("PERFORM"):
+                continue
+            callee = (stmt.get("attributes", {}).get("target") or "").strip()
+            if not callee or callee == site.callee:
+                continue
+            guarded, always = terminations(program, callee)
+            if always:
+                return [("INFEASIBLE", callee, site.caller, line)]
+            for guards in guarded:
+                # Surviving means not every conjunct held. Negating one is
+                # enough, and the first is the one the program itself tests.
+                for atom in negate_atom(guards[-1]):
+                    out.append(atom)
+                    if len(out) >= limit:
+                        return out
+    return out
+
+
 def build_graph(program) -> dict:
     """PERFORM and GO TO edges, plus the two COBOL-specific ones a naive
     graph misses.

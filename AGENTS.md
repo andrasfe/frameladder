@@ -174,20 +174,20 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 82.4%, range 50.0-97.6%.** Quote the median and the
+**28 programs, median 83.2%, range 50.0-98.5%.** Quote the median and the
 range.
 
-The lowest are now CSUTLDTC (50%, a date validator called only via its
-LINKAGE entry) and CBEXPORT (59.5%). Neither is a single defect any more;
-both need the survival obligation in item 1.
+The lowest are CSUTLDTC (50%, a date validator reached only through its
+LINKAGE entry, so the tool never calls it the way its callers do) and
+CORPT00C (65%).
 
 ## Open work, in the order I would take it
 
-1. **Surviving an earlier sibling call is not yet an obligation.** Reaching a
-   frame requires that paragraphs performed before it did not abend. A
-   prototype lifted exactly the right condition on CBACT01C, but the binding
-   layer misattributed the status and over-produced outcome sequences, so it
-   was reverted rather than shipped. Biggest single gap.
+1. ~~Surviving an earlier sibling call is not yet an obligation.~~ **Done**
+   (`graph.survival_atoms`). The earlier prototype over-produced; this one
+   caps the obligations and negates only the innermost conjunct, which was
+   the difference. An *un*guarded terminator is reported as a proof of
+   unreachability rather than turned into an obligation.
 2. **`--terminal` is per operation, not per invocation** — a program routing
    opens and reads through one subprogram cannot have both a succeeding open
    and an ending read.
