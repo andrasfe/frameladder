@@ -269,6 +269,22 @@ def obligations_for_branch(program, paragraph: str, line: int,
             found.extend(list(guards) + list(own))
 
     walk_guarded(para, visit)
+    if not found:
+        return found
+
+    # Reaching a statement means no earlier escape in the paragraph fired.
+    # CardDemo's edit paragraphs are a run of `IF bad → SET flag, GO TO EXIT`,
+    # so every decision after the first escape is unreachable unless that is
+    # said. The same computation already guards call sites; it was simply
+    # never applied to the decisions themselves.
+    own = {v for a in found for v in a.variables}
+    for escape_line, negation in _escapes(para):
+        if escape_line >= line:
+            continue
+        if own & {v for a in negation for v in a.variables}:
+            continue
+        own |= {v for a in negation for v in a.variables}
+        found.extend(negation)
     return found
 
 

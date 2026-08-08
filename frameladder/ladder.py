@@ -476,6 +476,29 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
             if op == "!=":
                 producer_key = prov.producer(var_term.name, at).op_key
                 domain = enrich_domain(var_term.name, model, domain, producer_key)
+            # A class condition constrains the *shape* of the value, so the
+            # PIC clause decides what satisfies it. It is settled here, ahead
+            # of `witness`, which has no notion of IS: it would compare
+            # against the word NUMERIC, return None, and the check below
+            # would skip the obligation entirely.
+            if op in (CLASS_OP, CLASS_OP_NOT):
+                shaped = preferred_value(var_term.name,
+                                         model.pic_of(var_term.name),
+                                         klass=str(const_term.value),
+                                         negated=(op == CLASS_OP_NOT))
+                if shaped is None:
+                    failures.append("no value satisfies %s" % candidate)
+                    continue
+                producer = prov.producer(var_term.name, at)
+                if bind(producer, shaped,
+                        "shape required by %s  [%s]" % (candidate,
+                                                        candidate.origin),
+                        atom=candidate, free=False):
+                    settled = True
+                    break
+                failures.append("conflicting binding for %s" % producer.slot)
+                continue
+
             value = witness(op, const_term, domain)
             if value is None:
                 failures.append("no witness value for %s" % candidate)
@@ -563,26 +586,6 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                     break
                 failures.append("literal %r fixed at %s contradicts it"
                                 % (producer.value, producer.site))
-                continue
-
-            # A class condition constrains the shape of the value, so the
-            # PIC clause decides what satisfies it; a plain witness would
-            # compare against the word NUMERIC and mean nothing.
-            if op in (CLASS_OP, CLASS_OP_NOT):
-                shaped = preferred_value(var_term.name,
-                                         model.pic_of(var_term.name),
-                                         klass=str(const_term.value),
-                                         negated=(op == CLASS_OP_NOT))
-                if shaped is None:
-                    failures.append("no value satisfies %s" % candidate)
-                    continue
-                producer = prov.producer(var_term.name, at)
-                if bind(producer, shaped,
-                        "shape required by %s  [%s]" % (candidate, candidate.origin),
-                        atom=candidate, free=False):
-                    settled = True
-                    break
-                failures.append("conflicting binding for %s" % producer.slot)
                 continue
 
             is_free = op != "="

@@ -137,6 +137,31 @@ anyone's estate. Where a bias direction is knowable, state it: the six
 largest programs average 79% free bindings against 55% for the rest, so the
 free-slot share is more likely understated here than overstated.
 
+## Derivation is not the whole answer
+
+The ladder derives; it does not sample. Those reach different things, and the
+gap is not small: on COACTUPC derived plans alone reach 61.2% of directions
+and literal sampling alone reaches 57.0%, but their **union is 69.8%** — each
+finds roughly a hundred directions the other never does.
+
+So `coverage --sample N` is a first-class part of the answer rather than a
+fallback. Derivation gets past guards that sampling would have to be lucky to
+hit; sampling reaches statements whose obligations the ladder cannot lift at
+all (unmodelled `COMPUTE`, `SEARCH` arms, reference modification). The
+directed-symbolic-execution literature reports the same shape, which is some
+comfort that this is a property of the problem and not of this code.
+
+Sampling saturates early — 100 draws gets within a point of 1,500 — so the
+default is small on purpose. Ranking it above `--routes` retries would be the
+wrong lesson: what makes the union work is that the two are uncorrelated.
+
+## Reporting honestly
+
+Paragraph coverage is close to free on this corpus: an empty state already
+enters 93 of COACTUPC's 99 paragraphs, because most are reached by
+fall-through rather than by a guard. **96/99 is not a result.** Direction
+coverage is the number that measures anything, and it is the one to quote.
+
 ## Open work, in the order I would take it
 
 1. **Surviving an earlier sibling call is not yet an obligation.** Reaching a

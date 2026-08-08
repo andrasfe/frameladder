@@ -114,9 +114,17 @@ class Interpreter:
         name = term.name
         if name in self.state:
             return self.state[name]
-        if name in self.model.initial:
-            return self.model.initial[name]
-        spec = (self.model.pic.get(name) or "").upper()
+        # A qualified reference names a declaration that is recorded under its
+        # base name, so reads have to see through the qualifier exactly as
+        # lookups elsewhere do - otherwise every write lands on one key, every
+        # read misses, and the condition is decided on a default.
+        found = self.model.look(self.state, name)
+        if found is not None:
+            return found
+        found = self.model.look(self.model.initial, name)
+        if found is not None:
+            return found
+        spec = (self.model.pic_of(name) or "").upper()
         return 0 if spec and "9" in spec and "X" not in spec else ""
 
     def evaluate(self, condition: str) -> bool:
@@ -449,6 +457,18 @@ class Interpreter:
     def _arithmetic(self, kind: str, stmt) -> None:
         import re
         text = norm(stmt.get("text", ""))
+        m = re.match(r"(?:ADD|SUBTRACT)\s+(\S+)\s+(?:TO|FROM)\s+(\S+)\s+"
+                     r"GIVING\s+([A-Z0-9-]+)", text, re.I)
+        if m:
+            a = self.value_of(parse_term(m.group(1)))
+            b = self.value_of(parse_term(m.group(2)))
+            try:
+                total = (float(a) + float(b) if text.upper().startswith("ADD")
+                         else float(b) - float(a))
+                self.assign(m.group(3), total)
+            except (TypeError, ValueError):
+                pass
+            return
         m = re.match(r"ADD\s+(\S+)\s+TO\s+([A-Z0-9-]+)", text, re.I)
         if m:
             a = self.value_of(parse_term(m.group(1)))

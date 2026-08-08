@@ -8,12 +8,18 @@ from typing import Any
 
 _LITERAL = re.compile(r"^'([^']*)'$|^\"([^\"]*)\"$|^([+-]?\d+(?:\.\d+)?)$")
 _SUBSCRIPTED = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s*\(([^)]*)\)$", re.I)
-_TARGET = re.compile(r"([A-Z0-9][A-Z0-9-]*)\s*(?:\(([^)]*)\))?", re.I)
+# A qualified reference is ONE name. Splitting `ACCT-ID OF MAPAI` on spaces
+# yields three targets, and writing to the group member `MAPAI` clobbers every
+# field of the map area for the sake of one screen field.
+_TARGET = re.compile(
+    r"([A-Z0-9][A-Z0-9-]*(?:\s+(?:OF|IN)\s+[A-Z0-9][A-Z0-9-]*)*)"
+    r"\s*(?:\(([^)]*)\))?", re.I)
 
 FIGURATIVE = {"ZERO": 0, "ZEROS": 0, "ZEROES": 0, "SPACE": " ", "SPACES": " ",
               "LOW-VALUE": "\x00", "LOW-VALUES": "\x00", "HIGH-VALUE": "\xff",
               "HIGH-VALUES": "\xff", "NULL": "", "NULLS": ""}
-NEGATE = {"=": "!=", "!=": "=", ">": "<=", "<=": ">", "<": ">=", ">=": "<"}
+NEGATE = {"=": "!=", "!=": "=", ">": "<=", "<=": ">", "<": ">=", ">=": "<",
+          "IS": "IS-NOT", "IS-NOT": "IS"}
 
 # CICS response and value constants. Platform vocabulary, fixed the way HTTP
 # status codes are - not an assumption about how anyone names anything.
@@ -141,12 +147,46 @@ def move_targets(text: str) -> list[str]:
     the subscript is a *read*, and counting it as a write invents a def-use
     edge that derails the whole provenance walk.
     """
-    return [m.group(1).upper() for m in _TARGET.finditer(norm(text))]
+    return [norm(m.group(1)).upper() for m in _TARGET.finditer(norm(text))]
+
+
+def class_holds(value: Any, klass: str) -> bool:
+    """A class condition asks about the *shape* of the bytes.
+
+    Without this the comparison table raises KeyError and the handler returns
+    True for both `IS` and `IS-NOT` - so every class test is true whichever
+    way it is asked, and neither direction can ever be planned for.
+    """
+    klass = (klass or "").upper()
+    text = "" if value is None else str(value)
+    if klass == "NUMERIC":
+        return text.strip() != "" and text.strip().lstrip("+-").isdigit()
+    if klass.startswith("ALPHABETIC"):
+        letters = [c for c in text if not c.isspace()]
+        if klass == "ALPHABETIC-LOWER":
+            return bool(letters) and all(c.islower() for c in letters)
+        if klass == "ALPHABETIC-UPPER":
+            return bool(letters) and all(c.isupper() for c in letters)
+        return bool(letters) and all(c.isalpha() for c in letters)
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return False
+    if klass == "POSITIVE":
+        return number > 0
+    if klass == "NEGATIVE":
+        return number < 0
+    if klass == "ZERO":
+        return number == 0
+    return False
 
 
 def holds(left: Any, op: str, right: Any) -> bool:
     """Compare the way COBOL would: mixed alphanumeric and numeric operands
     are reconciled rather than raising."""
+    if op in ("IS", "IS-NOT"):
+        result = class_holds(left, str(right))
+        return result if op == "IS" else not result
     try:
         if isinstance(left, str) != isinstance(right, str):
             try:

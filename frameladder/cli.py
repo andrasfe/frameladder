@@ -331,8 +331,9 @@ def cmd_coverage(args):
     from .interpreter import Interpreter
     from .ladder import analyse, build_family
     from .learned import Learned
+    from .provenance import Provenance
     from .conformance_defaults import io_defaults
-    analyse(program)
+    _graph, prov = analyse(program)
     entry = _entry(program, args)
     known = journal.bindings()
 
@@ -380,6 +381,24 @@ def cmd_coverage(args):
                 trace = run_plan(plan)
                 if trace is not None:
                     traces.append(trace)
+
+    if args.sample:
+        # Deliberate hybrid. Backward derivation reaches guards that sampling
+        # never will; sampling reaches statements whose obligations the ladder
+        # cannot lift at all. Measured on COACTUPC the two sets differ by
+        # ~100 directions each way, and the literature on directed symbolic
+        # execution reports the same: mixing beats either pure strategy.
+        import random
+        pool = {name: sorted(values, key=repr)
+                for name, values in prov.literals.items() if values}
+        rng = random.Random(args.seed)
+        for _ in range(args.sample):
+            state = {name: rng.choice(values) for name, values in pool.items()}
+            interp = Interpreter(program, state, defaults=io_defaults(program))
+            try:
+                traces.append(interp.run(entry))
+            except Exception:                                # noqa: BLE001
+                continue
 
     for target in program.paragraph_names[1:]:
         plans = []
@@ -779,6 +798,11 @@ def build_parser():
 
     cv = sub.add_parser("coverage", help="what a plan set exercises, and what "
                                         "it leaves untouched")
+    cv.add_argument("--sample", type=int, default=0,
+                    help="also run N states sampled from the program's own "
+                         "literals; complementary to the derived plans")
+    cv.add_argument("--seed", type=int, default=7,
+                    help="seed for --sample, so runs are reproducible")
     cv.add_argument("--routes", type=int, default=4,
                     help="alternative ways in to try when the chain itself "
                          "conflicts with the decision")
