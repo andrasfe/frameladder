@@ -1,0 +1,13 @@
+[project]
+name = "frameladder"
+version = "0.1.0"
+description = "Derive inputs that reach a deep target by lifting its obligations outwards along the call chain."
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+frameladder = "frameladder.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
