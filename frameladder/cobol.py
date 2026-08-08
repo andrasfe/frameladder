@@ -91,13 +91,44 @@ def _split_88_values(text: str) -> list:
     Since a level-88 is how COBOL names most of its states, that quietly
     disables a large share of them.
     """
-    out = []
+    out: list = []
+    pending_range = False
     for m in _88_VALUE.finditer(text or ""):
         token = m.group(0).strip()
-        if token.upper() in ("THRU", "THROUGH") or not token:
+        if not token:
             continue
-        out.append(token.rstrip("."))
+        if token.upper() in ("THRU", "THROUGH"):
+            pending_range = True
+            continue
+        token = token.rstrip(".")
+        if pending_range and out:
+            # `VALUES 1 THRU 12` names twelve states, not two. Keeping only
+            # the endpoints makes the condition-name false for every value in
+            # between - which is most of them - and setting it picks an
+            # endpoint that the program may never otherwise produce.
+            out.extend(_expand_range(out[-1], token))
+            pending_range = False
+            continue
+        out.append(token)
     return out
+
+
+# A range is enumerated so that everything downstream - the interpreter, SET,
+# and the ladder's choice of a value - keeps working on a plain list. Wide
+# ranges are left as their endpoints rather than blowing up the table.
+_RANGE_LIMIT = 1024
+
+
+def _expand_range(low: str, high: str) -> list:
+    def number(token):
+        try:
+            return int(token.strip("'\""))
+        except (TypeError, ValueError):
+            return None
+    a, b = number(low), number(high)
+    if a is None or b is None or not 0 <= b - a < _RANGE_LIMIT:
+        return [high]
+    return [str(v) for v in range(a + 1, b + 1)]
 
 
 _SELECT = re.compile(r"\bSELECT\s+(?:OPTIONAL\s+)?([A-Z0-9][A-Z0-9-]*)", re.I)

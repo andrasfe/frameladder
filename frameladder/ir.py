@@ -57,13 +57,26 @@ class Term:
     name: str = ""
     value: Any = None
     index: tuple = ()
+    # `WS-A(3:2)` names the same field as `WS-A` but a different two bytes of
+    # it, so the slice belongs to the reference and not to the declaration.
+    # Keeping `name` the bare field is what lets provenance, liveness and the
+    # ladder go on treating it as the field it is.
+    refmod: tuple = ()             # (start-expression, length-expression)
+    # An intrinsic is a function of its arguments, not a field called
+    # "FUNCTION TRIM(X)". `name` carries the first variable argument so the
+    # obligation still lands on something the harness can set.
+    func: str = ""
+    args: tuple = ()
 
     @property
     def key(self) -> str:
         if self.kind == "const":
             return repr(self.value)
+        if self.func:
+            return "%s(%s)" % (self.func, ",".join(a.key for a in self.args))
         return self.name + ("(%s)" % ",".join(str(i) for i in self.index)
-                            if self.index else "")
+                            if self.index else "") + (
+            "(%s:%s)" % self.refmod if self.refmod else "")
 
     def __str__(self) -> str:
         return self.key
@@ -116,6 +129,64 @@ def base_name(text: str) -> str:
     return m.group(1).strip().upper() if m else norm(text).upper()
 
 
+# An intrinsic call: `FUNCTION TRIM (WS-X)`, and the no-argument spellings
+# `FUNCTION CURRENT-DATE`. Read as a plain identifier the whole call becomes a
+# field nobody declares, whose value is therefore the empty default - so
+# `FUNCTION TEST-NUMVAL-C(X) = 0` is false however X is set, and that
+# direction cannot be planned or sampled into.
+_FUNCTION = re.compile(r"^FUNCTION\s+([A-Z][A-Z0-9-]*)\s*(\(.*\))?$", re.I)
+
+
+def _split_args(text: str) -> list:
+    """Top-level comma split, so `MOD(A, B)` is two arguments and
+    `TRIM(X(1:N))` is one."""
+    out, depth, buf = [], 0, []
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if ch == "," and depth == 0:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    out.append("".join(buf))
+    return [p.strip() for p in out if p.strip()]
+
+
+def _split_refmod(text: str):
+    """Split ``head ( start : length )`` into its parts, or None.
+
+    The head may be qualified (`TRNAMTI OF COTRN2AI`), which is why this
+    cannot be a single anchored regex on an identifier.
+    """
+    if not text.endswith(")"):
+        return None
+    depth = 0
+    for i in range(len(text) - 1, -1, -1):
+        depth += (text[i] == ")") - (text[i] == "(")
+        if depth == 0:
+            head, inside = text[:i].strip(), text[i + 1:-1]
+            if not head:
+                return None
+            parts = _split_top_colon(inside)
+            if len(parts) != 2:
+                return None
+            return head, parts[0].strip(), parts[1].strip()
+    return None
+
+
+def _split_top_colon(text: str) -> list:
+    out, depth, buf = [], 0, []
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if ch == ":" and depth == 0:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    out.append("".join(buf))
+    return out
+
+
 def parse_term(text: str) -> Term:
     text = norm(text).strip(".")
     while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):
@@ -141,6 +212,19 @@ def parse_term(text: str) -> Term:
     if m:
         return Term("const",
                     value=m.group(1) if m.group(1) is not None else m.group(2))
+    fn = _FUNCTION.match(text)
+    if fn:
+        raw = (fn.group(2) or "")[1:-1]
+        args = tuple(parse_term(a) for a in _split_args(raw))
+        carrier = next((a.name for a in args if a.kind == "var" and a.name), "")
+        return Term("var", name=carrier, func=fn.group(1).upper(), args=args)
+    slic = _split_refmod(text)
+    if slic and not _LITERAL.match(text):
+        head, start, length = slic
+        inner = parse_term(head)
+        if inner.kind == "var" and not inner.refmod:
+            return Term("var", name=inner.name, index=inner.index,
+                        refmod=(start, length))
     m = _LITERAL.match(text)
     if m:
         if m.group(3) is not None:
@@ -162,6 +246,82 @@ def parse_term(text: str) -> Term:
         return Term("var", name=head,
                     index=tuple(s.strip() for s in m.group(2).split(",")))
     return Term("var", name=upper)
+
+
+_ARITH_OPS = {"+", "-", "*", "/", "**"}
+
+
+def arith_tokens(text: str) -> list:
+    """Split an arithmetic expression into operands, operators and parens.
+
+    COBOL identifiers contain hyphens, so `WS-A - WS-B` and `WS-A-WS-B` are
+    different things and the language settles it with whitespace: an
+    arithmetic operator must stand alone.  Tokenising on that rule is what
+    keeps `ACCT-CURR-BAL` one name instead of three subtractions.
+    """
+    spaced = norm(text).replace("(", " ( ").replace(")", " ) ")
+    return [t for t in spaced.split(" ") if t]
+
+
+def is_arithmetic(text: str) -> bool:
+    """True when the text is an expression rather than a single operand."""
+    tokens = arith_tokens(text)
+    return any(t in _ARITH_OPS for t in tokens) and len(tokens) > 1
+
+
+def eval_arith(text: str, resolve) -> float:
+    """Evaluate an arithmetic expression, resolving operands through
+    `resolve`.  Raises ValueError when the text is not arithmetic."""
+    tokens = arith_tokens(text)
+    pos = [0]
+
+    def peek():
+        return tokens[pos[0]] if pos[0] < len(tokens) else ""
+
+    def take():
+        pos[0] += 1
+        return tokens[pos[0] - 1]
+
+    def primary():
+        token = take()
+        if token == "(":
+            value = expression()
+            if peek() == ")":
+                take()
+            return value
+        if token == "-":
+            return -primary()
+        if token == "+":
+            return primary()
+        return float(resolve(token))
+
+    def power():
+        value = primary()
+        while peek() == "**":
+            take()
+            value = value ** primary()
+        return value
+
+    def term():
+        value = power()
+        while peek() in ("*", "/"):
+            op = take()
+            other = power()
+            value = value * other if op == "*" else (value / other if other else 0.0)
+        return value
+
+    def expression():
+        value = term()
+        while peek() in ("+", "-"):
+            op = take()
+            other = term()
+            value = value + other if op == "+" else value - other
+        return value
+
+    result = expression()
+    if pos[0] != len(tokens):
+        raise ValueError("trailing tokens in %r" % text)
+    return result
 
 
 def move_targets(text: str) -> list[str]:

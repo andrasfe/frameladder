@@ -91,6 +91,14 @@ bound no state exposed it. If a branch settles an obligation, it either
 produced a binding or it appended to `open_obligations`. There is no third
 option, and a plan that claims to be solved is a claim someone will rely on.
 
+**Some of the coverage was phantom.** `X(2:8)`, `FUNCTION TRIM(X)` and
+`X NOT NUMERIC` all parsed as *variable names*, so the sampler set them
+directly and scored the directions they gated - 24 such pseudo-variables
+across the corpus. Correcting the parser removed that coverage; correcting
+value generation earned most of it back honestly. When a construct is
+unparsed, check whether it became a settable name before believing any
+number that depends on it.
+
 **Measure before building.** Several plausible features measured at zero and
 were not built: name-based sibling transfer (0% once guarded), prefix
 inheritance of witnesses (0%, because the chooser was already deterministic).
@@ -178,16 +186,30 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 84.7%, range 65.0-100%.** Quote the median and the
+**28 programs, median 86.0%, range 58.8-100%.** Quote the median and the
 range.
 
-The lowest is CORPT00C at 65%. CSUTLDTC, which sat at 50% for most of this
+The lowest is CORPT00C at 58.8%, and it went *down* when the interpreter
+learned `FUNCTION CURRENT-DATE`: the program does `ADD 1 TO
+WS-CURDATE-MONTH` and then tests `> 12`, which is reachable every December
+and unreachable against a fixed instant. Two directions there are now
+honestly out of reach rather than dishonestly counted. See open item 2. CSUTLDTC, which sat at 50% for most of this
 work, is at 100% -- its ten dead EVALUATE arms were all testing 88-levels
 whose VALUE was a hexadecimal literal the parser read as a variable name.
 
 ## Open work, in the order I would take it
 
-1. ~~Surviving an earlier sibling call is not yet an obligation.~~ **Done**
+1. **REDEFINES is never aliased at runtime** - an upper bound of 382
+   directions across 17 programs, the largest untouched item. Needs the
+   byte-level store that item 4 also calls for; doing it once brings MOVE
+   truncation and real subscripts with it.
+2. **The environment is not a planned input.** `FUNCTION CURRENT-DATE` is a
+   fixed instant, so every branch that depends on the date being a
+   particular month or day is unreachable rather than planned. It is a knob
+   like a file status, not a constant. Seeding it blindly into the sampler
+   measured at -2 (one more name dilutes every other draw), so it wants
+   deriving, not sampling.
+3. ~~Surviving an earlier sibling call is not yet an obligation.~~ **Done**
    (`graph.survival_atoms`). The earlier prototype over-produced; this one
    caps the obligations and negates only the innermost conjunct, which was
    the difference. An *un*guarded terminator is reported as a proof of

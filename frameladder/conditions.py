@@ -93,6 +93,11 @@ def expand_abbreviated(parts: list[str]) -> list[str]:
         if m and parse_term(m.group(1)).kind == "var":
             subject = (m.group(1).strip(), norm(m.group(2)))
             out.append(part)
+        elif m and subject and not norm(m.group(1)):
+            # Only the operator was repeated: `IF A > 5 AND < 10`. The
+            # relation is there but the subject is not, and reading the empty
+            # left side as a constant compares nothing against 10.
+            out.append("%s %s" % (subject[0], part))
         elif subject and not m:
             out.append("%s %s %s" % (subject[0], subject[1], part))
         else:
@@ -104,7 +109,13 @@ def expand_abbreviated(parts: list[str]) -> list[str]:
 # so it is not a relation and must be recognised before the relational
 # operators are tried - otherwise "IS NOT" matches and NUMERIC is read as a
 # value to compare against, which looks plausible and is nonsense.
-_CLASS = re.compile(r"^(.*?)\s+IS\s+(NOT\s+)?(NUMERIC|ALPHABETIC(?:-[A-Z]+)?|"
+# `IS` is optional in every one of these: `IF WS-X NOT NUMERIC` is as legal
+# as `IF WS-X IS NOT NUMERIC`, and CardDemo writes both. Requiring the word
+# leaves the short spelling to fall through to the relational parser, which
+# finds no operator and files the whole phrase as a condition-name - so the
+# test is false however the field is set, and one direction of it is
+# unreachable by construction.
+_CLASS = re.compile(r"^(.*?)\s+(?:IS\s+)?(NOT\s+)?(NUMERIC|ALPHABETIC(?:-[A-Z]+)?|"
                     r"POSITIVE|NEGATIVE|ZERO)\s*$", re.I)
 CLASS_OP = "IS"
 CLASS_OP_NOT = "IS-NOT"
@@ -114,12 +125,50 @@ def class_condition(text: str, negate: bool, origin: str):
     m = _CLASS.match(norm(text))
     if not m:
         return None
+    # Without `IS` the tail is ambiguous: `WS-X = ZERO` also ends in ZERO but
+    # is a comparison against the figurative constant. A subject that still
+    # contains a relational operator is that case, not a class test.
+    if not re.search(r"\bIS\b", norm(text), re.I) and _COMPARE.match(m.group(1)):
+        return None
     subject = parse_term(m.group(1))
     if subject.kind != "var":
         return None
     inverted = bool(m.group(2)) != negate
     return [[Atom(subject, CLASS_OP_NOT if inverted else CLASS_OP,
                   Term("const", value=m.group(3).upper()), origin)]]
+
+
+_WHEN_RANGE = re.compile(r"^(.+?)\s+(?:THRU|THROUGH)\s+(.+)$", re.I)
+_LEADING_RELATION = re.compile(
+    r"^\s*(" + "|".join(_relation_pattern(r) for r in _RELATIONS) + r")\s*(.*)$",
+    re.I)
+
+
+def when_condition(subject: str, value: str) -> str:
+    """The condition an EVALUATE arm stands for.
+
+    `WHEN 1 THRU 9` is a range and `WHEN > 10` is a relation with the subject
+    left out; pasted into ``subject = value`` both become a comparison
+    against a phrase, which is false for every value the subject can hold.
+    """
+    body = norm(value)
+    on_truth = norm(subject).upper() in ("TRUE", "FALSE")
+    negated = False
+    while body.upper().startswith("NOT ") and not on_truth:
+        body, negated = body[4:].strip(), not negated
+    m = _WHEN_RANGE.match(body)
+    if m and not on_truth:
+        text = "%s >= %s AND %s <= %s" % (subject, m.group(1).strip(),
+                                          subject, m.group(2).strip())
+        return "NOT (%s)" % text if negated else text
+    m = _LEADING_RELATION.match(body)
+    if m and m.group(2).strip() and not on_truth:
+        text = "%s %s %s" % (subject, norm(m.group(1)), m.group(2).strip())
+        return "NOT (%s)" % text if negated else text
+    if on_truth:
+        return norm(value)
+    text = "%s = %s" % (subject, body)
+    return "NOT (%s)" % text if negated else text
 
 
 def condition_atoms(condition: str, negate: bool = False,
@@ -178,7 +227,12 @@ def _condition_atoms(condition: str, negate: bool = False,
             out.extend(_condition_atoms(part, False, origin))
         return out
 
-    ands = split_top(text, "AND")
+    # The subject and the operator may be left out after AND just as after
+    # OR: `IF X NOT = '-' AND '+'` is two comparisons on X. Restoring them
+    # only for OR leaves the bare literal to be read as a condition-name,
+    # which is always false - so the conjunction is unsatisfiable and the
+    # true direction of the whole condition cannot be reached.
+    ands = expand_abbreviated(split_top(text, "AND"))
     if len(ands) > 1:
         if negate:                                   # NOT(A AND B) -> disjuncts
             out = []

@@ -131,6 +131,26 @@ def associate_field(name: str, candidates) -> str | None:
     return best if best_score >= 2 else None
 
 
+_CLASS_FILL = {"NUMERIC": "0", "ALPHABETIC": "A", "ALPHABETIC-UPPER": "A",
+               "ALPHABETIC-LOWER": "a", "POSITIVE": "1", "NEGATIVE": "1",
+               "ZERO": "0"}
+
+
+def _slice_text(value, length: int, violate: bool = False) -> str:
+    """The bytes one slice constraint asks for, or bytes that break it."""
+    if isinstance(value, str) and value.upper() in _CLASS_FILL:
+        fill = _CLASS_FILL[value.upper()]
+        return ("*" if fill.isdigit() else "9") * length if violate \
+            else fill * length
+    text = (value if isinstance(value, str)
+            else str(value)).ljust(length)[:length]
+    if not violate:
+        return text
+    # Anything that is not what the program asked for. A character it can
+    # never have been compared against is the safest choice.
+    return "".join("#" if c != "#" else "~" for c in text)
+
+
 class Provenance:
     def __init__(self, program, order: dict | None = None):
         self.program = program
@@ -141,6 +161,7 @@ class Provenance:
         self.call_literals: dict = {}   # op_key -> literals set before each call
         self.selectors: dict = {}       # op_key -> discriminating fields
         self.literals: dict = {}        # var -> literals it is compared against
+        self.slices: dict = {}          # var -> (start, length, value) facts
         self.payloads: set = set()
         self.operations: dict = {}      # paragraph -> external ops performed
         self._index()
@@ -269,24 +290,69 @@ class Provenance:
                                    if len(vs) > 1 or len(sites) == 1}
 
     def _harvest_literals(self):
+        from .ir import norm as _norm
+
+        def take(text):
+            """Every literal a condition compares a field against."""
+            if not text:
+                return
+            for alts in condition_atoms(text):
+                for atom in alts:
+                    # `IS NUMERIC` says what shape the value has, not what it
+                    # is. Filing "NUMERIC" as a candidate value hands the
+                    # sampler a string that satisfies nothing and crowds out
+                    # the literals that would.
+                    if atom.op in ("IS", "IS-NOT"):
+                        if atom.lhs.kind == "var" and atom.lhs.refmod:
+                            self._record_slice(atom.lhs, atom.rhs.value)
+                        elif atom.lhs.kind == "var":
+                            self._class_candidates(atom.lhs.name,
+                                                   str(atom.rhs.value))
+                        continue
+                    # `FUNCTION LENGTH(FUNCTION TRIM(X)) = 0` says X is blank,
+                    # and `FUNCTION TEST-NUMVAL-C(X) = 0` says it is a number,
+                    # but neither puts a literal anywhere the harvest can see
+                    # it. The field is left with no candidate that answers the
+                    # question the program is asking about it.
+                    for side in (atom.lhs, atom.rhs):
+                        if side.kind == "var" and side.func and side.name:
+                            self._function_candidates(side)
+                    for a, b in ((atom.lhs, atom.rhs), (atom.rhs, atom.lhs)):
+                        if a.kind == "var" and b.kind == "const":
+                            self.literals.setdefault(a.name, set()).add(b.value)
+                            if a.refmod:
+                                self._record_slice(a, b.value)
+
         def scan(stmt):
             attrs = stmt.get("attributes", {})
             for text in (attrs.get("condition"), attrs.get("varying"),
                          attrs.get("until")):
-                if not text:
-                    continue
-                for alts in condition_atoms(text):
-                    for atom in alts:
-                        for a, b in ((atom.lhs, atom.rhs), (atom.rhs, atom.lhs)):
-                            if a.kind == "var" and b.kind == "const":
-                                self.literals.setdefault(a.name, set()).add(b.value)
+                take(text)
             if stmt.get("type") == "EVALUATE":
                 subject = parse_term(attrs.get("subject", ""))
+                # `EVALUATE TRUE / WHEN <relation>` is how COBOL writes a
+                # chain of ifs, and the arm is a whole condition rather than a
+                # value to match the subject against. Filing its literals
+                # under a field called TRUE leaves the fields the arms
+                # actually test with no candidate values at all - which is
+                # most of the validation logic in a screen program.
+                on_truth = _norm(attrs.get("subject", "")).upper() in ("TRUE",
+                                                                       "FALSE")
                 for child in stmt.get("children") or []:
-                    if child.get("type") == "WHEN" and subject.kind == "var":
-                        val = parse_term(child.get("attributes", {}).get("value", ""))
+                    if child.get("type") != "WHEN":
+                        continue
+                    raw = child.get("attributes", {}).get("value", "")
+                    if _norm(raw).upper() in ("OTHER", "ANY"):
+                        continue
+                    if on_truth:
+                        take(raw)
+                    elif subject.kind == "var":
+                        val = parse_term(raw)
                         if val.kind == "const":
-                            self.literals.setdefault(subject.name, set()).add(val.value)
+                            self.literals.setdefault(subject.name,
+                                                     set()).add(val.value)
+                        else:
+                            take("%s = %s" % (attrs.get("subject", ""), raw))
             for child in stmt.get("children") or []:
                 scan(child)
 
@@ -298,6 +364,110 @@ class Provenance:
                 term = parse_term(v)
                 if term.kind == "const":
                     self.literals.setdefault(parent.upper(), set()).add(term.value)
+        # Offering `FUNCTION CURRENT-DATE` to the sampler as well was tried
+        # and measured at -2 directions across the corpus: one more name in
+        # the pool dilutes every other draw more than the December date buys.
+        # The slot stays settable by the harness; it is just not sampled.
+        self._compose_sliced()
+
+    def _field_width(self, name: str) -> int:
+        from .layout import byte_length
+        pic = self.model.pic_of(name)
+        if not pic:
+            return 0
+        try:
+            return byte_length(pic, self.model.usage_of(name),
+                               self.model.look(self.model.sign, name, ""))
+        except Exception:                                        # noqa: BLE001
+            return 0
+
+    def _class_candidates(self, name: str, klass: str) -> None:
+        """A class condition names a shape, so offer a value of that shape.
+
+        `IF WS-X IS NUMERIC` compares against nothing, so nothing about it
+        reaches the literal table and a sampler drawing from literals can
+        only ever take the direction the field's default happens to give.
+        Both a member and a non-member of the class make both directions
+        reachable.
+        """
+        width = self._field_width(name) or 1
+        if width > 64:
+            width = 64
+        klass = (klass or "").upper()
+        pool = self.literals.setdefault(name, set())
+        if klass == "NUMERIC":
+            pool.update({"0" * width, "*" * width, " " * width})
+        elif klass.startswith("ALPHABETIC"):
+            lower = klass.endswith("LOWER")
+            pool.update({("a" if lower else "A") * width, "0" * width})
+        elif klass in ("POSITIVE", "NEGATIVE", "ZERO"):
+            pool.update({0, 1, -1})
+
+    def _function_candidates(self, term) -> None:
+        """Values that make an intrinsic go each way, for its argument."""
+        width = self._field_width(term.name) or 1
+        if width > 64:
+            width = 64
+        pool = self.literals.setdefault(term.name, set())
+        if term.func in ("TRIM", "LENGTH", "UPPER-CASE", "LOWER-CASE"):
+            pool.update({" " * width, "A" * width})
+        elif term.func in ("NUMVAL", "NUMVAL-C", "TEST-NUMVAL",
+                           "TEST-NUMVAL-C"):
+            pool.update({"0" * width, "*" * width, " " * width})
+        for arg in term.args:
+            if arg.kind == "var" and arg.func:
+                self._function_candidates(arg)
+
+    def _record_slice(self, term, value) -> None:
+        """Remember what the program says about one slice of a field."""
+        try:
+            start = int(str(term.refmod[0]).strip())
+            length = int(str(term.refmod[1]).strip()) if term.refmod[1] else 1
+        except (TypeError, ValueError):
+            return
+        if start < 1 or length < 1 or start + length > 256:
+            return
+        self.slices.setdefault(term.name, []).append((start, length, value))
+
+    def _compose_sliced(self) -> None:
+        """Build whole-field candidates out of what the slices require.
+
+        A field the program only ever inspects a piece at a time - a date as
+        ``(1:4)`` numeric, ``(5:1) = '-'``, ``(6:2)`` numeric - has no literal
+        of its own anywhere in the source, so a sampler drawing from observed
+        literals can never produce one that gets past the format check. The
+        pieces, laid at the offsets the program names them at, compose exactly
+        the value it is asking for.
+        """
+        from .layout import byte_length
+        for name, pieces in self.slices.items():
+            width = 0
+            pic = self.model.pic_of(name)
+            if pic:
+                try:
+                    width = byte_length(pic, self.model.usage_of(name),
+                                        self.model.look(self.model.sign, name, ""))
+                except Exception:                                # noqa: BLE001
+                    width = 0
+            width = max([width] + [s + n - 1 for s, n, _ in pieces])
+            if width > 256:
+                continue
+            unique = list(dict.fromkeys(pieces))
+            # The satisfying composition, then one variant per slice that
+            # breaks *only* that slice. A validation paragraph is a chain of
+            # arms, each testing one piece, and an arm is only evaluated when
+            # every earlier one failed - so reaching the k-th arm's true
+            # direction needs a value that is right everywhere before k and
+            # wrong at k. n+1 candidates is exactly that ladder.
+            for broken in [None] + list(range(len(unique))):
+                for filler in ("0", " "):
+                    body = [filler] * width
+                    for i, (start, length, value) in enumerate(unique):
+                        text = _slice_text(value, length, violate=(i == broken))
+                        body[start - 1:start - 1 + length] = list(text[:length])
+                    self.literals.setdefault(name, set()).add("".join(body))
+                    if broken is None:
+                        break
 
     # -- lookups -----------------------------------------------------------
     def _rank(self, para: str) -> int:

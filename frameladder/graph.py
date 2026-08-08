@@ -6,7 +6,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 
-from .conditions import condition_atoms
+from .conditions import condition_atoms, when_condition
 from .ir import Atom, Term, move_targets, negate_atom, norm, parse_term
 
 _VARYING = re.compile(
@@ -82,9 +82,9 @@ def _after_earlier_arms(stmt: dict, subject: str, siblings, origin: str) -> list
                                    origin)
             out.extend(alts[0] if alts else [])
         else:
-            subj = Term("var", name=parse_term(subject).name)
-            for alt in value.split(" OR "):
-                out.append(Atom(subj, "!=", parse_term(alt), origin))
+            alts = condition_atoms(when_condition(subject, value), True,
+                                   origin)
+            out.extend(alts[0] if alts else [])
     return out
 
 
@@ -120,14 +120,16 @@ def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
             sv = norm(sib.get("attributes", {}).get("value", ""))
             if sib is stmt or sv.upper() in ("OTHER", "ANY") or not sv:
                 continue
-            for alt in sv.split(" OR "):
-                out.append(Atom(subj, "!=", parse_term(alt), origin))
+            branch = condition_atoms(when_condition(subject, sv), True, origin)
+            out.extend(branch[0] if branch else [])
         return out
-    alts = [Atom(subj, "=", parse_term(alt), origin) for alt in value.split(" OR ")]
-    if not alts:
+    # `WHEN 1 THRU 9` and `WHEN > 10` are a range and a relation, not values
+    # to compare the subject against; rendering them as `subject = <phrase>`
+    # invents a field named after the phrase and the arm becomes unplannable.
+    own = first_with_alternatives(
+        condition_atoms(when_condition(subject, value), False, origin))
+    if not own:
         return []
-    head = alts[0]
-    own = [Atom(head.lhs, head.op, head.rhs, head.origin, tuple(alts[1:]))]
     return own + _after_earlier_arms(stmt, subject, siblings, origin)
 
 
