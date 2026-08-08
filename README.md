@@ -487,6 +487,151 @@ a paragraph built from 39 replaced copies contributes only the branches
 written inline. The denominator is therefore understated wherever that idiom
 is used, and real coverage of those programs is lower than reported.
 
+## Runbook: synthetic data for a migration you have already built
+
+The common situation. The COBOL compiles, its externals are mocked, a Java
+program has been generated — and there is nothing to *run* either side on.
+That is what this section is for. It assumes you have the COBOL source and
+its copybooks and nothing else from this repository.
+
+### What you get, and in what shape
+
+One command per target produces a test case as JSON:
+
+```bash
+frameladder PROG.cbl --copybooks ./cpy --json plan 3000-VALIDATE > tc.json
+```
+
+Four fields matter, and they map onto the three things a test needs.
+
+| field | what it is | drive it into |
+|---|---|---|
+| `input_state` | program inputs: `{"FIELD": value}`, keys upper-case | the entry state on both sides |
+| `stub_plan` | `{op_key: [{when, set, seq}, …]}` — what each external operation returns, **in order** | your mocks |
+| `terminals` | `{op_key: {field: value}}` — what it returns once the planned outcomes run out | your mocks' fallback |
+| `open` | obligations it could **not** solve | read this before trusting the case |
+
+`op_key` is the operation identity, and it is stable across both sides:
+`READ:ACCTFILE-FILE`, `OPEN-INPUT:ACCTFILE-FILE`, `CALL:CBLTDLI`,
+`EXEC:SQL:SELECT`, `EXEC:CICS:READ`. Mode is part of it — opening a missing
+file for input fails where opening it for output creates it — so key your
+mocks on the same string and the two sides stay aligned.
+
+The sequence is not decoration. A file read returns a record, then another,
+then end-of-file; `seq` carries that order and `terminals` says how it ends.
+A mock that returns one fixed status describes a file that never ends, and
+the run will loop instead of finishing.
+
+`flat_state` is a convenience view — every binding as one map, first outcome
+only. Use it for a quick smoke test; use `stub_plan` for anything real,
+because a flat map cannot express a sequence.
+
+**Always check `open` and `solved`.** A plan with unmet obligations is still
+useful — it says exactly what it could not arrange — but it is not a test
+case yet. `sweep` does all targets at once and reports which ones verified.
+
+### The part that is specific to parity
+
+A binding is **forced** when the program's logic fixes the value, and **free**
+when it only fixed a relationship (`A = B`, `A NOT = B`, `A > B`). Only free
+slots may be varied — vary a forced one and you change which path runs, so
+the test stops reaching its target and proves nothing.
+
+That distinction is what makes divergence probing sound, and `family` spends
+it:
+
+```bash
+frameladder PROG.cbl --copybooks ./cpy --json family 3000-VALIDATE
+```
+
+Each member varies **one** free slot, so a failure is attributable to one
+value, and the set is capped (12 by default) so it stays linear in the
+number of slots rather than exponential.
+
+Which categories you actually get depends on the slot: its PIC decides
+whether the numeric or the alphanumeric list applies, and the *operator*
+decides whether ordering-sensitive ones apply at all. A plan with ten free
+text slots and no ordering constraint yields ten `spaces` variants and
+nothing more exotic — that is the common case, and it is worth knowing
+before you go looking for the interesting ones. The categories are chosen
+because real ports get them wrong:
+
+- **truncation** — COBOL truncates on both kinds of `MOVE` and in opposite
+  directions. Alphanumeric is left-aligned, so the tail is lost; numeric
+  aligns on the decimal point, so `MOVE 12345 TO PIC 9(2)` leaves **45**. A
+  Java port that models a field as `String` or as `int` loses exactly one of
+  those, silently.
+- **collation** — z/OS is EBCDIC and your target is ASCII, and they disagree
+  on ordering for exactly three class pairs: digit/upper, digit/lower,
+  upper/lower. An ordering constraint witnessed by two values from the same
+  class holds on both platforms and proves nothing; one witnessed *across* a
+  class boundary flips. Verified against GnuCOBOL under both sequences, not
+  assumed. **Only emitted for `<`/`>`/`<=`/`>=` on a text field** — if your
+  program compares such fields for ordering, this is the highest-value
+  family in the list; if it does not, you will never see one.
+- **figurative constants** — `SPACES`, `LOW-VALUES` and `HIGH-VALUES` are
+  three distinct states that a port usually collapses into one.
+- **width and sign** — a value one byte too long, a signed field at its
+  negative maximum, minus zero (equal arithmetically, different bytes).
+
+If you only take one thing from this section: truncation and collation are
+where a generated Java program actually diverges, and both cost nothing to
+generate once a plan exists. Truncation you can also probe directly without
+`family` — take any forced binding, widen the value past the receiving
+field's PIC, and check both sides agree on what survives.
+
+### What to expect
+
+Measured on 55 programs, and the split is sharp:
+
+| | branch directions covered |
+|---|---|
+| batch / file-driven | 88–100% |
+| CICS / screen / commarea-driven | 6–70% |
+
+Batch programs are the tool's strong case: the entry state plus the stub
+sequence really do determine the path. Long CICS transactions are the weak
+one, because a plan must survive the program's own writes all the way to the
+target and over a deep chain it often does not. Expect to hand the stubborn
+targets to an agent (see [`AGENT.md`](AGENT.md)) rather than to get them for
+free.
+
+### Things that will bite, in the order they will bite you
+
+1. **Pass `--copybooks` explicitly.** Automatic discovery only looks beside
+   the source and one directory up. On a deeper tree it silently finds
+   nothing, and a field with no copybook has no PIC — so no width, no sign,
+   no 88-levels, and no candidate values. It does not error; coverage is
+   just quietly worse. This is the most common silent failure.
+2. **Runtime scales with decisions, not lines.** Roughly one branch per ten
+   lines, and `coverage --branches` runs every direction in three I/O worlds
+   with overlays. On a large program start with `--sample 0 --overlays 0`
+   for a fast structural read, then add them back.
+3. **Constructs that are not modelled**, so anything gated behind them will
+   not be planned: `SEARCH`/`SEARCH ALL`, `REDEFINES` aliasing, `OCCURS`
+   indexing (subscripts are flattened — `T(1)` and `T(2)` are one cell),
+   `INSPECT`, `SORT`/`MERGE` with `INPUT`/`OUTPUT PROCEDURE` (no call edges,
+   so the procedures look unreachable), and nested programs (`LINKAGE
+   SECTION` is parsed as a paragraph). `python3 -m conformance.microdiff`
+   prints the current list, measured against GnuCOBOL.
+4. **Record layout is a module, not a command.** `layout.py` gives byte
+   offsets and exact lengths (19/19 against GnuCOBOL) if you need to write
+   real fixed-width data files rather than field maps. Import it.
+
+### First twenty minutes
+
+```bash
+frameladder PROG.cbl --copybooks ./cpy frames          # does it parse; how deep
+frameladder PROG.cbl --copybooks ./cpy --json sweep    # every target, planned and verified
+frameladder PROG.cbl --copybooks ./cpy crossroads TARGET  # what that route needs from outside
+python3 -m conformance.microdiff                       # which constructs are still wrong
+```
+
+`frames` tells you it read the program. `sweep` tells you how much of it is
+plannable, and is the one to run first on anything unfamiliar. `crossroads`
+takes a target and tells you which external operations you must control to
+reach it — exactly the list your mocks have to satisfy.
+
 ## Agent-assisted
 
 The derivation is deterministic and needs no model. Where it runs out — the
