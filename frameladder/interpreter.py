@@ -289,6 +289,17 @@ class Interpreter:
                                condition, result, self._snapshot(condition),
                                arm.get("ordinal", -1)))
                 if result:
+                    # An earlier arm matching is exactly how WHEN OTHER goes
+                    # the other way. Without recording it, OTHER only ever
+                    # reports True and its False direction is uncoverable by
+                    # construction - it sits in the denominator for good.
+                    for rest in arms:
+                        if norm(rest.get("attributes", {}).get("value", "")
+                                ).upper() in ("OTHER", "ANY"):
+                            self.trace.guards.append(
+                                GuardEvent(para, rest.get("line_start", line),
+                                           "WHEN", "OTHER", False, {},
+                                           rest.get("ordinal", -1)))
                     self.block(arm.get("children") or [], para, depth)
                     return
             for arm in arms:

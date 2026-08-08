@@ -176,9 +176,32 @@ class Provenance:
                 elif kind == "SET":
                     name = attrs.get("name")
                     if name:
-                        self._add(name, Writer(pname, line, "SET",
-                                               source=attrs.get("value", ""),
-                                               guards=tuple(guards)))
+                        # `SET FLG-ACCT-VALID TO TRUE` writes the *parent*
+                        # field, not a field called FLG-ACCT-VALID - there is
+                        # no such storage. Recorded against the condition-name
+                        # the write is invisible: nothing appears to write the
+                        # parent, so the ladder concludes the field is never
+                        # assigned and emits a false infeasibility proof for
+                        # any obligation on it. The interpreter already
+                        # resolves 88s to the parent, so leaving this alone
+                        # also puts provenance and execution at odds about
+                        # the same program.
+                        entry = self.model.condition_names.get(name.upper())
+                        target, value = name, attrs.get("value", "")
+                        if entry:
+                            parent, values = entry
+                            target = parent
+                            # TO TRUE means "any of its values"; the first is
+                            # the conventional witness. TO FALSE names no
+                            # value at all, so the source stays empty and the
+                            # writer records only that the field is touched.
+                            if norm(value).upper() != "FALSE" and values:
+                                value = values[0]
+                            else:
+                                value = ""
+                        self._add(target, Writer(pname, line, "SET",
+                                                 source=value,
+                                                 guards=tuple(guards)))
 
                 elif kind in STUB_KINDS:
                     key = op_key(text)
