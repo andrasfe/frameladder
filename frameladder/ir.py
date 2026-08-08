@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 _LITERAL = re.compile(r"^'([^']*)'$|^\"([^\"]*)\"$|^([+-]?\d+(?:\.\d+)?)$")
+# X'0A1B' - hexadecimal, two digits per byte.
+_HEX_LITERAL = re.compile(r"^[Xx]'([0-9A-Fa-f]*)'$|^[Xx]\"([0-9A-Fa-f]*)\"$")
+# Z'..' (null-terminated) and N'..' (national) are ordinary literals wearing
+# a prefix; without this they parse as a variable called Z or N.
+_QUOTED_PREFIXED = re.compile(r"^[ZzNn]'([^']*)'$|^[ZzNn]\"([^\"]*)\"$")
 _SUBSCRIPTED = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s*\(([^)]*)\)$", re.I)
 # A qualified reference is ONE name. Splitting `ACCT-ID OF MAPAI` on spaces
 # yields three targets, and writing to the group member `MAPAI` clobbers every
@@ -117,6 +122,25 @@ def parse_term(text: str) -> Term:
         text = text[1:-1].strip()
     if not text:
         return Term("const", value="")
+    # A hexadecimal literal is a constant, and reading it as a name is worse
+    # than merely losing it: `88 FC-INVALID-DATE VALUE X'00...'` becomes a
+    # condition-name whose value is a variable nobody writes, so every arm
+    # testing it is dead and the obligation on it can never be met. Z'..' is
+    # the null-terminated form and N'..' the national one; both are still
+    # literals whatever their encoding.
+    m = _HEX_LITERAL.match(text)
+    if m:
+        digits = m.group(1) if m.group(1) is not None else m.group(2)
+        if len(digits) % 2 == 0:
+            try:
+                return Term("const",
+                            value=bytes.fromhex(digits).decode("latin-1"))
+            except ValueError:
+                pass
+    m = _QUOTED_PREFIXED.match(text)
+    if m:
+        return Term("const",
+                    value=m.group(1) if m.group(1) is not None else m.group(2))
     m = _LITERAL.match(text)
     if m:
         if m.group(3) is not None:

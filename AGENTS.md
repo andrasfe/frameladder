@@ -129,6 +129,10 @@ leaves the corpus figure flat, say so and say why it cannot show up there.
   anything else, so instrumentation has to skip them.
 - **Order is meaning.** Passing a `set` where a ranked list is expected
   silently re-sorts by `repr` — that is how `'02'` beat end-of-file 174 times.
+- **A literal can wear a prefix.** `X'0A1B'` is hexadecimal, `Z'..'` is
+  null-terminated, `N'..'` is national. Parsed as names they become
+  variables nobody writes, so every condition testing one is permanently
+  false - which is exactly how CSUTLDTC sat at 50% with ten dead arms.
 - **Copybooks: read what is `COPY`ed.** Loading the directory gave CBACT04C
   2,640 fields instead of 129, inflating the `declared` set that live-in
   filtering and record association depend on.
@@ -174,12 +178,12 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 83.2%, range 50.0-98.5%.** Quote the median and the
+**28 programs, median 84.7%, range 65.0-100%.** Quote the median and the
 range.
 
-The lowest are CSUTLDTC (50%, a date validator reached only through its
-LINKAGE entry, so the tool never calls it the way its callers do) and
-CORPT00C (65%).
+The lowest is CORPT00C at 65%. CSUTLDTC, which sat at 50% for most of this
+work, is at 100% -- its ten dead EVALUATE arms were all testing 88-levels
+whose VALUE was a hexadecimal literal the parser read as a variable name.
 
 ## Open work, in the order I would take it
 
