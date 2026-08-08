@@ -1567,3 +1567,71 @@ class TestFirstMatch(unittest.TestCase):
         entered = Interpreter(p, plan.flat_state()).run("AR-MAIN").entered_set
         self.assertIn("AR-SECOND", entered, "the second arm must actually run")
         self.assertNotIn("AR-FIRST", entered, "and the first must not")
+
+
+class TestCopyExpansion(unittest.TestCase):
+    """COPY ... REPLACING is how one copybook becomes many paragraphs."""
+
+    def _program_with_copybook(self, member: str, body: str, main: str):
+        import tempfile
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "cpy"))
+        with open(os.path.join(root, "cpy", member + ".cpy"), "w") as fh:
+            fh.write(body)
+        path = os.path.join(root, "P.cbl")
+        with open(path, "w") as fh:
+            fh.write(main)
+        return cobol.load_program(path)
+
+    def test_replacing_produces_real_branches(self):
+        from frameladder.coverage import branches_of
+        p = self._program_with_copybook(
+            "CHK",
+            "           IF FLG-(NAME1)-BAD\n"
+            "              CONTINUE\n"
+            "           END-IF\n",
+            HEADER + """       01  WS-X PIC X.
+       PROCEDURE DIVISION.
+       AS-MAIN.
+           COPY CHK REPLACING ==(NAME1)== BY ==ALPHA==.
+           COPY CHK REPLACING ==(NAME1)== BY ==BETA==.
+           GOBACK
+           .
+""")
+        conditions = [b.condition for b in branches_of(p)]
+        # Unexpanded, this paragraph has no branches at all and the coverage
+        # denominator silently understates the program.
+        self.assertIn("FLG-ALPHA-BAD", " ".join(conditions))
+        self.assertIn("FLG-BETA-BAD", " ".join(conditions))
+        self.assertEqual(len(conditions), 2)
+
+    def test_an_unresolvable_copy_is_dropped_not_guessed(self):
+        p = program(HEADER + """       01  WS-X PIC X.
+       PROCEDURE DIVISION.
+       AT-MAIN.
+           COPY NOSUCHMEMBER.
+           GOBACK
+           .
+""")
+        self.assertIn("AT-MAIN", p.paragraph_names)
+
+
+class TestFigurativeValues(unittest.TestCase):
+    def test_value_low_values_is_not_the_word(self):
+        # `VALUE LOW-VALUES` names a figurative constant. Storing the ten
+        # letters makes every later comparison against it wrong - and wrong
+        # in the flattering direction, since conditions start matching that
+        # should not.
+        p = program(HEADER + """       01  WS-A PIC X(4) VALUE LOW-VALUES.
+       01  WS-B PIC X(4) VALUE SPACES.
+       01  WS-C PIC 9(2) VALUE ZERO.
+       01  WS-D PIC X(2) VALUE 'AB'.
+       PROCEDURE DIVISION.
+       AU-MAIN.
+           GOBACK
+           .
+""")
+        self.assertEqual(p.model.initial["WS-A"], "\x00")
+        self.assertEqual(p.model.initial["WS-B"], " ")
+        self.assertEqual(p.model.initial["WS-C"], 0)
+        self.assertEqual(p.model.initial["WS-D"], "AB")

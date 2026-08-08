@@ -364,15 +364,15 @@ def cmd_coverage(args):
     if args.branches:
         # One plan per decision *direction*, which is what the metric counts.
         from .coverage import branches_of
-        from .graph import obligations_for_branch
+        from .ladder import plan_for_branch
         for b in branches_of(program):
             for direction in (True, False):
-                extra = obligations_for_branch(program, b.paragraph, b.line,
-                                               direction)
                 try:
-                    plan = build_plan(program, b.paragraph, entry=args.entry,
-                                      agent_bindings=known, extra=extra,
-                                      preferred=warm)
+                    plan = plan_for_branch(program, b.paragraph, b.line,
+                                           direction, entry=args.entry,
+                                           agent_bindings=known,
+                                           preferred=warm,
+                                           max_routes=args.routes)
                 except Exception:                            # noqa: BLE001
                     continue
                 if not plan.chain:
@@ -779,6 +779,9 @@ def build_parser():
 
     cv = sub.add_parser("coverage", help="what a plan set exercises, and what "
                                         "it leaves untouched")
+    cv.add_argument("--routes", type=int, default=4,
+                    help="alternative ways in to try when the chain itself "
+                         "conflicts with the decision")
     cv.add_argument("--learn", metavar="FILE",
                     help="record values that covered something, and reuse them")
     cv.add_argument("--branches", action="store_true",

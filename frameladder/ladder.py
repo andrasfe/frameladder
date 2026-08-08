@@ -641,3 +641,61 @@ def build_family(program, target: str, *, entry: str | None = None, via=(),
             break
         queues = still
     return out
+
+
+def plan_for_branch(program, paragraph: str, line: int, direction: bool, *,
+                    entry: str | None = None, agent_bindings: dict | None = None,
+                    preferred: dict | None = None, max_routes: int = 4):
+    """A plan that makes one decision go a particular way.
+
+    The shortest route to a paragraph is not always a route on which the
+    decision inside it can go the way you want: a guard on the way in may
+    already have settled one of the variables the decision needs. That is a
+    conflict with the *chain*, not with the program, and another way in may
+    have no opinion about it - so when the obligations come back contested,
+    the other ways in are tried before giving up.
+    """
+    from .dependencies import route_options
+    from .graph import build_graph, obligations_for_branch
+    from .provenance import Provenance
+
+    extra = obligations_for_branch(program, paragraph, line, direction)
+    wanted = {v for a in extra for v in a.variables}
+    base = build_plan(program, paragraph, entry=entry, extra=extra,
+                      agent_bindings=agent_bindings, preferred=preferred)
+    if not base.chain:
+        return base
+
+    def contested(plan) -> bool:
+        """Does the plan's own state fail to satisfy what the branch asked?
+
+        Checking the open-obligation list is not enough: when a guard on the
+        way in has already bound a variable the decision needs, the solver
+        settles the clash quietly in the chain's favour and reports nothing.
+        The state is the thing that is actually true, so ask it.
+        """
+        from .interpreter import Interpreter
+        probe = Interpreter(program, plan.flat_state())
+        for atom in extra:
+            try:
+                if not probe._atom(atom):
+                    return True
+            except Exception:                                # noqa: BLE001
+                return True
+        return False
+
+    if not contested(base):
+        return base
+
+    graph, prov = analyse(program)
+    start = (entry or program.paragraph_names[0]).upper()
+    for option in route_options(program, graph, prov, start, paragraph)[:max_routes]:
+        if option["via"] is None:
+            continue
+        candidate = build_plan(program, paragraph, entry=entry,
+                               via=[option["via"]], extra=extra,
+                               agent_bindings=agent_bindings,
+                               preferred=preferred)
+        if candidate.chain and not contested(candidate):
+            return candidate
+    return base

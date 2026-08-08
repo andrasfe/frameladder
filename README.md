@@ -434,7 +434,7 @@ one way is half a branch:
 
 | program | paragraphs | directions |
 |---|---|---|
-| COACTUPC (4,236 lines) | 100% | **66.8%** |
+| COACTUPC (4,236 lines) | 97% | **48.8%** |
 | COCRDLIC | 100% | 86.7% |
 | COCRDUPC | 100% | 75.6% |
 | COUSR00C | 100% | 71.6% |
@@ -445,13 +445,28 @@ target. Directions do not, and iterating on the gap has been the most
 productive way to find defects in the tool — every gain below came from
 fixing a semantic error, not from adding search:
 
-| | directions |
-|---|---|
-| one plan per paragraph | 49.7% |
-| plans aimed at each decision *direction* | 62.4% |
-| condition-name values parsed with quoted literals | 63.2% |
-| `WHEN` arms given their subject; entry paragraph planable | 65.5% |
-| `EVALUATE` first-match semantics | **66.8%** |
+| | branches | directions |
+|---|---|---|
+| one plan per paragraph | 291 | 49.7% |
+| plans aimed at each decision *direction* | 291 | 62.4% |
+| condition-name values parsed with quoted literals | 291 | 63.2% |
+| `WHEN` arms given their subject; entry paragraph planable | 291 | 65.5% |
+| `EVALUATE` first-match semantics | 291 | 66.8% |
+| **`COPY … REPLACING` expanded** | **401** | 56.1% |
+| **figurative `VALUE`s read as values** | 401 | **48.8%** |
+
+The last two *lower* the number and are the two I trust most. Expanding
+`COPY` revealed 110 branches that were never being counted — the numerator
+rose (389 → 450) while the denominator rose further, so 66.8% had been
+measured against a program two-thirds the size of the real one. Reading
+`VALUE LOW-VALUES` as `\x00` rather than as the ten-letter string stopped
+conditions matching that never should have.
+
+This is the recurring shape of the whole exercise: **almost every correctness
+fix moved coverage down, and every one of them was right.** A coverage number
+is only as honest as the semantics underneath it, which is why
+`conformance/` runs against a real compiler after each change — still
+20/20 identical.
 
 That last one is the shape of most of them. `EVALUATE` takes the *first*
 matching arm, so reaching arm N means arms 1..N−1 all failed. Without that
@@ -688,6 +703,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 91 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 94 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

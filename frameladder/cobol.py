@@ -289,7 +289,13 @@ def parse_data_division(path: str) -> DataModel:
                 model.pic[name] = p.group(1).rstrip(".")
             v = _VALUE_IN.search(rest)
             if v:
-                model.initial[name] = v.group(1).strip("'\"")
+                # `VALUE LOW-VALUES` names a figurative constant, not a field
+                # containing the ten letters "LOW-VALUES". Storing the text
+                # makes every later comparison against it false.
+                from .ir import parse_term as _pt
+                term = _pt(v.group(1))
+                model.initial[name] = (term.value if term.kind == "const"
+                                       else v.group(1).strip("'\""))
             o = _OCCURS.search(rest)
             if o:
                 model.occurs[name] = int(o.group(1))
@@ -662,6 +668,63 @@ _COPY = re.compile(r"^\s*COPY\s+([A-Z0-9][A-Z0-9-]*)", re.I)
 _COPY_SUFFIXES = ("", ".cpy", ".CPY", ".cbl", ".CBL", ".cob", ".COB", ".txt")
 
 
+_COPY_STMT = re.compile(
+    r"^\s*COPY\s+([A-Z0-9][A-Z0-9-]*)\s*(.*)$", re.I | re.S)
+_PSEUDO = re.compile(r"==(.*?)==\s+BY\s+==(.*?)==", re.I | re.S)
+_PLAIN_REPL = re.compile(r"(\S+)\s+BY\s+(\S+)", re.I)
+
+
+def _replacements(clause: str) -> list:
+    """The (from, to) pairs of a REPLACING clause.
+
+    Pseudo-text (``==(TESTVAR1)== BY ==CASH-LIMIT==``) is the form that
+    matters: it is how one copybook becomes twenty-five paragraphs of
+    generated code, and every branch inside those copies is real code that a
+    compiler sees and an unexpanded parser does not.
+    """
+    pairs = [(m.group(1).strip(), m.group(2).strip())
+             for m in _PSEUDO.finditer(clause)]
+    if pairs:
+        return pairs
+    body = re.sub(r"^\s*REPLACING\s+", "", clause, flags=re.I)
+    return [(m.group(1).strip(), m.group(2).strip())
+            for m in _PLAIN_REPL.finditer(body)]
+
+
+def expand_copies(lines: list, directories, depth: int = 0) -> list:
+    """Inline COPY members, applying REPLACING, the way a compiler would.
+
+    Without this a paragraph assembled from copies looks nearly empty: its
+    conditions are in the member, so they are neither counted nor coverable,
+    and the coverage denominator quietly understates the program.
+    """
+    if depth > 5 or not directories:
+        return lines
+    out: list = []
+    pending = ""
+    for line in lines:
+        text = line.text
+        if pending or re.match(r"^\s*COPY\s", text, re.I):
+            pending += " " + text.strip()
+            if "." not in text:
+                continue
+            statement, pending = pending, ""
+            m = _COPY_STMT.match(statement.strip().rstrip("."))
+            resolved = resolve_member(m.group(1).upper(), directories) if m else None
+            if resolved is None:
+                continue                       # unresolvable: drop the directive
+            body = read_lines(resolved)
+            pairs = _replacements(m.group(2) or "")
+            for inner in expand_copies(body, directories, depth + 1):
+                replaced = inner.text
+                for src, dst in pairs:
+                    replaced = replaced.replace(src, dst)
+                out.append(Line(line.number, replaced))
+            continue
+        out.append(line)
+    return out
+
+
 def copy_members(source: str) -> list:
     """The copybooks a program actually COPYs.
 
@@ -729,7 +792,9 @@ def load_program(path: str, copybooks: str | None = None) -> Program:
         lines = read_lines(path)
         model = parse_data_division(path)
         program = Program(os.path.splitext(os.path.basename(path))[0],
-                          parse_procedure(lines), model, path)
+                          parse_procedure(
+                              expand_copies(lines, find_copybooks(path))),
+                          model, path)
     directories = find_copybooks(program.source_path or path)
     if copybooks and os.path.isdir(copybooks):
         directories = [copybooks] + directories
