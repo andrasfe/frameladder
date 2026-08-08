@@ -617,6 +617,22 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                                             % (w.source, var_term.name,
                                                w.para, w.line)))
                             queue.append((neg, round_no + 1))
+                # Steering around the writes that would break the value is
+                # only half the job. Something still has to *supply* it, and
+                # if nothing in the program does, the entry state is the only
+                # candidate - so bind it rather than settling on the strength
+                # of the avoidance guards alone. This is the third costume of
+                # the same defect: an obligation neither bound nor reported.
+                #
+                # Only when nothing produces it. Where a write does, requiring
+                # that write to be reached is better than pinning the entry
+                # value, which fights the program's own MOVE and costs the
+                # status-flag directions that depend on it.
+                if not prov.establishing_writes(var_term.name, op, value):
+                    bind(producer, value,
+                         "no write supplies %s, so it enters with it  [%s]"
+                         % (var_term.name, candidate.origin),
+                         atom=candidate, free=(op != "="))
                 settled = True
                 break
 
@@ -770,7 +786,8 @@ def build_family(program, target: str, *, entry: str | None = None, via=(),
 
 def plan_for_branch(program, paragraph: str, line: int, direction: bool, *,
                     entry: str | None = None, agent_bindings: dict | None = None,
-                    preferred: dict | None = None, max_routes: int = 4):
+                    preferred: dict | None = None, max_routes: int = 4,
+                    ordinal: int | None = None):
     """A plan that makes one decision go a particular way.
 
     The shortest route to a paragraph is not always a route on which the
@@ -784,7 +801,7 @@ def plan_for_branch(program, paragraph: str, line: int, direction: bool, *,
     from .graph import build_graph, obligations_for_branch
     from .provenance import Provenance
 
-    extra = obligations_for_branch(program, paragraph, line, direction)
+    extra = obligations_for_branch(program, paragraph, line, direction, ordinal)
     wanted = {v for a in extra for v in a.variables}
     base = build_plan(program, paragraph, entry=entry, extra=extra,
                       agent_bindings=agent_bindings, preferred=preferred)

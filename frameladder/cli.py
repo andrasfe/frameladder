@@ -361,6 +361,24 @@ def cmd_coverage(args):
             learned.record(plan.flat_state(), len(fresh))
         return trace
 
+    import random as _random
+    _rng = _random.Random(args.seed)
+
+    # The value pool, built once. Every literal the program compares a field
+    # against, plus one value it compares against nothing - without the
+    # complement a field tested only for SPACES has a single reachable state
+    # here and the negative direction of its own comparison is unsamplable.
+    from .heuristics import complement_value
+    pool: dict = {}
+    for name, values in prov.literals.items():
+        if not values:
+            continue
+        ordered = sorted(values, key=repr)
+        other = complement_value(name, program.model.pic_of(name), ordered)
+        if other is not None:
+            ordered = ordered + [other]
+        pool[name] = ordered
+
     traces = []
     if args.branches:
         # One plan per decision *direction*, which is what the metric counts.
@@ -373,14 +391,33 @@ def cmd_coverage(args):
                                            direction, entry=args.entry,
                                            agent_bindings=known,
                                            preferred=warm,
-                                           max_routes=args.routes)
+                                           max_routes=args.routes,
+                                           ordinal=b.ordinal)
                 except Exception:                            # noqa: BLE001
                     continue
                 if not plan.chain:
                     continue
-                trace = run_plan(plan)
-                if trace is not None:
-                    traces.append(trace)
+                for world in WORLDS:
+                    trace = run_plan(plan, world)
+                    if trace is not None:
+                        traces.append(trace)
+                # A plan pins only the slots its obligations reached; the rest
+                # keep whatever the defaults give, identically on every run.
+                # Overlaying the free slots costs nothing the plan cares about
+                # and is what lets a harvested literal actually be tried.
+                fixed = plan.input_state()
+                for _ in range(args.overlays):
+                    state = {n: _rng.choice(v) for n, v in pool.items()
+                             if n not in fixed}
+                    state.update(fixed)
+                    interp = Interpreter(program, state,
+                                         stubs=plan.stub_plan(),
+                                         terminals=plan.terminals,
+                                         defaults=io_defaults(program, "bare"))
+                    try:
+                        traces.append(interp.run(entry))
+                    except Exception:                        # noqa: BLE001
+                        continue
 
     if args.sample:
         # Deliberate hybrid. Backward derivation reaches guards that sampling
@@ -388,12 +425,8 @@ def cmd_coverage(args):
         # cannot lift at all. Measured on COACTUPC the two sets differ by
         # ~100 directions each way, and the literature on directed symbolic
         # execution reports the same: mixing beats either pure strategy.
-        import random
-        pool = {name: sorted(values, key=repr)
-                for name, values in prov.literals.items() if values}
-        rng = random.Random(args.seed)
         for _ in range(args.sample):   # noqa: B007  - _ selects the world
-            state = {name: rng.choice(values) for name, values in pool.items()}
+            state = {name: _rng.choice(values) for name, values in pool.items()}
             interp = Interpreter(program, state,
                                  defaults=io_defaults(program,
                                                       WORLDS[_ % len(WORLDS)]))
@@ -808,6 +841,9 @@ def build_parser():
                          "beats either alone. 0 disables it")
     cv.add_argument("--seed", type=int, default=7,
                     help="seed for --sample, so runs are reproducible")
+    cv.add_argument("--overlays", type=int, default=2,
+                    help="random draws over the slots each derived plan left "
+                         "free; 2 is the knee, 0 disables")
     cv.add_argument("--routes", type=int, default=4,
                     help="alternative ways in to try when the chain itself "
                          "conflicts with the decision")

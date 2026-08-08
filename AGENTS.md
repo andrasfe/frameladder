@@ -158,6 +158,34 @@ anyone's estate. Where a bias direction is knowable, state it: the six
 largest programs average 79% free bindings against 55% for the rest, so the
 free-slot share is more likely understated here than overstated.
 
+## Four things that raise coverage, and why they compose
+
+Measured independently and in combination on the whole corpus. They are
+listed together because the interaction is the point:
+
+- **A complement value in the sample pool.** The program names the values it
+  distinguishes; the complement of that set is the only *other* thing it can
+  distinguish. Without one, a field compared only against SPACES has a
+  single reachable state and the negative direction of its own comparison
+  cannot be sampled into. Evidence-derived, so nothing about it is
+  corpus-specific.
+- **Every derived plan run in every I/O world.** The plans were already
+  right; the harness only ran them in `bare`, where a batch program abends
+  at its first OPEN and every later failure path is unreachable.
+- **Overlays on the free slots.** A plan pins only the slots its obligations
+  reached; the rest take the same default on every run. Two random draws
+  over the remainder is the knee -- eight cost four times as much for a
+  quarter more.
+- **Harvesting `EVALUATE TRUE / WHEN <condition>` arms.** Alone this is
+  worth almost nothing. In combination it is worth an order of magnitude
+  more, because harvesting the literals is useless until something varies
+  them. That is the strongest interaction measured here and the reason to
+  distrust any of these numbers taken alone.
+
+**Raw budget buys nothing.** 33x the samples and 6x the routes moved the
+corpus by 0.16 points for 8x the runtime. When coverage is stuck the answer
+is a missing mechanism, not a bigger number.
+
 ## Derivation is not the whole answer
 
 The ladder derives; it does not sample. Those reach different things, and the
@@ -186,14 +214,20 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 86.0%, range 58.8-100%.** Quote the median and the
+**28 programs, median 97.2%, range 72.5-100%** (2796/2976 directions).
+Nine programs are at 100%. Quote the median and the
 range.
 
-The lowest is CORPT00C at 58.8%, and it went *down* when the interpreter
-learned `FUNCTION CURRENT-DATE`: the program does `ADD 1 TO
-WS-CURDATE-MONTH` and then tests `> 12`, which is reachable every December
-and unreachable against a fixed instant. Two directions there are now
-honestly out of reach rather than dishonestly counted. See open item 2. CSUTLDTC, which sat at 50% for most of this
+The lowest is CORPT00C at 72.5%. It dipped to 58.8% when the interpreter
+learned `FUNCTION CURRENT-DATE` -- the program does `ADD 1 TO
+WS-CURDATE-MONTH` and then tests `> 12`, reachable every December and
+unreachable against a fixed instant. It recovered without anyone
+special-casing dates. Two of its directions still need open item 2.
+
+**The residual is over-reported success, not dead code.** Of the directions
+still missing at the previous measurement, the tool proved 7 infeasible and
+112 had a plan claiming `solved` that did not deliver. Before believing a
+program has hit its ceiling, check `contested`. CSUTLDTC, which sat at 50% for most of this
 work, is at 100% -- its ten dead EVALUATE arms were all testing 88-levels
 whose VALUE was a hexadecimal literal the parser read as a variable name.
 

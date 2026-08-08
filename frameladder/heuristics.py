@@ -250,3 +250,33 @@ def preferred_value(name: str, pic: str, klass: str | None = None,
     if klass:
         return conforming_value(pic, klass, negated)
     return semantic_value(name, pic, evidence, op, other)
+
+
+def complement_value(name: str, pic: str, values):
+    """A value this field could hold that is none of the ones it is tested
+    against.
+
+    Not a guess about what the field means: the program named the values it
+    distinguishes, and the complement of that set is the only other thing it
+    can distinguish. Without it a field compared only against SPACES has one
+    reachable state in the sample pool, and the negative direction of its own
+    comparison cannot be sampled into at all.
+    """
+    concrete = [v for v in values if not isinstance(v, bool)]
+    if not concrete:
+        # A condition-name evidences both truth values.
+        return False if values and all(v is True for v in values) else None
+    text, width, _signed, _dec = _pic(pic or "")
+    if all(isinstance(v, (int, float)) for v in concrete):
+        candidate = 0
+        while candidate in concrete and candidate < 10 ** 6:
+            candidate += 1
+        return candidate
+    if not text and pic:
+        return None
+    width = width or 8
+    for filler in ("A", "Z", "1", "9"):
+        candidate = filler * min(width, 8)
+        if candidate not in concrete and candidate.strip() not in concrete:
+            return candidate
+    return None

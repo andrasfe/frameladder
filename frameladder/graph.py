@@ -217,7 +217,7 @@ def walk_guarded(paragraph: dict, visit):
 
 
 def obligations_for_branch(program, paragraph: str, line: int,
-                           direction: bool) -> list:
+                           direction: bool, ordinal: int | None = None) -> list:
     """What must hold for one decision to go a particular way.
 
     Aiming a plan at a paragraph only satisfies the guards on the way *to*
@@ -225,6 +225,11 @@ def obligations_for_branch(program, paragraph: str, line: int,
     happen to be, which is why so many end up always false. Aiming at a
     direction adds the condition itself, plus the guards enclosing it within
     the paragraph, so the run arrives with the decision already determined.
+
+    Addressed by ordinal when one is given. A line does not identify a
+    decision: `COPY CSUTLDPY` expands twenty of them onto the line of the
+    directive, and matching by line conjoins every one of their conditions
+    into a single unsatisfiable obligation.
     """
     para = program.paragraph(paragraph)
     if para is None:
@@ -248,7 +253,10 @@ def obligations_for_branch(program, paragraph: str, line: int,
         index(stmt)
 
     def visit(stmt, pname, guards, induction, literals):
-        if stmt.get("line_start", 0) != line:
+        if ordinal is not None:
+            if stmt.get("ordinal", -1) != ordinal:
+                return
+        elif stmt.get("line_start", 0) != line:
             return
         kind = stmt.get("type", "")
         attrs = stmt.get("attributes", {})
