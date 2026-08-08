@@ -19,6 +19,7 @@ than counted as passes.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -30,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from frameladder.cobol import ENTRY_PARAGRAPH, load_program, read_lines
 from frameladder.interpreter import verify
 from frameladder.ladder import analyse, build_plan
+from frameladder.witness import WitnessStore
 from conformance.differential import (MARKER, compile_and_run, instrument,
                                       io_defaults, stage_files)
 
@@ -86,7 +88,8 @@ def inject(src: str, out: str, state: dict, declared: set) -> tuple:
     return out, applied, skipped
 
 
-def check(path: str, copybooks=(), limit: int | None = None) -> list:
+def check(path: str, copybooks=(), limit: int | None = None,
+          store: WitnessStore | None = None) -> list:
     program = load_program(path)
     analyse(program)
     entry = program.paragraph_names[0] if program.paragraph_names else None
@@ -99,31 +102,47 @@ def check(path: str, copybooks=(), limit: int | None = None) -> list:
     if limit:
         targets = targets[:limit]
 
+    # Compiling a state yields a whole trace, and a trace answers
+    # reachability for every paragraph at once - so the unit of work is the
+    # distinct state, not the target. Two thirds of targets ask for a state
+    # some other target already asked for.
+    groups: dict = {}
     for target in targets:
         plan = build_plan(program, target, entry=entry)
         if not plan.chain:
             continue
         predicted = verify(program, plan, entry,
                            defaults=io_defaults(program))["reached"]
+        signature = repr(sorted(plan.flat_state().items()))
+        groups.setdefault(signature, []).append((target, plan, predicted))
 
+    for signature, members in groups.items():
+        _t, plan, _p = members[0]
         work = tempfile.mkdtemp(prefix="fl-plan-")
         marked = os.path.join(work, os.path.basename(path))
-        untraced = instrument(path, marked)
+        instrument(path, marked)
         injected = os.path.join(work, "inj_" + os.path.basename(path))
         result, applied, skipped = inject(marked, injected,
                                           plan.flat_state(), declared)
         if result is None:
             continue
-        real_trace, note = compile_and_run(injected, work, copybooks,
-                                           stage_files(path, work))
-        rows.append({
-            "target": target,
-            "needs_stubs": bool(plan.stub_plan()),
-            "predicted": predicted,
-            "real": (real_trace is not None and target in real_trace),
-            "applied": applied, "skipped": skipped,
-            "note": note if real_trace is None else "",
-        })
+        trace, note = compile_and_run(injected, work, copybooks,
+                                      stage_files(path, work))
+        for index, (target, plan, predicted) in enumerate(members):
+            row = {
+                "target": target,
+                "needs_stubs": bool(plan.stub_plan()),
+                "predicted": predicted,
+                "real": (trace is not None and target in trace),
+                "applied": applied, "skipped": skipped,
+                "note": note if trace is None else "",
+                "cached": index > 0,
+            }
+            if store is not None and row["real"]:
+                store.add(plan.chain, plan.flat_state(), target,
+                          verified=True, source="compiler")
+            rows.append(row)
+    rows.sort(key=lambda r: r["target"])
     return rows
 
 
@@ -132,14 +151,17 @@ def main(argv=None):
     ap.add_argument("programs", nargs="+")
     ap.add_argument("-I", "--copybooks", action="append", default=[])
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--witnesses", help="file to persist confirmed witnesses in")
     args = ap.parse_args(argv)
 
     agree = disagree = 0
     stub_dependent = 0
+    compiles = cached = 0
+    store = WitnessStore(args.witnesses)
     matrix = {(True, True): 0, (True, False): 0,
               (False, True): 0, (False, False): 0}
     for path in args.programs:
-        rows = check(path, args.copybooks, args.limit)
+        rows = check(path, args.copybooks, args.limit, store)
         if not rows:
             print("%-16s (nothing runnable)" % os.path.basename(path))
             continue
@@ -150,6 +172,10 @@ def main(argv=None):
                 print("  %-32s %10s %8s %s" % (r["target"], r["predicted"], "-",
                                                r["note"][:40]))
                 continue
+            if r.get("cached"):
+                cached += 1
+            else:
+                compiles += 1
             if r["needs_stubs"]:
                 stub_dependent += 1
             ok = r["predicted"] == r["real"]
@@ -173,6 +199,12 @@ def main(argv=None):
         print("\nagreement %d/%d (%.0f%%); %d plans also depend on stub "
               "outcomes that entry-state injection cannot supply"
               % (agree, total, 100.0 * agree / total, stub_dependent))
+        print("compiles run %d, reused from an identical confirmed state %d "
+              "(%.0f%% avoided)"
+              % (compiles, cached, 100.0 * cached / max(1, compiles + cached)))
+        if args.witnesses:
+            store.save()
+            print("witnesses: %s" % json.dumps(store.summary()))
     return 0 if disagree == 0 else 1
 
 

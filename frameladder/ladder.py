@@ -156,7 +156,7 @@ def analyse(program):
 
 def build_plan(program, target: str, *, entry: str | None = None, via=(),
                agent_bindings: dict | None = None, kinds: set | None = None,
-               max_rounds: int = 8) -> Plan:
+               preferred: dict | None = None, max_rounds: int = 8) -> Plan:
     """Derive a reaching plan for ``target``.
 
     ``via`` pins the call trace through named frames, so a caller can ask
@@ -164,7 +164,14 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     happens to be shortest.  ``agent_bindings`` are decisions made
     outside this module - by a human or an agent reading the frame - and
     they win over anything the ladder would derive itself.
+
+    ``preferred`` is weaker and safer: values to reach for when the ladder
+    has a *free* choice, and to ignore otherwise.  A witness already
+    verified for a shorter chain can be offered this way, so traces that
+    share a prefix agree on the arbitrary values instead of each inventing
+    their own - without ever overriding something a constraint decided.
     """
+    preferred = {k.upper(): v for k, v in (preferred or {}).items()}
     graph, prov = analyse(program)
     entry = (entry or program.paragraph_names[0]).upper()
     target = target.upper()
@@ -308,6 +315,13 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                                        "%s and %s" % (atom.op, pa.slot, pb.slot)))
                 continue
             left, right = pair
+            if atom.op == "=" and lhs.name in preferred:
+                left = right = preferred[lhs.name]
+            elif atom.op == "=" and rhs.name in preferred:
+                left = right = preferred[rhs.name]
+            elif (lhs.name in preferred and rhs.name in preferred
+                  and holds(preferred[lhs.name], atom.op, preferred[rhs.name])):
+                left, right = preferred[lhs.name], preferred[rhs.name]
             # If either side is already pinned, keep it and solve for the other.
             if assigned.get(pa.slot) is not None:
                 left = assigned[pa.slot].value
@@ -435,8 +449,13 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                                 % (producer.value, producer.site))
                 continue
 
+            is_free = op != "="
+            if is_free and var_term.name in preferred:
+                carried = preferred[var_term.name]
+                if holds(carried, op, const_term.value):
+                    value = carried
             if bind(producer, value, "from %s  [%s]" % (candidate, candidate.origin),
-                    atom=candidate, free=(op != "=")):
+                    atom=candidate, free=is_free):
                 settled = True
                 break
             failures.append("conflicting binding for %s" % producer.slot)

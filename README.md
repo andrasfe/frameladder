@@ -133,6 +133,43 @@ program does not merely compute a different number, it takes a different path.
 The tool applies this only to alphanumeric comparisons, because numeric ones
 compare values rather than bytes and are stable.
 
+## Witnesses are reusable
+
+A state that opens a paragraph is evidence about a *frame*, not about the one
+path that found it. Chains overlap heavily — **63% of targets have a chain
+that extends another target's** — so it is worth keeping what was learned.
+
+Measuring where that actually pays gave a surprise. Two mechanisms were
+plausible:
+
+- **Prefix inheritance** — offer a shorter chain's values as preferences for a
+  longer one. Measured gain: **0%**. The value chooser is deterministic, so
+  targets sharing a prefix already agreed; there was no inconsistency to
+  remove. Kept anyway (`preferred=`, which moves only *free* slots and never
+  overrides a constraint) because it stops being a no-op the moment values
+  vary — which is exactly what families do.
+- **State identity** — 563 targets ask for only **189 distinct states**, and
+  2,631 family members for **856**. Roughly two-thirds of the work is asking a
+  question someone already asked.
+
+The second is where the money is, because one compile of a state produces a
+whole *trace*, and a trace answers reachability for every paragraph at once.
+So the unit of work is the distinct state, not the target:
+
+| | per target | per distinct state |
+|---|---|---|
+| compiles | 90 | **19** (79% avoided) |
+| wall clock | 25.0s | **5.5s** |
+| confirmation matrix | 21/4/0/65 | identical |
+
+`--witnesses FILE` persists compiler-confirmed witnesses across runs.
+
+Making this sound required computing **live-in** sets — the variables a
+paragraph reads before writing. The README had described a paragraph's
+"arguments" that way from the start, but nothing computed it; the ladder
+worked from call-site guards, which is enough to *reach* a frame and not
+enough to say what a witness is really about.
+
 ## Agent-assisted
 
 The derivation is deterministic and needs no model. Where it runs out — the
@@ -320,6 +357,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 33 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 40 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

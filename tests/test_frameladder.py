@@ -606,3 +606,105 @@ class TestDivergence(unittest.TestCase):
             paired = [state[v] for v in ("REC-A", "REC-B", "AREA-A") if v in state]
             self.assertLessEqual(len(set(map(repr, paired))), 1,
                                  "both ends of a rendezvous must hold one value")
+
+
+class TestLiveness(unittest.TestCase):
+    def test_read_before_write_is_live_in(self):
+        from frameladder.liveness import live_in
+        p = program(HEADER + """       01  WS-IN PIC X(2).
+       01  WS-OUT PIC X(2).
+       01  WS-TMP PIC X(2).
+       PROCEDURE DIVISION.
+       W-MAIN.
+           MOVE WS-IN TO WS-OUT
+           MOVE 'AB' TO WS-TMP
+           MOVE WS-TMP TO WS-OUT
+           GOBACK
+           .
+""")
+        live = live_in(p, "W-MAIN")
+        self.assertIn("WS-IN", live, "read before any write")
+        self.assertNotIn("WS-TMP", live, "written before it is read")
+        self.assertNotIn("WS-OUT", live, "only ever written")
+
+    def test_live_in_follows_performs(self):
+        from frameladder.liveness import live_in
+        p = program(HEADER + """       01  WS-DEEP PIC X(2).
+       PROCEDURE DIVISION.
+       X-MAIN.
+           PERFORM X-SUB
+           GOBACK
+           .
+       X-SUB.
+           IF WS-DEEP = 'ZZ'
+              CONTINUE
+           END-IF
+           .
+""")
+        self.assertIn("WS-DEEP", live_in(p, "X-MAIN"),
+                      "a callee's inputs are the caller's too")
+
+    def test_verbs_are_not_variables(self):
+        from frameladder.liveness import live_in
+        p = program(HEADER + """       01  WS-N PIC 9(2).
+       PROCEDURE DIVISION.
+       Y-MAIN.
+           DISPLAY 'HELLO' WS-N
+           CALL 'SUBPROG'
+           GOBACK
+           .
+""")
+        live = live_in(p, "Y-MAIN")
+        self.assertIn("WS-N", live)
+        for noise in ("DISPLAY", "CALL", "SUBPROG", "HELLO"):
+            self.assertNotIn(noise, live)
+
+
+class TestWitnessStore(unittest.TestCase):
+    def test_longest_prefix_wins(self):
+        from frameladder.witness import WitnessStore
+        store = WitnessStore()
+        store.add(("A",), {"X": 1}, "A")
+        store.add(("A", "B"), {"X": 2}, "B")
+        found = store.longest_prefix(("A", "B", "C"))
+        self.assertEqual(found.chain, ("A", "B"))
+        self.assertEqual(store.preferences(("A", "B", "C")), {"X": 2})
+
+    def test_unrelated_chain_gets_nothing(self):
+        from frameladder.witness import WitnessStore
+        store = WitnessStore()
+        store.add(("A", "B"), {"X": 1}, "B")
+        self.assertEqual(store.preferences(("Q", "R")), {})
+
+    def test_compiler_confirmation_outranks_interpreter(self):
+        from frameladder.witness import WitnessStore
+        store = WitnessStore()
+        store.add(("A",), {"X": 1}, "A", verified=False)
+        store.add(("A",), {"X": 9}, "A", verified=True, source="compiler")
+        self.assertEqual(store.entries["A"].state["X"], 9)
+        self.assertEqual(store.summary()["compiler_confirmed"], 1)
+
+    def test_preferences_only_move_free_slots(self):
+        # A carried value must never override something a constraint decided,
+        # or reuse could turn a correct plan into an unreachable one.
+        p = program(HEADER + """       01  WS-F PIC X(2).
+       01  WS-G PIC X(2).
+       PROCEDURE DIVISION.
+       Z-MAIN.
+           IF WS-F = 'YY'
+              IF WS-G NOT EQUAL 'ZZ'
+                 PERFORM Z-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       Z-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "Z-DEEP", entry="Z-MAIN",
+                          preferred={"WS-F": "QQ", "WS-G": "GG"})
+        state = plan.flat_state()
+        self.assertEqual(state["WS-F"], "YY", "equality must survive a preference")
+        self.assertEqual(state["WS-G"], "GG", "a free slot may take one")
+        self.assertTrue(verify(p, plan, "Z-MAIN")["reached"])
