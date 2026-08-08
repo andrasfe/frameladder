@@ -211,13 +211,38 @@ fails `IS NUMERIC` is worse than dull digits that pass.
 
 | source | share |
 |---|---|
-| the program itself — literals it compares the field against | **873 (56%)** |
-| the en-US convention pack | 18 (1%) |
-| nothing plausible available | 661 (43%) |
+| the program itself — a literal it compares the field against *that satisfies the constraint* | **320 (21%)** |
+| genuinely undecided | 1,212 (79%) |
 
-The convention pack was the part most at risk of being an assumption about
-COBOL rather than a fact about a program, and measuring it settled the
-question: it does 1% of the work, and it is replaceable.
+An earlier version of this table claimed 56%. It was wrong: it counted any
+literal the field appeared beside, including — for a disequality — the very
+value being ruled out. Applying the constraint to the evidence dropped it to
+21%, which is the honest figure.
+
+**No token table is consulted by default.** A fixed list of name fragments is
+a guess about how other people name things, and programs are not consistent
+enough for that to hold. Measured against the corpus it settled 1% of values
+and **zero targets of reachability**, so it now ships as `packs/en-US.json`
+and is opt-in via `--conventions`.
+
+What replaces it is a sweep of the program's *own* vocabulary. A single
+program was written by one team with one convention, so the convention is
+discoverable from the source rather than assumed:
+
+```bash
+frameladder COACTUPC.cbl names
+```
+```
+COACTUPC: 8 values the program never pins down, sharing 6 tokens.
+token          fields  shapes          examples
+AID                 2  (undeclared)    CCARD-AID-PFK03, CCARD-AID-PFK12
+CDEMO               2  (undeclared)    CDEMO-PGM-ENTER, CDEMO-PGM-REENTER
+```
+
+`questions` lists the same set field by field; `bind --why` records a
+decision; the journal makes it permanent, so it is asked once and is data
+thereafter. Where nothing decides a value, the tool says so instead of
+inventing one.
 
 The one piece of built-in knowledge that is *not* a naming guess is the
 platform's status vocabulary — file status, SQLCODE, CICS RESP. Those are
@@ -544,6 +569,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 63 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 68 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

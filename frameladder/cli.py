@@ -310,6 +310,149 @@ def cmd_explain(args):
     return _emit(payload, args.json, render)
 
 
+def _constraint_of(binding):
+    """The comparison a binding had to satisfy, if it was against a constant."""
+    atom = binding.atom
+    if atom is None:
+        return None, None
+    if atom.rhs.kind == "const":
+        return atom.op, atom.rhs.value
+    if atom.lhs.kind == "const":
+        from .ir import flip
+        return flip(atom.op), atom.lhs.value
+    return None, None
+
+
+def cmd_names(args):
+    """Sweep this program's own vocabulary, rather than assume a prior one.
+
+    A fixed token table is a guess about how other people name things, and
+    programs are not consistent enough for that to hold. What *is* consistent
+    is a single program: it was written by a team with one convention, so the
+    convention is discoverable from the source. This lists the tokens that
+    actually occur, weighted by how many undecided values each would settle,
+    so one pass of judgment covers the program instead of one field at a time.
+    """
+    program = _program(args)
+    journal = Journal(args.work_dir)
+    from .ladder import analyse
+    from .heuristics import from_evidence
+    _graph, prov = analyse(program)
+    entry = _entry(program, args)
+    known = journal.bindings()
+
+    undecided: dict = {}
+    for target in program.paragraph_names[1:]:
+        try:
+            plan = build_plan(program, target, entry=args.entry,
+                              agent_bindings=known)
+        except Exception:                                    # noqa: BLE001
+            continue
+        for b in plan.bindings:
+            var = b.producer.var
+            if not b.free or var in known:
+                continue
+            pic = program.model.pic.get(var, "")
+            op, other = _constraint_of(b)
+            if from_evidence(prov.literals.get(var, ()), pic, op, other) is not None:
+                continue
+            undecided.setdefault(var, pic)
+
+    groups: dict = {}
+    for var, pic in undecided.items():
+        for token in var.split("-"):
+            if len(token) < 2 or token.isdigit():
+                continue
+            entry_ = groups.setdefault(token, {"fields": [], "pics": set()})
+            entry_["fields"].append(var)
+            entry_["pics"].add(pic or "(undeclared)")
+
+    rows = sorted(({"token": t, "fields": sorted(v["fields"]),
+                    "pics": sorted(v["pics"]), "count": len(v["fields"])}
+                   for t, v in groups.items()),
+                  key=lambda r: (-r["count"], r["token"]))
+    if args.limit:
+        rows = rows[: args.limit]
+    payload = {"program": program.name, "entry": entry,
+               "undecided_fields": len(undecided), "tokens": rows}
+
+    def render(p):
+        print("%s: %d values the program never pins down, sharing %d tokens.\n"
+              % (p["program"], p["undecided_fields"], len(p["tokens"])))
+        print("%-14s %6s  %-28s %s" % ("token", "fields", "shapes", "examples"))
+        for r in p["tokens"]:
+            print("%-14s %6d  %-28s %s"
+                  % (r["token"], r["count"], ",".join(r["pics"][:2]),
+                     ", ".join(r["fields"][:3])))
+        print("\nDecide a token once and it settles every field carrying it:")
+        print("  frameladder %s --work-dir DIR bind --bind \"<FIELD>=<value>\" "
+              "--why \"...\"" % args.program)
+    return _emit(payload, args.json, render)
+
+
+def cmd_questions(args):
+    """The slots where the tool would have to invent a value, so it asks.
+
+    A naming table is a guess about how other people name things, and it
+    measured as worth zero targets. What a value should be, where the
+    program itself never says, is a judgment - so it is put to whoever is
+    driving, once, and recorded. After that it is data like any other.
+    """
+    program = _program(args)
+    journal = Journal(args.work_dir)
+    from .ladder import analyse
+    from .heuristics import from_evidence
+    _graph, prov = analyse(program)
+    entry = _entry(program, args)
+    known = journal.bindings()
+
+    targets = ([args.target.upper()] if args.target
+               else program.paragraph_names[1:])
+    asked, seen = [], set()
+    for target in targets:
+        plan = build_plan(program, target, entry=args.entry,
+                          agent_bindings=known)
+        if not plan.chain:
+            continue
+        for b in plan.bindings:
+            var = b.producer.var
+            if not b.free or var in seen or var in known:
+                continue
+            pic = program.model.pic.get(var, "")
+            evidence = sorted(prov.literals.get(var, ()), key=repr)
+            op, other = _constraint_of(b)
+            if from_evidence(evidence, pic, op, other) is not None:
+                continue
+            seen.add(var)
+            asked.append({
+                "variable": var, "pic": pic or "(undeclared)",
+                "constraint": str(b.atom) if b.atom else "(free)",
+                "origin": b.atom.origin if b.atom else "",
+                "chose": b.value, "target": target,
+                "slot": b.slot, "evidence": evidence,
+            })
+    if args.limit:
+        asked = asked[: args.limit]
+    payload = {"program": program.name, "entry": entry, "questions": asked}
+
+    def render(p):
+        if not p["questions"]:
+            print("Nothing to ask: every free value came from the program.")
+            return
+        print("%d values the program never pins down. It currently invents "
+              "these; decide them once and they are recorded.\n"
+              % len(p["questions"]))
+        for q in p["questions"]:
+            print("%s   PIC %s" % (q["variable"], q["pic"]))
+            print("   must satisfy : %s   [%s]" % (q["constraint"], q["origin"]))
+            print("   invented     : %r" % (q["chose"],))
+            print("   answer with  : frameladder %s --work-dir DIR bind "
+                  "--bind \"%s=<value>\" --why \"...\""
+                  % (args.program, q["variable"]))
+            print()
+    return _emit(payload, args.json, render)
+
+
 def cmd_crossroads(args):
     """At a decision point: what each route obliges you to control."""
     program = _program(args)
@@ -493,6 +636,17 @@ def build_parser():
     e.add_argument("--variables", help="comma-separated variable names")
     e.add_argument("--source", action="store_true", help="include the source text")
     e.set_defaults(func=cmd_explain)
+
+    nm = sub.add_parser("names", help="this program's own naming vocabulary, "
+                                     "ranked by how much it would settle")
+    nm.add_argument("--limit", type=int, default=15)
+    nm.set_defaults(func=cmd_names)
+
+    qs = sub.add_parser("questions", help="values the program never pins "
+                                         "down, for a human or agent to decide")
+    qs.add_argument("target", nargs="?")
+    qs.add_argument("--limit", type=int, default=10)
+    qs.set_defaults(func=cmd_questions)
 
     cr = sub.add_parser("crossroads", help="what each route obliges you to "
                                           "control in the outside world")

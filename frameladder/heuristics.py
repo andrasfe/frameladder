@@ -36,9 +36,16 @@ from __future__ import annotations
 
 import re
 
-# Suffixes are matched longest-first so ACCT-EXPIRAION-DATE reads as a date
-# rather than as whatever its earlier tokens suggest.
-_ROLES = [
+# Empty by default. A token table is a guess about how other people name
+# things, and measurement settled what that guess is worth: 1% of free-slot
+# values and zero targets of reachability. The built-in one now ships as
+# packs/en-US.json and is opt-in via --conventions, so the default behaviour
+# is to use what the program says and otherwise to *ask* rather than invent.
+_ROLES: list = []
+
+# Kept for reference and for building a pack from; not consulted unless a
+# pack is loaded.
+_REFERENCE_ROLES = [
     ("date", ("DATE", "DT", "DOB", "BIRTH")),
     ("timestamp", ("TIMESTAMP", "TS", "TIME", "ORIG-TS", "PROC-TS")),
     ("amount", ("AMT", "AMOUNT", "BAL", "BALANCE", "LIMIT", "CREDIT", "DEBIT",
@@ -61,7 +68,9 @@ _ROLES = [
 # The built-in pack is en-US by convention and deliberately quarantined here,
 # so that swapping it out is a supported operation rather than a fork.
 DEFAULT_PACK_NAME = "en-US"
-_SAMPLES = {
+_SAMPLES: dict = {}
+
+_REFERENCE_SAMPLES = {
     "date": {8: "20250115", 10: "2025-01-15", 6: "250115", 7: "2025015"},
     "timestamp": {26: "2025-01-15-12.30.45.000000", 16: "2025-01-15-12.3",
                   14: "20250115123045", 10: "2025-01-15"},
@@ -74,8 +83,10 @@ _SAMPLES = {
     "address": {},
 }
 
-_WORDS = {"name": "JOHN SMITH", "address": "1 MAIN STREET",
-          "status": "00", "flag": "Y", "code": "A"}
+_WORDS: dict = {}
+
+_REFERENCE_WORDS = {"name": "JOHN SMITH", "address": "1 MAIN STREET",
+                    "status": "00", "flag": "Y", "code": "A"}
 
 
 def load_pack(path: str) -> dict:
@@ -109,14 +120,22 @@ def _fits(value, pic: str) -> bool:
     return not isinstance(value, str)
 
 
-def from_evidence(evidence, pic: str):
+def from_evidence(evidence, pic: str, op: str | None = None, other=None):
     """A value the program itself compares this field against.
 
     Preferred over any naming convention: these are facts about this source
     rather than assumptions about how fields are usually named, so they carry
     over to an estate written in any language.
+
+    The constraint has to be applied here, not afterwards. Where the
+    obligation is a disequality the only literal on offer is usually the
+    forbidden one, and counting that as evidence reports a field as settled
+    when nothing has settled it.
     """
-    usable = [v for v in evidence or () if _fits(v, pic)]
+    from .ir import holds
+    usable = [v for v in evidence or ()
+              if _fits(v, pic) and (op is None or other is None
+                                    or holds(v, op, other))]
     if not usable:
         return None
     # Longest first: a value that fills the field exercises more of it than a
@@ -175,14 +194,14 @@ def conforming_value(pic: str, klass: str, negated: bool = False):
     return None
 
 
-def semantic_value(name: str, pic: str, evidence=()):
+def semantic_value(name: str, pic: str, evidence=(), op=None, other=None):
     """A plausible value for a field, from its name and its declared shape.
 
     The shape matters as much as the name: a date in ``X(8)`` is ``20250115``
     and the same date in ``X(10)`` is ``2025-01-15``, and a validator will
     reject the other one.
     """
-    found = from_evidence(evidence, pic)
+    found = from_evidence(evidence, pic, op, other)
     if found is not None:
         return found
     role = role_of(name)
@@ -221,7 +240,7 @@ def semantic_value(name: str, pic: str, evidence=()):
 
 
 def preferred_value(name: str, pic: str, klass: str | None = None,
-                    negated: bool = False, evidence=()):
+                    negated: bool = False, evidence=(), op=None, other=None):
     """The value to reach for in a free slot.
 
     Shape beats plausibility: a realistic date that fails ``IS NUMERIC`` is
@@ -230,4 +249,4 @@ def preferred_value(name: str, pic: str, klass: str | None = None,
     """
     if klass:
         return conforming_value(pic, klass, negated)
-    return semantic_value(name, pic, evidence)
+    return semantic_value(name, pic, evidence, op, other)

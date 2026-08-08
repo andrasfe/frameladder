@@ -710,7 +710,28 @@ class TestWitnessStore(unittest.TestCase):
         self.assertTrue(verify(p, plan, "Z-MAIN")["reached"])
 
 
-class TestHeuristics(unittest.TestCase):
+PACK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "packs", "en-US.json")
+
+
+class _WithPack(unittest.TestCase):
+    """The naming pack is opt-in, so a test about it has to opt in."""
+
+    def setUp(self):
+        from frameladder import heuristics
+        self._roles = list(heuristics._ROLES)
+        self._samples = dict(heuristics._SAMPLES)
+        self._words = dict(heuristics._WORDS)
+        heuristics.load_pack(PACK)
+
+    def tearDown(self):
+        from frameladder import heuristics
+        heuristics._ROLES[:] = self._roles
+        heuristics._SAMPLES.clear(); heuristics._SAMPLES.update(self._samples)
+        heuristics._WORDS.clear(); heuristics._WORDS.update(self._words)
+
+
+class TestHeuristics(_WithPack):
     def test_class_condition_is_not_a_relation(self):
         # `IS NOT` matches the relational operators, so without recognising
         # class conditions first this parses as `ACCT-ID != NUMERIC` - which
@@ -1034,9 +1055,22 @@ class TestFaultVocabulary(unittest.TestCase):
         self.assertEqual(enrich_domain("CUST-FIRST-NAME", model, {"BOB"}), ["BOB"])
 
 
-class TestGenericity(unittest.TestCase):
+class TestGenericity(_WithPack):
     """What the tool knows must come from the program, not from assuming the
     program was written in English by an American bank."""
+
+    def test_no_naming_table_is_consulted_by_default(self):
+        from frameladder import heuristics
+        heuristics._ROLES.clear()
+        heuristics._SAMPLES.clear()
+        # With no pack loaded the tool must decline rather than invent: a
+        # guess about naming is not knowledge, and it measured as worth zero
+        # targets of reachability.
+        self.assertIsNone(heuristics.semantic_value("ACCT-OPEN-DATE", "X(10)"))
+        self.assertEqual(
+            heuristics.semantic_value("ACCT-OPEN-DATE", "X(10)",
+                                      evidence={"1999-12-31"}), "1999-12-31",
+            "evidence from the program still works with no pack at all")
 
     def test_the_program_outranks_the_name_table(self):
         from frameladder.heuristics import semantic_value
@@ -1088,3 +1122,90 @@ class TestGenericity(unittest.TestCase):
         self.assertIn("10", codes_for("WS-ST", model))
         self.assertEqual(codes_for("SOME-OTHER-FIELD", model), [],
                          "a field outside a known channel gets no vocabulary")
+
+
+class TestNameSweep(unittest.TestCase):
+    """Names are decided by sweeping this program, not by assuming a prior."""
+
+    def test_sweep_finds_only_what_is_undecided(self):
+        from frameladder.cli import build_parser, cmd_names
+        p = program(HEADER + """       01  WS-KNOWN PIC X(2).
+       01  ACME-WIDGET-KEY PIC X(6).
+       PROCEDURE DIVISION.
+       AH-MAIN.
+           IF WS-KNOWN = 'OK'
+              IF ACME-WIDGET-KEY NOT = 'ZZZZZZ'
+                 PERFORM AH-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       AH-DEEP.
+           EXIT
+           .
+""")
+        # Written to the parser's own path so the command sees a real program.
+        args = build_parser().parse_args([p.source_path, "names"])
+        payload = cmd_names(args)
+        tokens = {t["token"] for t in payload["tokens"]}
+        # WS-KNOWN is pinned by an equality, so it is not undecided.
+        self.assertNotIn("KNOWN", tokens)
+        # ACME-WIDGET-KEY is left open by a disequality and its tokens are
+        # nothing any English table would carry - which is the point.
+        self.assertTrue({"ACME", "WIDGET"} & tokens)
+
+    def test_a_decision_persists_and_removes_the_question(self):
+        import tempfile
+        from frameladder.cli import build_parser, cmd_names, cmd_bind
+        p = program(HEADER + """       01  ACME-WIDGET-KEY PIC X(6).
+       PROCEDURE DIVISION.
+       AI-MAIN.
+           IF ACME-WIDGET-KEY NOT = 'ZZZZZZ'
+              PERFORM AI-DEEP
+           END-IF
+           GOBACK
+           .
+       AI-DEEP.
+           EXIT
+           .
+""")
+        work = tempfile.mkdtemp()
+        parser = build_parser()
+        before = cmd_names(parser.parse_args([p.source_path, "--work-dir", work,
+                                              "names"]))
+        self.assertGreater(before["undecided_fields"], 0)
+        cmd_bind(parser.parse_args([p.source_path, "--work-dir", work, "bind",
+                                    "--bind", "ACME-WIDGET-KEY=W12345",
+                                    "--why", "site convention"]))
+        after = cmd_names(parser.parse_args([p.source_path, "--work-dir", work,
+                                             "names"]))
+        self.assertEqual(after["undecided_fields"], 0,
+                         "a decision, once made, is data and is not re-asked")
+
+    def test_declared_value_is_a_default_not_a_constraint(self):
+        # A VALUE says what the field starts as. It should be preferred, and
+        # it must still yield to a constraint that needs something else.
+        p = program(HEADER + """       01  WS-F PIC X VALUE 'N'.
+       PROCEDURE DIVISION.
+       AJ-MAIN.
+           IF WS-F = 'Y'
+              PERFORM AJ-DEEP
+           END-IF
+           GOBACK
+           .
+       AJ-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "AJ-DEEP", entry="AJ-MAIN")
+        self.assertEqual(plan.flat_state()["WS-F"], "Y")
+        self.assertTrue(verify(p, plan, "AJ-MAIN")["reached"])
+
+    def test_cics_response_constants_are_not_arrays(self):
+        # DFHRESP(NOTFND) is a compile-time constant; read as a subscripted
+        # name it becomes an array nobody can set.
+        term = ir.parse_term("DFHRESP(NOTFND)")
+        self.assertEqual(term.kind, "const")
+        self.assertEqual(term.value, 13)
+        self.assertEqual(ir.parse_term("DFHRESP(NORMAL)").value, 0)
+        self.assertEqual(ir.parse_term("WS-TAB(I)").kind, "var")

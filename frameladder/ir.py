@@ -15,6 +15,25 @@ FIGURATIVE = {"ZERO": 0, "ZEROS": 0, "ZEROES": 0, "SPACE": " ", "SPACES": " ",
               "HIGH-VALUES": "\xff", "NULL": "", "NULLS": ""}
 NEGATE = {"=": "!=", "!=": "=", ">": "<=", "<=": ">", "<": ">=", ">=": "<"}
 
+# CICS response and value constants. Platform vocabulary, fixed the way HTTP
+# status codes are - not an assumption about how anyone names anything.
+CICS_CONSTANTS = {
+    "DFHRESP": {"NORMAL": 0, "ERROR": 1, "RDATT": 2, "WRBRK": 3, "EOF": 4,
+                "EODS": 5, "EOC": 6, "INBFMH": 7, "ENDINPT": 8, "NONVAL": 9,
+                "NOSTART": 10, "TERMIDERR": 11, "FILENOTFOUND": 12,
+                "NOTFND": 13, "DUPREC": 14, "DUPKEY": 15, "INVREQ": 16,
+                "IOERR": 17, "NOSPACE": 18, "NOTOPEN": 19, "ENDFILE": 20,
+                "ILLOGIC": 21, "LENGERR": 22, "QZERO": 23, "SIGNAL": 24,
+                "QBUSY": 25, "ITEMERR": 26, "PGMIDERR": 27, "TRANSIDERR": 28,
+                "ENDDATA": 29, "INVTSREQ": 30, "EXPIRED": 31, "RETPAGE": 32,
+                "RTEFAIL": 33, "RTESOME": 34, "TSIOERR": 35, "MAPFAIL": 36,
+                "INVERRTERM": 37, "INVMPSZ": 38, "IGREQID": 39, "OVERFLOW": 40,
+                "INVLDC": 41, "NOSTG": 42, "JIDERR": 43, "QIDERR": 44,
+                "NOJBUFSP": 45, "DSSTAT": 46, "SELNERR": 47, "FUNCERR": 48,
+                "UNEXPIN": 49, "NOPASSBKRD": 50, "NOPASSBKWR": 51},
+    "DFHVALUE": {"NORMAL": 0, "CURSOR": 1},
+}
+
 
 def norm(text: str) -> str:
     """Conditions arrive folded across source lines; flatten them first."""
@@ -84,7 +103,14 @@ def parse_term(text: str) -> Term:
         return Term("const", value=FIGURATIVE[upper])
     m = _SUBSCRIPTED.match(text)
     if m:
-        return Term("var", name=m.group(1).upper(),
+        head = m.group(1).upper()
+        # DFHRESP(NOTFND) is a compile-time constant the translator replaces
+        # with a number; read as a subscript it becomes an array nobody can
+        # set, and the obligation on it is unsatisfiable.
+        if head in CICS_CONSTANTS:
+            return Term("const", value=CICS_CONSTANTS[head].get(
+                m.group(2).strip().upper(), 0))
+        return Term("var", name=head,
                     index=tuple(s.strip() for s in m.group(2).split(",")))
     return Term("var", name=upper)
 

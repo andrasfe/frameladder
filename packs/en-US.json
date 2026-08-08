@@ -1,0 +1,145 @@
+{
+  "name": "en-US",
+  "note": "A convention pack, not knowledge. Opt in with --conventions. Measured contribution on the CardDemo corpus: 1% of free-slot values, 0 targets of reachability.",
+  "roles": {
+    "date": [
+      "DATE",
+      "DT",
+      "DOB",
+      "BIRTH"
+    ],
+    "timestamp": [
+      "TIMESTAMP",
+      "TS",
+      "TIME",
+      "ORIG-TS",
+      "PROC-TS"
+    ],
+    "amount": [
+      "AMT",
+      "AMOUNT",
+      "BAL",
+      "BALANCE",
+      "LIMIT",
+      "CREDIT",
+      "DEBIT",
+      "TOTAL",
+      "FEE",
+      "INTEREST"
+    ],
+    "rate": [
+      "RATE",
+      "PCT",
+      "PERCENT"
+    ],
+    "card": [
+      "CARD-NUM",
+      "CARDNUM",
+      "PAN"
+    ],
+    "account": [
+      "ACCT-ID",
+      "ACCTID",
+      "ACCOUNT-ID"
+    ],
+    "identifier": [
+      "ID",
+      "NUM",
+      "NUMBER",
+      "KEY",
+      "SEQ"
+    ],
+    "name": [
+      "NAME",
+      "FNAME",
+      "LNAME",
+      "MIDDLE"
+    ],
+    "address": [
+      "ADDR",
+      "ADDRESS",
+      "STREET",
+      "CITY"
+    ],
+    "zip": [
+      "ZIP",
+      "POSTAL",
+      "ZIPCODE"
+    ],
+    "state": [
+      "STATE",
+      "STATE-CD",
+      "PROVINCE"
+    ],
+    "country": [
+      "COUNTRY",
+      "CTRY"
+    ],
+    "phone": [
+      "PHONE",
+      "TEL",
+      "MOBILE"
+    ],
+    "status": [
+      "STATUS",
+      "RC",
+      "RETURN-CODE",
+      "SQLCODE",
+      "RESP"
+    ],
+    "flag": [
+      "FLAG",
+      "FLG",
+      "SW",
+      "SWITCH",
+      "IND",
+      "INDICATOR"
+    ],
+    "code": [
+      "CODE",
+      "CD",
+      "TYPE",
+      "CAT",
+      "GROUP"
+    ]
+  },
+  "samples": {
+    "date": {
+      "8": "20250115",
+      "10": "2025-01-15",
+      "6": "250115",
+      "7": "2025015"
+    },
+    "timestamp": {
+      "26": "2025-01-15-12.30.45.000000",
+      "16": "2025-01-15-12.3",
+      "14": "20250115123045",
+      "10": "2025-01-15"
+    },
+    "card": {
+      "16": "4111111111111111"
+    },
+    "zip": {
+      "5": "12345",
+      "10": "12345-6789"
+    },
+    "state": {
+      "2": "NY"
+    },
+    "country": {
+      "2": "US",
+      "3": "USA"
+    },
+    "phone": {
+      "10": "2125551234",
+      "15": "(212)555-1234"
+    }
+  },
+  "words": {
+    "name": "JOHN SMITH",
+    "address": "1 MAIN STREET",
+    "status": "00",
+    "flag": "Y",
+    "code": "A"
+  }
+}

@@ -175,7 +175,13 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     share a prefix agree on the arbitrary values instead of each inventing
     their own - without ever overriding something a constraint decided.
     """
-    preferred = {k.upper(): v for k, v in (preferred or {}).items()}
+    # A VALUE clause is the program stating what a field starts as. That is a
+    # default rather than a constraint - a test may still set it - so it seeds
+    # the preferences instead of pinning anything. It is also the reason a
+    # named literal like LIT-MENUPGM stops being invented: the source said.
+    seeded = dict(program.model.initial)
+    seeded.update({k.upper(): v for k, v in (preferred or {}).items()})
+    preferred = seeded
     graph, prov = analyse(program)
     entry = (entry or program.paragraph_names[0]).upper()
     target = target.upper()
@@ -486,7 +492,8 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 # ladder cannot see into will reject an implausible one.
                 guess = preferred_value(
                     var_term.name, model.pic.get(var_term.name, ""),
-                    evidence=prov.literals.get(var_term.name, ()))
+                    evidence=prov.literals.get(var_term.name, ()),
+                    op=op, other=const_term.value)
                 if guess is not None and holds(guess, op, const_term.value):
                     value = guess
             if is_free and var_term.name in preferred:
