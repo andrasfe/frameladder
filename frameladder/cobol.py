@@ -740,12 +740,16 @@ _COPYBOOK_DIRS = ("cpy", "copy", "copybook", "copybooks", "cpylib", "include",
                   "cpy-bms")
 
 
-_COPY = re.compile(r"^\s*COPY\s+([A-Z0-9][A-Z0-9-]*)", re.I)
+# The member name may be quoted - `COPY 'CSUTLDWY'.` is legal, and matching
+# only the bare form means the copybook is silently never read: every field
+# it declares loses its PIC, its VALUE and its 88-levels, and the conditions
+# on them become unplannable.
+_COPY = re.compile(r"^\s*COPY\s+[\'\"]?([A-Z0-9][A-Z0-9-]*)", re.I)
 _COPY_SUFFIXES = ("", ".cpy", ".CPY", ".cbl", ".CBL", ".cob", ".COB", ".txt")
 
 
 _COPY_STMT = re.compile(
-    r"^\s*COPY\s+([A-Z0-9][A-Z0-9-]*)\s*(.*)$", re.I | re.S)
+    r"^\s*COPY\s+[\'\"]?([A-Z0-9][A-Z0-9-]*)[\'\"]?\s*(.*)$", re.I | re.S)
 _PSEUDO = re.compile(r"==(.*?)==\s+BY\s+==(.*?)==", re.I | re.S)
 _PLAIN_REPL = re.compile(r"(\S+)\s+BY\s+(\S+)", re.I)
 

@@ -7,11 +7,26 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from .conditions import condition_atoms, when_condition
-from .ir import Atom, Term, move_targets, negate_atom, norm, parse_term
+from .ir import (Atom, NEGATE, Term, move_targets, negate_atom, norm,
+                 parse_term)
 
 _VARYING = re.compile(
     r"VARYING\s+([A-Z0-9-]+)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.*)", re.I)
 _TERMINATORS = {"GO_TO", "GOTO", "GOBACK", "STOP", "EXIT_PROGRAM"}
+# CICS hands control away and does not come back: RETURN ends the program,
+# XCTL replaces it, ABEND kills the task. Each leaves the paragraph exactly as
+# a GOBACK does, and a pseudo-conversational program is nothing but these - so
+# not knowing them makes every statement after one look reachable when it is
+# not, and a paragraph PERFORMed from elsewhere appears to return.
+_CICS_TERMINATOR = re.compile(r"\bEXEC\s+CICS\s+(RETURN|XCTL|ABEND)\b", re.I)
+
+
+def leaves_paragraph(stmt: dict) -> bool:
+    """Does control leave the paragraph here, rather than fall through?"""
+    kind = stmt.get("type", "")
+    if kind in _TERMINATORS:
+        return True
+    return kind == "EXEC" and bool(_CICS_TERMINATOR.search(stmt.get("text", "")))
 
 
 @dataclass
@@ -38,6 +53,30 @@ def first_with_alternatives(alts) -> list:
         return list(chosen)
     head = chosen[0]
     return [Atom(head.lhs, head.op, head.rhs, head.origin, spares)] + list(chosen[1:])
+
+
+def contradicts(atom: Atom, asserted) -> bool:
+    """Would asserting this atom conflict with what is already asserted?
+
+    Used to decide whether an earlier escape's negation can be carried.
+    Sharing a *variable* is not a conflict and testing for that was the
+    defect: a paragraph that screens one field against a run of values -
+    ``IF BANK = 'B1' GO TO exit`` then ``IF BANK = 'B2' GO TO exit`` - has
+    every escape after the first about a variable already seen, so all of
+    them were dropped and the plan claimed to avoid escapes it did not.
+    Only a genuine conflict is a reason to stop.
+    """
+    for other in asserted:
+        if other.lhs.key != atom.lhs.key:
+            continue
+        same_rhs = other.rhs.key == atom.rhs.key
+        if same_rhs and NEGATE.get(other.op) == atom.op:
+            return True
+        if not same_rhs and other.op == "=" and atom.op == "=":
+            # One field cannot equal two different constants at once.
+            if other.rhs.kind == "const" and atom.rhs.kind == "const":
+                return True
+    return False
 
 
 def substitute(atoms, bindings: dict) -> list:
@@ -287,14 +326,14 @@ def obligations_for_branch(program, paragraph: str, line: int,
     # so every decision after the first escape is unreachable unless that is
     # said. The same computation already guards call sites; it was simply
     # never applied to the decisions themselves.
-    own = {v for a in found for v in a.variables}
-    for escape_line, negation in _escapes(para):
+    for escape_line, ways in _escapes(para):
         if escape_line >= line:
             continue
-        if own & {v for a in negation for v in a.variables}:
-            continue
-        own |= {v for a in negation for v in a.variables}
-        found.extend(negation)
+        for negation in ways:
+            if any(contradicts(a, found) for a in negation):
+                continue
+            found.extend(a for a in negation if a not in found)
+            break
     return found
 
 
@@ -307,6 +346,9 @@ _ABEND_CALLS = {"CEE3ABD", "ILBOABN0", "ILBOABN", "CANCEL"}
 
 def _ends_run(stmt: dict) -> bool:
     if stmt.get("type", "") in _ENDERS:
+        return True
+    if stmt.get("type", "") == "EXEC" and _CICS_TERMINATOR.search(
+            stmt.get("text", "")):
         return True
     if stmt.get("type", "") == "CALL":
         target = norm(stmt.get("attributes", {}).get("target", "")).strip("'\" ")
@@ -456,18 +498,21 @@ def build_graph(program) -> dict:
         # the ladder lifts no obligation at all for the hop it enables.
         escapes = _escapes(para)
         for site in sites:
-            own = {v for g in site.guards for v in g.variables}
-            for line, negation in escapes:
+            for line, ways in escapes:
                 if line >= site.line:
                     continue
-                # An escape whose condition is about the same variables the
-                # site is already guarded on is a sibling branch, not an
-                # earlier exit - an EVALUATE arm, say. Its guard is already
-                # settled by the site's own, and re-asserting the negation
-                # only manufactures a contradiction.
-                if own & {v for a in negation for v in a.variables}:
-                    continue
-                site.guards = list(site.guards) + list(negation)
+                # An escape whose negation contradicts what the site is
+                # already guarded on is a sibling branch, not an earlier
+                # exit - an EVALUATE arm, say - and re-asserting it only
+                # manufactures a contradiction. Sharing a *variable* is not
+                # that: a run of screens over one field is all the same
+                # variable and every one of them is a real earlier exit.
+                for negation in ways:
+                    if any(contradicts(a, site.guards) for a in negation):
+                        continue
+                    site.guards = list(site.guards) + [
+                        a for a in negation if a not in site.guards]
+                    break
         graph[para["name"]] = sites
 
     for altered, destination, line, guards in alters:
@@ -520,13 +565,25 @@ def completes(statements) -> bool:
 
 
 def _escapes(paragraph: dict) -> list:
-    """Guarded ways out of a paragraph, each with the condition that avoids it."""
+    """Guarded ways out of a paragraph, each with the ways to avoid it.
+
+    ``NOT (A AND B)`` is satisfied by negating *either* conjunct, so an
+    escape offers one avoidance per enclosing condition rather than one
+    overall. Returning only the innermost was enough while every escape
+    tested a field of its own; where a screening run shares a field - `IF
+    CTRY = 'S3' AND APPROVED = 'N'` then `IF CTRY = 'S4' AND APPROVED = 'N'`
+    - the innermost negation is `APPROVED NOT = 'N'` every time, which
+    contradicts any target that needs `APPROVED = 'N'` and leaves the
+    escape unavoided. The alternatives are ordered innermost-first, which
+    keeps the previous choice as the default.
+    """
     out: list = []
 
     def visit(stmt, pname, own_guards, induction, literals):
-        if stmt.get("type") not in _TERMINATORS or not own_guards:
+        if not leaves_paragraph(stmt) or not own_guards:
             return
-        out.append((stmt.get("line_start", 0), negate_atom(own_guards[-1])))
+        ways = [negate_atom(g) for g in reversed(list(own_guards))]
+        out.append((stmt.get("line_start", 0), ways))
 
     walk_guarded(paragraph, visit)
     return out
@@ -546,7 +603,7 @@ def _fallthrough_guards(paragraph: dict) -> tuple[list, bool]:
     escaped = [not completes(paragraph.get("statements") or [])]
 
     def visit(stmt, pname, own_guards, induction, literals):
-        if stmt.get("type") not in _TERMINATORS:
+        if not leaves_paragraph(stmt):
             return
         if not own_guards:
             escaped[0] = True

@@ -99,7 +99,8 @@ def compile_and_run(src: str, work: str, copybooks=(), env_extra=None,
     for extra in ([], ["-free"]):
         includes = [a for d in copybooks for a in ("-I", d)]
         proc = subprocess.run(["cobc", "-x", *extra, *includes, src, "-o", binary],
-                              capture_output=True, text=True, cwd=work)
+                              capture_output=True, text=True,
+                              errors="replace", cwd=work)
         if proc.returncode == 0:
             break
         errors.append((extra, (proc.stderr or "").strip()))
@@ -116,6 +117,7 @@ def compile_and_run(src: str, work: str, copybooks=(), env_extra=None,
         env = dict(os.environ)
         env.update(env_extra or {})
         run = subprocess.run([binary], capture_output=True, text=True,
+                             errors="replace",
                              cwd=work, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None, "timed out"

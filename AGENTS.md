@@ -91,6 +91,18 @@ bound no state exposed it. If a branch settles an obligation, it either
 produced a binding or it appended to `open_obligations`. There is no third
 option, and a plan that claims to be solved is a claim someone will rely on.
 
+**Nothing is pinned, and nothing may be.** `interpreter.assign` used to
+return early for any variable present in the entry state, so the program's
+own assignments to it were discarded for the whole run. No COBOL construct
+models that. It let a failed OPEN run `MOVE 12 TO APPL-RESULT` and the next
+line still find `88 APPL-AOK VALUE 0` true - both arms scored in one run no
+compiler can produce. Removing it cost roughly a third of the reported
+coverage and is not negotiable: an entry state supplies a variable's
+*initial* value and the program owns it from then on. A plan whose value is
+overwritten before the target needs an obligation about that write, which is
+what `blocking_writes` and `establishing_writes` are for - not a plan that
+needs the write suppressed.
+
 **Some of the coverage was phantom.** `X(2:8)`, `FUNCTION TRIM(X)` and
 `X NOT NUMERIC` all parsed as *variable names*, so the sampler set them
 directly and scored the directions they gated - 24 such pseudo-variables
@@ -221,8 +233,20 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 97.2%, range 72.5-100%** (2796/2976 directions).
-Nine programs are at 100%. Quote the median and the
+**28 programs, median 82.4%, range 6.4-100%, pooled 1639/3200 = 51.2%.**
+
+That is a third lower than this file claimed a day earlier, and the drop is
+the point. The old figure was measuring an artefact: every variable in the
+entry state was frozen for the whole run (see *Nothing is pinned* below), so
+the sampler ran each program with exactly the fields that gate its branches
+turned into constants. GnuCOBOL, driven with the tool's own states, confirmed
+only 61% of the directions that number claimed.
+
+Quote the pooled figure alongside the median. The median flatters: the
+failures are concentrated in the large CICS programs, where a plan has to
+survive the program's own writes all the way to the target and mostly does
+not. COACTUPC is at 6.4% and that is an honest measurement of the planner,
+not a bug. Quote the median and the
 range.
 
 The lowest is CORPT00C at 72.5%. It dipped to 58.8% when the interpreter

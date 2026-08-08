@@ -79,6 +79,20 @@ def split_top(text: str, keyword: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+_NEGATED_NAME = re.compile(r"^\s*NOT\s+[A-Z0-9][A-Z0-9-]*\s*$", re.I)
+
+
+def _is_negated_name(part: str) -> bool:
+    """`NOT SOME-FLAG` is a condition-name being negated, not a bare operand.
+
+    Restoring the subject onto it yields `A = 'NOT SOME-FLAG'` - a comparison
+    against a field named after the phrase, which no value can satisfy. It is
+    the same mistake as reading `X(2:8)` or `FUNCTION TRIM(X)` as a variable,
+    and it makes the arm permanently false rather than merely imprecise.
+    """
+    return bool(_NEGATED_NAME.match(part or ""))
+
+
 def expand_abbreviated(parts: list[str]) -> list[str]:
     """Restore the subject COBOL lets you leave out.
 
@@ -98,7 +112,7 @@ def expand_abbreviated(parts: list[str]) -> list[str]:
             # relation is there but the subject is not, and reading the empty
             # left side as a constant compares nothing against 10.
             out.append("%s %s" % (subject[0], part))
-        elif subject and not m:
+        elif subject and not m and not _is_negated_name(part):
             out.append("%s %s %s" % (subject[0], subject[1], part))
         else:
             out.append(part)

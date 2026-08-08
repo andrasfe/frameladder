@@ -66,6 +66,51 @@ _CICS_SELECTORS = {"DATASET", "FILE", "PROGRAM", "MAPSET", "MAP", "QUEUE",
                    "TRANSID", "SYSID", "TABLE"}
 _HOST_VAR = re.compile(r":\s*([A-Z][A-Z0-9-]*)", re.I)
 
+# Where a USING list stops. RETURNING/GIVING is an output but not a parameter,
+# and the handlers are statements rather than operands.
+_USING_END = re.compile(r"\b(RETURNING|GIVING|ON\s+EXCEPTION|NOT\s+ON\s+EXCEPTION"
+                        r"|ON\s+OVERFLOW|END-CALL)\b", re.I)
+# BY CONTENT and BY VALUE hand the callee a copy, so it cannot write back
+# through them. BY REFERENCE - the default - it can.
+_BY_MODE = re.compile(r"\bBY\s+(REFERENCE|CONTENT|VALUE)\b", re.I)
+_OPERAND = re.compile(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*", re.I)
+_NOT_OPERAND = {"BY", "REFERENCE", "CONTENT", "VALUE", "ADDRESS", "OF",
+                "LENGTH", "OMITTED", "USING", "CALL"}
+
+
+def call_outputs(flat: str) -> list[str]:
+    """Every operand a CALL passes BY REFERENCE.
+
+    COBOL passes BY REFERENCE unless told otherwise, so *every* operand in
+    the USING list is somewhere the callee can write. Reading only the first
+    name after ``USING`` makes the ones that matter invisible: MQ hands its
+    completion and reason codes back in the fifth and sixth operands, and
+    DL/I hands its status back inside the PCB in the second. Every arm those
+    gate is then unreachable, not because the ladder could not lift the
+    obligation but because nothing was recorded as producing the value.
+    """
+    m = re.search(r"\bUSING\b(.*)$", flat, re.I | re.S)
+    if not m:
+        return []
+    tail = m.group(1)
+    stop = _USING_END.search(tail)
+    if stop:
+        tail = tail[: stop.start()]
+    out, mode = [], "REFERENCE"
+    pos = 0
+    for token in _OPERAND.finditer(tail):
+        word = token.group(0).upper()
+        by = _BY_MODE.match(tail, token.start()) if word == "BY" else None
+        if by:
+            mode = by.group(1).upper()
+            continue
+        if word in _NOT_OPERAND or tail[max(0, token.start() - 1)] in "'\"":
+            continue
+        if mode == "REFERENCE":
+            out.append(word)
+        pos = token.end()
+    return list(dict.fromkeys(out))
+
 
 def exec_operands(text: str) -> dict:
     """Clause name -> operand, for an EXEC block."""
@@ -91,8 +136,10 @@ def stub_outputs(text: str) -> list[str]:
                                                          operand, re.I))
         return list(dict.fromkeys(out))
 
-    out = [m.group(1).upper() for m in
-           re.finditer(r"\b(?:USING|INTO)\s+([A-Z0-9-]+)", flat, re.I)]
+    out = call_outputs(flat)
+    out.extend(m.group(1).upper() for m in
+               re.finditer(r"\bINTO\s+([A-Z0-9-]+)", flat, re.I))
+    out = list(dict.fromkeys(out))
     if not out:
         out = [m.group(2).upper() for m in
                re.finditer(r"\b(READ|OPEN|CLOSE|RETURN)\s+([A-Z0-9-]+)", flat, re.I)]

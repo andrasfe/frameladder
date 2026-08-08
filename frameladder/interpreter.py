@@ -43,6 +43,24 @@ RUNAWAY = 400        # one paragraph running this often is a loop, not progress
 # without it every abend path looks like it carries on executing.
 TERMINATING_CALLS = {"CEE3ABD", "ILBOABN0", "ILBOABN", "CANCEL"}
 
+# CICS commands that hand control away and never come back. RETURN ends the
+# program, XCTL replaces it, ABEND kills the task - none of them fall through
+# to the next statement. Running on past one is the CICS equivalent of running
+# on past GOBACK: every statement after it looks reachable when it is not.
+TERMINATING_EXECS = {"EXEC:CICS:RETURN", "EXEC:CICS:XCTL", "EXEC:CICS:ABEND"}
+
+# A pseudo-conversational program does not run once. `EXEC CICS RETURN
+# TRANSID(T) COMMAREA(C)` ends *this* task and asks CICS to start T again on
+# the next input, handing it back C - so the program is re-entered from the
+# top with its own saved state and EIBCALEN non-zero. Modelling one task per
+# run is correct for the task and wrong for the application: everything the
+# program does on re-entry becomes unreachable, which on a screen program is
+# most of it. Bounded, because each task is a fixed point once the commarea
+# stops changing.
+MAX_TASKS = 4
+_RETURN_TRANSID = re.compile(r"\bTRANSID\s*\(", re.I)
+_RETURN_COMMAREA = re.compile(r"\bCOMMAREA\s*\(\s*([A-Z0-9-]+)", re.I)
+
 # FUNCTION CURRENT-DATE returns YYYYMMDDhhmmssttshhmm. Reading the real clock
 # would break determinism, which is an invariant here, so one instant stands
 # for "now" in every run.
@@ -124,6 +142,10 @@ class _Stop(Exception):
     pass
 
 
+class _NextTask(Exception):
+    """`EXEC CICS RETURN TRANSID(...)`: this task ends, another one starts."""
+
+
 class _ExitParagraph(Exception):
     """`EXIT PARAGRAPH` / `EXIT SECTION`: leave this paragraph, keep running."""
 
@@ -187,7 +209,27 @@ class Interpreter:
         self.sequential = sequential
         self.trace = Trace()
         self._names = program.paragraph_names
-        self._pinned = set(self.state)
+        # Nothing is pinned. An entry state supplies a variable's *initial*
+        # value; from then on the program owns it, and a COBOL program
+        # assigns to its inputs constantly.
+        #
+        # Freezing them was the single largest source of wrong answers here.
+        # `coverage --sample` draws a state over every name the program
+        # compares against a literal - precisely the variables that gate
+        # branches - so the run proceeded with its most decision-relevant
+        # fields turned into read-only constants: file statuses that never
+        # update, flags that never flip, end-of-file that never arrives. In
+        # CBACT01C a failed OPEN would run `MOVE 12 TO APPL-RESULT` and the
+        # very next line would still find `88 APPL-AOK VALUE 0` true, scoring
+        # both arms in one run that no compiler can produce. Honouring
+        # assignments costs a third of the reported coverage and agrees with
+        # GnuCOBOL instead of contradicting it.
+        #
+        # A plan whose value the program overwrites before the target is a
+        # plan that needs an obligation about that write - which is what
+        # `blocking_writes` and `establishing_writes` are for - not a plan
+        # that needs the write suppressed.
+        self._pinned: set = set()
         self._delivered: dict = {}
         self._visits: dict = {}
         self._layouts: dict = {}
@@ -530,29 +572,53 @@ class Interpreter:
 
     # -- execution ---------------------------------------------------------
     def run(self, entry: str) -> Trace:
-        index = self._names.index(entry.upper()) if entry.upper() in self._names else 0
+        start = self._names.index(entry.upper()) if entry.upper() in self._names else 0
+        for task in range(MAX_TASKS):
+            if self._one_task(start, task) is not True:
+                break
+        return self.trace
+
+    def _one_task(self, start: int, task: int) -> bool:
+        """Run one CICS task. True when another one follows."""
+        # A re-entered transaction arrives with a commarea, and every
+        # program worth the name branches on whether it has one. Leaving
+        # EIBCALEN at its first-task value makes every re-entry look like a
+        # first entry, so the whole re-entry half of the program stays dark.
+        if task:
+            saved = getattr(self, "_commarea", "")
+            if saved:
+                value = self._stored(saved)
+                if value is not None:
+                    self.state["DFHCOMMAREA"] = value
+                if "EIBCALEN" not in self._pinned:
+                    self.state["EIBCALEN"] = self._width(saved) or 100
+            elif "EIBCALEN" not in self._pinned:
+                self.state["EIBCALEN"] = 100
+        index = start
         while 0 <= index < len(self._names):
             para = self.program.paragraphs[index]
             try:
                 self.perform(para["name"], depth=0)
+            except _NextTask:
+                return True
             except _Stop:
                 if not self.trace.stopped:
                     self.trace.stopped = ("runaway loop in %s" % self.trace.runaway
                                           if self.trace.runaway
                                           else "STOP RUN / GOBACK")
-                break
+                return False
             except _Goto as jump:
                 if jump.target in self._names:
                     index = self._names.index(jump.target)
                     continue
-                break
+                return False
             except RecursionError:
                 self.trace.stopped = "recursion limit"
-                break
+                return False
             if not self.sequential:
-                break
+                return False
             index += 1
-        return self.trace
+        return False
 
     def _tick(self, name: str) -> None:
         """Notice a paragraph running away.
@@ -748,8 +814,23 @@ class Interpreter:
 
         if kind == "MOVE":
             source = parse_term(attrs.get("source", ""))
-            value = self.value_of(source)
             from .ir import move_targets
+            # `MOVE DFHCOMMAREA(1:EIBCALEN) TO <commarea>` on re-entry is the
+            # program taking back the state it saved at RETURN. Modelled as an
+            # ordinary group move it copies an empty linkage area over that
+            # state and clears the re-entry flag, so every task believes it is
+            # the first - which is why a screen program appears to have an
+            # unreachable second half. The contents are carried across the
+            # task boundary as fields, because that is what they are here:
+            # the group itself holds no bytes of its own.
+            if source.name == "DFHCOMMAREA" and getattr(self, "_carried", None):
+                for name in move_targets(attrs.get("targets", "")):
+                    for child, value in self._carried.items():
+                        if child not in self._pinned:
+                            self.state[child] = value
+                    del name
+                return
+            value = self.value_of(source)
             for name in move_targets(attrs.get("targets", "")):
                 self.assign(name, value)
             return
@@ -795,6 +876,28 @@ class Interpreter:
         self.calls[key] = self.calls.get(key, 0) + 1
         if key.startswith("CALL:") and key[5:] in TERMINATING_CALLS:
             self.trace.stopped = "terminated by %s" % key[5:]
+            raise _Stop()
+        if key in TERMINATING_EXECS:
+            # RETURN *with* TRANSID re-invokes the transaction; RETURN
+            # without one hands control back for good.
+            if key == "EXEC:CICS:RETURN" and _RETURN_TRANSID.search(
+                    stmt.get("text", "") or ""):
+                # What this task returns as its commarea is literally what
+                # the next task receives in DFHCOMMAREA. Without the handoff
+                # the re-entered program copies an empty DFHCOMMAREA over its
+                # own state and resets the very flag that tells it this is a
+                # re-entry - so every task looks like the first one and the
+                # whole second half of the program stays dark.
+                m = _RETURN_COMMAREA.search(stmt.get("text", "") or "")
+                if m:
+                    self._commarea = m.group(1).upper()
+                    kept = {}
+                    for child in self.model.descendants(self._commarea):
+                        if child in self.state:
+                            kept[child] = self.state[child]
+                    self._carried = kept
+                raise _NextTask()
+            self.trace.stopped = "terminated by %s" % key
             raise _Stop()
         entries = self.stubs.get(key, [])
         matched = False
