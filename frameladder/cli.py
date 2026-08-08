@@ -358,32 +358,57 @@ def cmd_names(args):
                 continue
             undecided.setdefault(var, pic)
 
+    def described(var: str) -> str:
+        """PIC alone is not the type. USAGE decides the representation, and a
+        REDEFINES means the bytes are shared with something else."""
+        model = program.model
+        parts = [model.pic.get(var) or "(no PIC)"]
+        usage = model.usage.get(var)
+        if usage:
+            parts.append(usage)
+        if model.sign.get(var):
+            parts.append("SIGN " + model.sign[var])
+        if model.occurs.get(var):
+            parts.append("OCCURS %d" % model.occurs[var])
+        if model.redefines.get(var):
+            parts.append("REDEFINES " + model.redefines[var])
+        return " ".join(parts)
+
     groups: dict = {}
-    for var, pic in undecided.items():
+    for var, _pic in undecided.items():
         for token in var.split("-"):
             if len(token) < 2 or token.isdigit():
                 continue
-            entry_ = groups.setdefault(token, {"fields": [], "pics": set()})
+            entry_ = groups.setdefault(token, {"fields": [], "types": set(),
+                                               "origins": set()})
             entry_["fields"].append(var)
-            entry_["pics"].add(pic or "(undeclared)")
+            entry_["types"].add(described(var))
+            entry_["origins"].add(program.model.origin.get(var, "(undeclared)"))
 
     rows = sorted(({"token": t, "fields": sorted(v["fields"]),
-                    "pics": sorted(v["pics"]), "count": len(v["fields"])}
+                    "types": sorted(v["types"]),
+                    "declared_in": sorted(v["origins"]),
+                    "count": len(v["fields"])}
                    for t, v in groups.items()),
                   key=lambda r: (-r["count"], r["token"]))
     if args.limit:
         rows = rows[: args.limit]
     payload = {"program": program.name, "entry": entry,
+               "copybooks": list(program.model.copybooks),
                "undecided_fields": len(undecided), "tokens": rows}
 
     def render(p):
-        print("%s: %d values the program never pins down, sharing %d tokens.\n"
+        print("%s: %d values the program never pins down, sharing %d tokens."
               % (p["program"], p["undecided_fields"], len(p["tokens"])))
-        print("%-14s %6s  %-28s %s" % ("token", "fields", "shapes", "examples"))
+        print("copybooks read: %s\n"
+              % (", ".join(p["copybooks"]) or "(none COPYed)"))
+        print("%-14s %6s  %-30s %-18s %s"
+              % ("token", "fields", "type", "declared in", "examples"))
         for r in p["tokens"]:
-            print("%-14s %6d  %-28s %s"
-                  % (r["token"], r["count"], ",".join(r["pics"][:2]),
-                     ", ".join(r["fields"][:3])))
+            print("%-14s %6d  %-30s %-18s %s"
+                  % (r["token"], r["count"], "; ".join(r["types"][:1])[:30],
+                     ",".join(r["declared_in"][:1])[:18],
+                     ", ".join(r["fields"][:2])))
         print("\nDecide a token once and it settles every field carrying it:")
         print("  frameladder %s --work-dir DIR bind --bind \"<FIELD>=<value>\" "
               "--why \"...\"" % args.program)

@@ -230,14 +230,30 @@ program was written by one team with one convention, so the convention is
 discoverable from the source rather than assumed:
 
 ```bash
-frameladder COACTUPC.cbl names
+frameladder CBACT04C.cbl names
 ```
 ```
-COACTUPC: 8 values the program never pins down, sharing 6 tokens.
-token          fields  shapes          examples
-AID                 2  (undeclared)    CCARD-AID-PFK03, CCARD-AID-PFK12
-CDEMO               2  (undeclared)    CDEMO-PGM-ENTER, CDEMO-PGM-REENTER
+CBACT04C: 1 value the program never pins down, sharing 3 tokens.
+copybooks read: CVTRA01Y, CVACT03Y, CVTRA02Y, CVACT01Y, CVTRA05Y
+
+token     fields  type          declared in     examples
+DIS            1  S9(04)V99     CVTRA02Y.cpy    DIS-INT-RATE
+RATE           1  S9(04)V99     CVTRA02Y.cpy    DIS-INT-RATE
 ```
+
+The entry carries the **type**, not just the shape. `PIC` alone does not
+determine representation: `S9(4) COMP` is two binary bytes truncated to four
+decimal digits, `S9(4) COMP-3` is three packed bytes with a sign nibble, and
+`S9(4) DISPLAY` is four characters with an overpunched sign. They compare
+equal and serialise completely differently — which is exactly where a
+migration diverges — so `USAGE`, `REDEFINES`, `SIGN` and `OCCURS` are read
+alongside `PIC`, and every field records which file declared it.
+
+It covers **every** variable, not just copybook ones. For CBACT04C that is 86
+declared in the program and 43 across its five copybooks — and only its five:
+loading the whole directory gave 2,640 fields, 95% of them belonging to other
+programs, which inflates the declared set that live-in filtering and record
+association both key off. `COPY` statements say which members are wanted.
 
 `questions` lists the same set field by field; `bind --why` records a
 decision; the journal makes it permanent, so it is asked once and is data
@@ -599,6 +615,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 71 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 76 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

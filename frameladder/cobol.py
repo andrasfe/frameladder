@@ -63,6 +63,22 @@ _DECL = re.compile(r"^\s*(\d\d)\s+([A-Z0-9][A-Z0-9-]*)\b(.*)$", re.I)
 _PIC_IN = re.compile(r"\bPIC(?:TURE)?\s+(?:IS\s+)?(\S+)", re.I)
 _VALUE_IN = re.compile(r"\bVALUE\s+(?:IS\s+)?('[^']*'|\"[^\"]*\"|[A-Z0-9+-]+)", re.I)
 _OCCURS = re.compile(r"\bOCCURS\s+(\d+)", re.I)
+# USAGE decides the *representation*, which PIC does not. S9(4) COMP is two
+# binary bytes truncated to four decimal digits; S9(4) COMP-3 is three packed
+# bytes with a sign nibble; S9(4) DISPLAY is four characters with an
+# overpunched sign. They compare equal and serialise completely differently,
+# which is exactly where a migration diverges.
+_USAGE = re.compile(r"\b(?:USAGE\s+(?:IS\s+)?)?(COMP-[1-5]|COMPUTATIONAL-[1-5]|"
+                    r"COMP|COMPUTATIONAL|BINARY|PACKED-DECIMAL|DISPLAY|"
+                    r"INDEX|POINTER)\b", re.I)
+_REDEFINES = re.compile(r"\bREDEFINES\s+([A-Z0-9][A-Z0-9-]*)", re.I)
+_SIGN = re.compile(r"\bSIGN\s+(?:IS\s+)?(LEADING|TRAILING)"
+                   r"(\s+SEPARATE)?", re.I)
+
+_USAGE_CANON = {"COMPUTATIONAL": "COMP", "COMPUTATIONAL-1": "COMP-1",
+                "COMPUTATIONAL-2": "COMP-2", "COMPUTATIONAL-3": "COMP-3",
+                "COMPUTATIONAL-4": "COMP-4", "COMPUTATIONAL-5": "COMP-5",
+                "PACKED-DECIMAL": "COMP-3"}
 _LEVEL88 = re.compile(r"^\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(?:ARE\s+|IS\s+)?(.*)$", re.I)
 
 
@@ -148,6 +164,11 @@ class DataModel:
     parent: dict = field(default_factory=dict)
     declared: set = field(default_factory=set)
     condition_names: dict = field(default_factory=dict)   # 88 name -> (parent, values)
+    usage: dict = field(default_factory=dict)             # field -> COMP-3/BINARY/...
+    redefines: dict = field(default_factory=dict)         # field -> field it overlays
+    sign: dict = field(default_factory=dict)              # field -> LEADING/TRAILING[ SEPARATE]
+    origin: dict = field(default_factory=dict)            # field -> file it was declared in
+    copybooks: list = field(default_factory=list)         # members actually COPYed
     file_status: dict = field(default_factory=dict)       # file -> status variable
     fd_records: dict = field(default_factory=dict)        # file -> record areas
     organization: dict = field(default_factory=dict)      # file -> SEQUENTIAL/INDEXED
@@ -161,6 +182,10 @@ class DataModel:
         self.occurs.update(other.occurs)
         self.parent.update(other.parent)
         self.declared |= other.declared
+        self.usage.update(other.usage)
+        self.redefines.update(other.redefines)
+        self.sign.update(other.sign)
+        self.origin.update(other.origin)
         self.condition_names.update(other.condition_names)
         self.file_status.update(other.file_status)
         self.organization.update(other.organization)
@@ -206,7 +231,8 @@ def parse_data_division(path: str) -> DataModel:
                 continue
             while stack and stack[-1][0] >= level:
                 stack.pop()
-            model.declared.add(name)
+            if name != "FILLER":                  # a placeholder, not a field
+                model.declared.add(name)
             if stack:
                 model.parent[name] = stack[-1][1]
                 for _lvl, ancestor in stack:
@@ -220,6 +246,18 @@ def parse_data_division(path: str) -> DataModel:
             o = _OCCURS.search(rest)
             if o:
                 model.occurs[name] = int(o.group(1))
+            u = _USAGE.search(rest)
+            if u:
+                raw = u.group(1).upper()
+                model.usage[name] = _USAGE_CANON.get(raw, raw)
+            rd = _REDEFINES.search(rest)
+            if rd:
+                model.redefines[name] = rd.group(1).upper()
+            sg = _SIGN.search(rest)
+            if sg:
+                model.sign[name] = (sg.group(1).upper()
+                                    + (" SEPARATE" if sg.group(2) else "")).strip()
+            model.origin[name] = os.path.basename(path)
             stack.append((level, name))
         buffer = ""
     return model
@@ -573,6 +611,39 @@ _COPYBOOK_DIRS = ("cpy", "copy", "copybook", "copybooks", "cpylib", "include",
                   "cpy-bms")
 
 
+_COPY = re.compile(r"^\s*COPY\s+([A-Z0-9][A-Z0-9-]*)", re.I)
+_COPY_SUFFIXES = ("", ".cpy", ".CPY", ".cbl", ".CBL", ".cob", ".COB", ".txt")
+
+
+def copy_members(source: str) -> list:
+    """The copybooks a program actually COPYs.
+
+    Loading every copybook in the directory is over-inclusive: it inflates the
+    set of declared names, which is what live-in filtering and record
+    association both key off, and on an estate where two copybooks define the
+    same name differently it silently picks one. The program says which ones
+    it wants.
+    """
+    out = []
+    for line in read_lines(source):
+        m = _COPY.match(line.text)
+        if m:
+            out.append(m.group(1).upper())
+    return list(dict.fromkeys(out))
+
+
+def resolve_member(member: str, directories) -> str | None:
+    for directory in directories:
+        for suffix in _COPY_SUFFIXES:
+            candidate = os.path.join(directory, member + suffix)
+            if os.path.isfile(candidate):
+                return candidate
+            lower = os.path.join(directory, member.lower() + suffix)
+            if os.path.isfile(lower):
+                return lower
+    return None
+
+
 def find_copybooks(source: str) -> list:
     """Conventional copybook directories beside or just above the source.
 
@@ -612,12 +683,25 @@ def load_program(path: str, copybooks: str | None = None) -> Program:
         model = parse_data_division(path)
         program = Program(os.path.splitext(os.path.basename(path))[0],
                           parse_procedure(lines), model, path)
-    directories = ([copybooks] if copybooks and os.path.isdir(copybooks)
-                   else find_copybooks(program.source_path or path))
-    for directory in directories:
-        for entry in sorted(os.listdir(directory)):
-            full = os.path.join(directory, entry)
-            if os.path.isfile(full):
-                model.merge(parse_data_division(full))
+    directories = find_copybooks(program.source_path or path)
+    if copybooks and os.path.isdir(copybooks):
+        directories = [copybooks] + directories
+
+    wanted = copy_members(program.source_path or path)
+    loaded = []
+    for member in wanted:
+        resolved = resolve_member(member, directories)
+        if resolved:
+            model.merge(parse_data_division(resolved))
+            loaded.append(member)
+    if not wanted:
+        # No COPY statements to go on - the AST path, or a program that
+        # declares everything inline. Fall back to the directory.
+        for directory in directories:
+            for entry in sorted(os.listdir(directory)):
+                full = os.path.join(directory, entry)
+                if os.path.isfile(full):
+                    model.merge(parse_data_division(full))
+    model.copybooks = loaded
     program.model = model
     return program

@@ -1263,3 +1263,76 @@ class TestCopybookDiscovery(unittest.TestCase):
         path = os.path.join(root, "P.cbl")
         open(path, "w").close()
         self.assertTrue(find_copybooks(path))
+
+
+class TestDictionary(unittest.TestCase):
+    """The dictionary carries the type, not just the name."""
+
+    def test_usage_is_part_of_the_type(self):
+        import tempfile
+        # PIC does not determine representation. S9(4) COMP is two binary
+        # bytes, COMP-3 is three packed bytes with a sign nibble, DISPLAY is
+        # four characters - they compare equal and serialise differently,
+        # which is where a migration diverges.
+        path = tempfile.NamedTemporaryFile("w", suffix=".cbl", delete=False)
+        path.write(HEADER + """       01  WS-BIN  PIC S9(4) COMP.
+       01  WS-PACK PIC S9(4) COMP-3.
+       01  WS-CHAR PIC S9(4).
+       01  WS-ALIAS REDEFINES WS-CHAR PIC X(4).
+       01  WS-TAB PIC X(2) OCCURS 5 TIMES.
+       PROCEDURE DIVISION.
+       AL-MAIN.
+           GOBACK
+           .
+""")
+        path.close()
+        m = cobol.load_program(path.name).model
+        self.assertEqual(m.usage.get("WS-BIN"), "COMP")
+        self.assertEqual(m.usage.get("WS-PACK"), "COMP-3")
+        self.assertIsNone(m.usage.get("WS-CHAR"))
+        self.assertEqual(m.redefines.get("WS-ALIAS"), "WS-CHAR")
+        self.assertEqual(m.occurs.get("WS-TAB"), 5)
+
+    def test_packed_decimal_spellings_are_one_type(self):
+        import tempfile
+        path = tempfile.NamedTemporaryFile("w", suffix=".cbl", delete=False)
+        path.write(HEADER + """       01  A PIC S9(4) COMP-3.
+       01  B PIC S9(4) USAGE IS COMP-3.
+       01  C PIC S9(4) PACKED-DECIMAL.
+       PROCEDURE DIVISION.
+       AM-MAIN.
+           GOBACK
+           .
+""")
+        path.close()
+        m = cobol.load_program(path.name).model
+        self.assertEqual({m.usage.get(n) for n in "ABC"}, {"COMP-3"})
+
+    def test_every_field_records_where_it_was_declared(self):
+        p = program(HEADER + """       01  WS-LOCAL PIC X(2).
+       PROCEDURE DIVISION.
+       AN-MAIN.
+           GOBACK
+           .
+""")
+        self.assertTrue(p.model.origin.get("WS-LOCAL", "").endswith(".cbl"))
+
+    def test_filler_is_not_a_field(self):
+        p = program(HEADER + """       01  WS-REC.
+           05  FILLER PIC X(4).
+           05  WS-REAL PIC X(2).
+       PROCEDURE DIVISION.
+       AO-MAIN.
+           GOBACK
+           .
+""")
+        self.assertIn("WS-REAL", p.model.declared)
+        self.assertNotIn("FILLER", p.model.declared)
+
+    def test_not_equals_without_a_space(self):
+        # `IF X NOT= Y` is as legal as `NOT =`, and a mandatory space made
+        # the whole relation fall through to the bare `=`, yielding a
+        # variable called "X NOT".
+        for text in ("X NOT= Y", "X NOT = Y", "X IS NOT= Y", "X NOT EQUAL Y"):
+            atoms = conditions.condition_atoms(text)[0]
+            self.assertEqual(str(atoms[0]), "X != Y", text)

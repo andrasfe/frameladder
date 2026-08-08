@@ -16,7 +16,7 @@ _RELATIONS = [
     "LESS THAN OR EQUAL TO", "EQUAL TO", "GREATER THAN", "LESS THAN",
     "NOT EQUAL", "NOT GREATER", "NOT LESS", "IS EQUAL", "IS GREATER",
     "IS LESS", "EQUALS", "EQUAL", "EXCEEDS", "GREATER", "LESS",
-    "NOT =", "IS NOT", ">=", "<=", "<>", "!=", "=", ">", "<",
+    "IS NOT =", "NOT =", "IS NOT", ">=", "<=", "<>", "!=", "=", ">", "<",
 ]
 def _relation_pattern(text: str) -> str:
     """A word-operator needs word boundaries; a symbol cannot have them.
@@ -25,7 +25,14 @@ def _relation_pattern(text: str) -> str:
     after the `=`, which cannot match before a quote - so `WS-ST NOT = '00'`
     fell through to the bare `=` and the variable came out as `WS-ST NOT`.
     """
-    body = re.escape(text).replace(r"\ ", r"\s+")
+    # Between two words a space is required; between a word and a symbol it
+    # is optional, because `NOT=` is as legal as `NOT =` and a mandatory
+    # space makes the whole relation fall through to the bare `=`.
+    parts = text.split(" ")
+    body = re.escape(parts[0])
+    for previous, part in zip(parts, parts[1:]):
+        joiner = r"\s+" if (previous[-1].isalnum() and part[0].isalnum()) else r"\s*"
+        body += joiner + re.escape(part)
     if text[0].isalpha():
         body = r"\b" + body
     if text[-1].isalnum():
@@ -41,7 +48,7 @@ _OP_WORDS = {
     "EQUAL": "=", "EQUALS": "=", "EQUAL TO": "=", "IS EQUAL": "=",
     "IS EQUAL TO": "=", "NOT EQUAL": "!=", "NOT EQUAL TO": "!=",
     "IS NOT EQUAL": "!=", "IS NOT EQUAL TO": "!=", "IS NOT": "!=",
-    "NOT =": "!=", "<>": "!=",
+    "NOT =": "!=", "IS NOT =": "!=", "<>": "!=",
     "GREATER": ">", "GREATER THAN": ">", "IS GREATER": ">",
     "IS GREATER THAN": ">", "EXCEEDS": ">",
     "LESS": "<", "LESS THAN": "<", "IS LESS": "<", "IS LESS THAN": "<",
@@ -49,6 +56,9 @@ _OP_WORDS = {
     "NOT LESS": ">=", "NOT LESS THAN": ">=", "IS NOT LESS THAN": ">=",
     "GREATER THAN OR EQUAL TO": ">=", "LESS THAN OR EQUAL TO": "<=",
 }
+
+
+_OP_WORDS_TIGHT = {k.replace(" ", ""): v for k, v in _OP_WORDS.items()}
 
 
 def split_top(text: str, keyword: str) -> list[str]:
@@ -179,7 +189,9 @@ def _condition_atoms(condition: str, negate: bool = False,
                       Term("const", value=True), origin)]]
 
     lhs_text, op_text, rhs_text = m.group(1), norm(m.group(2)).upper(), m.group(3)
-    op = _OP_WORDS.get(op_text, op_text)
+    # The spelling that matched need not be the spelling in the table: `NOT=`
+    # and `NOT =` are the same operator, so compare with the spaces removed.
+    op = _OP_WORDS_TIGHT.get(op_text.replace(" ", ""), op_text)
     if negate:
         op = NEGATE.get(op, op)
     lhs = parse_term(lhs_text)
