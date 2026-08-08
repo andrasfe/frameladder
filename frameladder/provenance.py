@@ -51,12 +51,60 @@ def op_key(text: str) -> str:
     return "EXTERNAL"
 
 
+# CICS and SQL write their operands in parentheses, not after whitespace, so
+# a "word after the keyword" reader finds nothing - or worse, falls through to
+# the file-I/O reader and mistakes the keyword DATASET for a variable.
+_EXEC_CLAUSE = re.compile(r"\b([A-Z][A-Z0-9]*)\s*\(\s*([^)]*?)\s*\)", re.I)
+
+# What a CICS command hands *back*. RESP and RESP2 are CICS's FILE STATUS:
+# the same "how did the operation go" channel that makes file I/O planable.
+_CICS_OUTPUTS = {"INTO", "RESP", "RESP2", "LENGTH", "FLENGTH", "COMMAREA",
+                 "SET", "RIDFLD", "COUNTER", "ITEM"}
+# What a command *selects* - which file, which map, which program. These tell
+# two invocations of one verb apart, exactly as a DD name does for a CALL.
+_CICS_SELECTORS = {"DATASET", "FILE", "PROGRAM", "MAPSET", "MAP", "QUEUE",
+                   "TRANSID", "SYSID", "TABLE"}
+_HOST_VAR = re.compile(r":\s*([A-Z][A-Z0-9-]*)", re.I)
+
+
+def exec_operands(text: str) -> dict:
+    """Clause name -> operand, for an EXEC block."""
+    return {m.group(1).upper(): m.group(2).strip()
+            for m in _EXEC_CLAUSE.finditer(norm(text))}
+
+
 def stub_outputs(text: str) -> list[str]:
+    flat = norm(text)
+    if re.search(r"\bEXEC\s+(CICS|SQL|DLI)\b", flat, re.I):
+        out: list[str] = []
+        if re.search(r"\bEXEC\s+SQL\b", flat, re.I):
+            # Every SQL statement sets SQLCODE whether it mentions it or not;
+            # it is the DB2 equivalent of a file status and the thing every
+            # generated error path actually tests.
+            out.append("SQLCODE")
+            m = re.search(r"\bINTO\b(.*?)(\bFROM\b|$)", flat, re.I | re.S)
+            if m:
+                out.extend(h.group(1).upper() for h in _HOST_VAR.finditer(m.group(1)))
+        for clause, operand in exec_operands(flat).items():
+            if clause in _CICS_OUTPUTS:
+                out.extend(n.upper() for n in re.findall(r"[A-Z][A-Z0-9-]*",
+                                                         operand, re.I))
+        return list(dict.fromkeys(out))
+
     out = [m.group(1).upper() for m in
-           re.finditer(r"\b(?:USING|INTO)\s+([A-Z0-9-]+)", text, re.I)]
+           re.finditer(r"\b(?:USING|INTO)\s+([A-Z0-9-]+)", flat, re.I)]
     if not out:
         out = [m.group(2).upper() for m in
-               re.finditer(r"\b(READ|OPEN|CLOSE|RETURN)\s+([A-Z0-9-]+)", text, re.I)]
+               re.finditer(r"\b(READ|OPEN|CLOSE|RETURN)\s+([A-Z0-9-]+)", flat, re.I)]
+    return out
+
+
+def exec_selectors(text: str) -> dict:
+    """Which resource an EXEC command names, as discriminators."""
+    out = {}
+    for clause, operand in exec_operands(text).items():
+        if clause in _CICS_SELECTORS and operand:
+            out[clause] = operand.strip("'\"").upper()
     return out
 
 
@@ -133,7 +181,12 @@ class Provenance:
 
                 elif kind in STUB_KINDS:
                     key = op_key(text)
-                    self.call_literals.setdefault(key, []).append(dict(literals))
+                    # The resource a CICS command names is what tells two
+                    # invocations of one verb apart - the same role a DD name
+                    # plays for a CALL - so it belongs with the discriminators.
+                    site_literals = dict(literals)
+                    site_literals.update(exec_selectors(text))
+                    self.call_literals.setdefault(key, []).append(site_literals)
                     outputs = list(stub_outputs(text))
                     for f, status in self.model.file_status.items():
                         if re.search(r"\b%s\b" % re.escape(f), text, re.I):
@@ -144,7 +197,7 @@ class Provenance:
                                 outputs.extend(records)
                     for var in outputs:
                         w = Writer(pname, line, "STUB", op_key=key,
-                                   guards=tuple(guards), literals=dict(literals))
+                                   guards=tuple(guards), literals=site_literals)
                         self._add(var, w)
                         self.payloads.add(var)
                         # A record filled straight by the operation - READ ...

@@ -212,6 +212,59 @@ for reaching code; backwards for parity testing, where the validated path is
 where the interesting semantics are. `--via` forces the hard route today; a
 "prefer the guarded path" chain selector would do it by default.
 
+## The external world
+
+A program's interesting behaviour is mostly decided by things it does not
+compute: what a file read returned, whether an open succeeded, what a
+subprogram put in the commarea, what DB2 said. A test has to *supply* those,
+so the plan names them as **outcomes** rather than pretending they are inputs.
+
+An outcome is identified by the operation and by whatever selects it:
+
+| kind | identity | how the outcome arrives |
+|---|---|---|
+| file I/O | `OPEN-INPUT:ACCTFILE-FILE`, `READ:XREF-FILE` | the `FILE STATUS IS` variable, and the `FD` record |
+| subprogram | `CALL:CBSTM03B` | the `USING` area |
+| CICS | `EXEC:CICS:READ` + `DATASET(...)` | `RESP`, `RESP2`, `INTO`, `COMMAREA` |
+| DB2 | `EXEC:SQL:SELECT` | `SQLCODE` always, plus `INTO :host-vars` |
+
+Three things make this work:
+
+**Discrimination.** One subprogram called twice is two operations if something
+distinguishes them. The literals set before a call are compared *across* call
+sites and only the fields that actually vary are kept — a DD name selects,
+blanking the output area does not. CICS resource clauses (`DATASET`, `MAP`,
+`PROGRAM`) do the same job and are treated the same way.
+
+**Sequences.** An operation returns a *series*: a record, another record, then
+end-of-file. Two obligations on one status field are consecutive outcomes, not
+a contradiction, and the plan emits them ordered. The end-of-file value is
+derived rather than guessed — it is the literal that guard avoidance steered
+away from. `--stub-repeat`, `--terminal` and `--default` control delivery
+(`--default` is what an operation returns when no planned outcome matches it,
+which is different from what it returns once they run out).
+
+**Mode.** `OPEN INPUT` and `OPEN OUTPUT` are different operations, because
+opening a missing file for input fails where opening it for output creates it.
+
+### What is weak here
+
+- **`--terminal` is per operation, not per invocation.** A program routing its
+  opens and its reads through one subprogram cannot have both a succeeding
+  open and an ending read. This is what still caps CBSTM03A.
+- **CICS and SQL are shallow.** Operands and status channels are modelled;
+  cursors, result sets, `SYNCPOINT`/rollback, pseudo-conversational state
+  across `RETURN TRANSID` and commarea round-trips are not.
+- **No state setup.** The plan says what an operation should return; it does
+  not build the VSAM file, the DB2 rows or the queue that would make a real
+  system return it. On a migration that gap is most of the work.
+- **Stubbing hides the seam.** A transpiled program is usually faithful
+  *inside* and lossy at its edges — DB2 to Postgres, VSAM emulation, date
+  handling. Stubbing those interfaces tests the part that was already
+  semantics-preserving and skips the part where divergence actually lives.
+  This is the strongest argument against using the tool as a primary parity
+  oracle, and it stands.
+
 ## Agent-assisted
 
 The derivation is deterministic and needs no model. Where it runs out — the
@@ -399,6 +452,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 45 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 50 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

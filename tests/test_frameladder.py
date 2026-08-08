@@ -777,3 +777,101 @@ class TestHeuristics(unittest.TestCase):
         self.assertTrue(str(shaped).isdigit())
         plain = preferred_value("ACCT-OPEN-DATE", "X(10)")
         self.assertEqual(plain, "2025-01-15")
+
+
+class TestExternalWorld(unittest.TestCase):
+    """CALL, file I/O, CICS and SQL - the operations whose outcomes a test
+    has to supply because the program cannot produce them itself."""
+
+    def test_cics_operands_are_parenthesised(self):
+        from frameladder.provenance import op_key, stub_outputs, exec_selectors
+        text = ("EXEC CICS READ DATASET(WS-FILE) INTO(WS-REC) "
+                "RIDFLD(WS-KEY) RESP(WS-RESP-CD) END-EXEC")
+        self.assertEqual(op_key(text), "EXEC:CICS:READ")
+        outputs = stub_outputs(text)
+        # RESP is CICS's FILE STATUS: the channel every error path tests.
+        self.assertIn("WS-RESP-CD", outputs)
+        self.assertIn("WS-REC", outputs)
+        # DATASET is a keyword naming the resource, not a variable to set.
+        self.assertNotIn("DATASET", outputs)
+        self.assertEqual(exec_selectors(text), {"DATASET": "WS-FILE"})
+
+    def test_every_sql_statement_sets_sqlcode(self):
+        from frameladder.provenance import stub_outputs
+        outputs = stub_outputs("EXEC SQL SELECT NAME INTO :WS-NAME "
+                               "FROM CUST WHERE ID = :WS-ID END-EXEC")
+        self.assertIn("SQLCODE", outputs, "the DB2 analogue of a file status")
+        self.assertIn("WS-NAME", outputs, "host variables receive the result")
+        self.assertNotIn("WS-ID", outputs, "a predicate host variable is input")
+
+    def test_open_mode_is_part_of_the_operation(self):
+        from frameladder.provenance import op_key
+        # Opening a missing file for input fails where opening it for output
+        # creates it, so they are different operations with different outcomes.
+        self.assertEqual(op_key("OPEN INPUT ACCTFILE-FILE"),
+                         "OPEN-INPUT:ACCTFILE-FILE")
+        self.assertEqual(op_key("OPEN OUTPUT ACCTFILE-FILE"),
+                         "OPEN-OUTPUT:ACCTFILE-FILE")
+
+    def test_file_status_is_an_outcome_not_an_input(self):
+        src = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INFILE
+                  ORGANIZATION IS SEQUENTIAL
+                  FILE STATUS IS WS-ST.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-REC PIC X(80).
+       WORKING-STORAGE SECTION.
+       01  WS-ST PIC XX.
+       PROCEDURE DIVISION.
+       AC-MAIN.
+           OPEN INPUT IN-FILE
+           IF WS-ST = '00'
+              PERFORM AC-DEEP
+           END-IF
+           GOBACK
+           .
+       AC-DEEP.
+           EXIT
+           .
+"""
+        p = program(src)
+        plan = build_plan(p, "AC-DEEP", entry="AC-MAIN")
+        stubs = plan.stub_plan()
+        self.assertIn("OPEN-INPUT:IN-FILE", stubs)
+        self.assertEqual(stubs["OPEN-INPUT:IN-FILE"][0]["set"], {"WS-ST": "00"})
+        # It must not be presented as something the caller sets directly.
+        self.assertNotIn("WS-ST", plan.input_state())
+
+    def test_two_calls_are_told_apart_by_what_selects_them(self):
+        p = program(HEADER + """       01  WS-DD PIC X(8).
+       01  WS-AREA PIC X(4).
+       01  REC-A PIC X(4).
+       01  REC-B PIC X(4).
+       PROCEDURE DIVISION.
+       AD-MAIN.
+           MOVE 'FIRST' TO WS-DD
+           CALL 'SUB' USING WS-AREA
+           MOVE WS-AREA TO REC-A
+           MOVE 'SECOND' TO WS-DD
+           CALL 'SUB' USING WS-AREA
+           MOVE WS-AREA TO REC-B
+           IF REC-A = REC-B
+              PERFORM AD-DEEP
+           END-IF
+           GOBACK
+           .
+       AD-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "AD-DEEP", entry="AD-MAIN")
+        whens = [e["when"].get("WS-DD")
+                 for e in plan.stub_plan().get("CALL:SUB", [])]
+        self.assertEqual(len(set(w for w in whens if w)), 2,
+                         "one subprogram, two invocations, two outcomes")
