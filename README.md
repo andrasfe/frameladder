@@ -147,9 +147,8 @@ reference is the incomplete one.
 
 ## Results
 
-Every reachable paragraph, planned and then verified by execution:
-
-Across **31 programs / 553 targets**, every plan verified by running it:
+Every reachable paragraph, planned and then verified by running it.
+Across **31 programs / 553 targets**:
 
 | | |
 |---|---|
