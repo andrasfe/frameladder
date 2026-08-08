@@ -86,6 +86,25 @@ def balanced(text: str) -> bool:
     return depth == 0
 
 
+# `ACSHLIMI OF CACTUPAI` names one field and says which group it belongs to,
+# for disambiguation. Keeping the qualifier in the name makes the reference
+# match no declaration, carry no PIC and bind to nothing - and CardDemo's
+# screen handling is written almost entirely this way.
+_QUALIFIED = re.compile(r"^(.*?)\s+(?:OF|IN)\s+[A-Z0-9][A-Z0-9-]*"
+                        r"(?:\s+(?:OF|IN)\s+[A-Z0-9][A-Z0-9-]*)*\s*$", re.I)
+
+
+def base_name(text: str) -> str:
+    """The field a qualified reference names, without its qualifier.
+
+    Used for *lookups* only. The qualifier must stay part of the identity:
+    a BMS map has the same field name under its input and its output area,
+    and collapsing them makes two separately satisfiable conditions collide.
+    """
+    m = _QUALIFIED.match(norm(text))
+    return m.group(1).strip().upper() if m else norm(text).upper()
+
+
 def parse_term(text: str) -> Term:
     text = norm(text).strip(".")
     while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):

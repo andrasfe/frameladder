@@ -330,10 +330,35 @@ def cmd_coverage(args):
     from .coverage import accumulate, missing
     from .interpreter import Interpreter
     from .ladder import analyse, build_family
+    from .learned import Learned
     from .conformance_defaults import io_defaults
     analyse(program)
     entry = _entry(program, args)
     known = journal.bindings()
+
+    learned = Learned(args.learn)
+    # Values that have worked before are offered as *preferences*, so they
+    # are taken where the ladder has a free choice and ignored where a
+    # constraint decides. A warm dictionary can therefore only help.
+    warm = {name: learned.best(name) for name in learned.fields
+            if learned.best(name) is not None}
+    seen_directions: set = set()
+
+    def run_plan(plan):
+        """Run it, and remember the values if it covered anything new."""
+        interp = Interpreter(program, plan.input_state(),
+                             stubs=plan.stub_plan(), terminals=plan.terminals,
+                             defaults=io_defaults(program))
+        try:
+            trace = interp.run(entry)
+        except Exception:                                    # noqa: BLE001
+            return None
+        fresh = {(g.paragraph, g.line, g.kind, bool(g.result))
+                 for g in trace.guards} - seen_directions
+        seen_directions.update(fresh)
+        if args.learn:
+            learned.record(plan.flat_state(), len(fresh))
+        return trace
 
     traces = []
     if args.branches:
@@ -346,19 +371,15 @@ def cmd_coverage(args):
                                                direction)
                 try:
                     plan = build_plan(program, b.paragraph, entry=args.entry,
-                                      agent_bindings=known, extra=extra)
+                                      agent_bindings=known, extra=extra,
+                                      preferred=warm)
                 except Exception:                            # noqa: BLE001
                     continue
                 if not plan.chain:
                     continue
-                interp = Interpreter(program, plan.input_state(),
-                                     stubs=plan.stub_plan(),
-                                     terminals=plan.terminals,
-                                     defaults=io_defaults(program))
-                try:
-                    traces.append(interp.run(entry))
-                except Exception:                            # noqa: BLE001
-                    continue
+                trace = run_plan(plan)
+                if trace is not None:
+                    traces.append(trace)
 
     for target in program.paragraph_names[1:]:
         plans = []
@@ -368,23 +389,21 @@ def cmd_coverage(args):
                                   limit=args.families)]
         if not plans:
             plan = build_plan(program, target, entry=args.entry,
-                              agent_bindings=known)
+                              agent_bindings=known, preferred=warm)
             plans = [plan] if plan.chain else []
         for plan in plans:
-            interp = Interpreter(program, plan.input_state(),
-                                 stubs=plan.stub_plan(),
-                                 terminals=plan.terminals,
-                                 defaults=io_defaults(program))
-            try:
-                traces.append(interp.run(entry))
-            except Exception:                                # noqa: BLE001
-                continue
+            trace = run_plan(plan)
+            if trace is not None:
+                traces.append(trace)
 
+    if args.learn:
+        learned.save()
     cov = accumulate(program, traces)
     gaps = missing(program, cov)
     payload = dict(cov.summary())
     payload.update({
         "program": program.name, "entry": entry,
+        "learned": learned.summary() if args.learn else None,
         "unreached_paragraphs": gaps["paragraphs"],
         "untouched_branches": [{"paragraph": b.paragraph, "line": b.line,
                                 "kind": b.kind, "condition": b.condition}
@@ -399,6 +418,8 @@ def cmd_coverage(args):
         print("%s   %d runs" % (p["program"], p["runs"]))
         print("  paragraphs %-12s %5.1f%%" % (p["paragraphs"], p["paragraph_pct"]))
         print("  directions %-12s %5.1f%%" % (p["directions"], p["direction_pct"]))
+        if p.get("learned"):
+            print("  dictionary %s" % json.dumps(p["learned"]))
         if p["unreached_paragraphs"]:
             print("\nnever entered (%d): %s"
                   % (len(p["unreached_paragraphs"]),
@@ -758,6 +779,8 @@ def build_parser():
 
     cv = sub.add_parser("coverage", help="what a plan set exercises, and what "
                                         "it leaves untouched")
+    cv.add_argument("--learn", metavar="FILE",
+                    help="record values that covered something, and reuse them")
     cv.add_argument("--branches", action="store_true",
                     help="also aim a plan at each decision direction")
     cv.add_argument("--families", type=int, default=0,

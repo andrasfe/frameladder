@@ -1497,5 +1497,73 @@ class TestCoverage(unittest.TestCase):
         line = [s for s in p.paragraph("AQ-MAIN")["statements"]
                 if s["type"] == "EVALUATE"][0]["children"][1]["line_start"]
         atoms = obligations_for_branch(p, "AQ-MAIN", line, True)
-        self.assertTrue(atoms, "a WHEN arm must yield its own obligation")
-        self.assertEqual(str(atoms[0]), "WS-S = 'BB'")
+        rendered = [str(a) for a in atoms]
+        self.assertIn("WS-S = 'BB'", rendered, "the arm's own condition")
+        # EVALUATE takes the first matching arm, so reaching the second means
+        # the first did not match.
+        self.assertIn("WS-S != 'AA'", rendered, "and the one before it failed")
+        self.assertLess(rendered.index("WS-S = 'BB'"),
+                        rendered.index("WS-S != 'AA'"),
+                        "the arm's own condition is settled first")
+
+
+class TestFirstMatch(unittest.TestCase):
+    """EVALUATE takes the first arm that matches - a language rule, not a
+    property of any program."""
+
+    SRC = HEADER + """       01  WS-A PIC X VALUE 'N'.
+           88  A-ON VALUE 'Y'.
+       01  WS-B PIC X VALUE 'N'.
+           88  B-ON VALUE 'Y'.
+       PROCEDURE DIVISION.
+       AR-MAIN.
+           EVALUATE TRUE
+             WHEN A-ON
+               PERFORM AR-FIRST
+             WHEN B-ON
+               PERFORM AR-SECOND
+           END-EVALUATE
+           GOBACK
+           .
+       AR-FIRST.
+           CONTINUE
+           .
+       AR-SECOND.
+           CONTINUE
+           .
+"""
+
+    def test_a_later_arm_requires_the_earlier_ones_to_fail(self):
+        from frameladder.graph import obligations_for_branch
+        p = program(self.SRC)
+        arms = [s for s in p.paragraph("AR-MAIN")["statements"]
+                if s["type"] == "EVALUATE"][0]["children"]
+        atoms = [str(a) for a in
+                 obligations_for_branch(p, "AR-MAIN", arms[1]["line_start"], True)]
+        self.assertIn("B-ON = True", atoms)
+        self.assertIn("A-ON != True", atoms,
+                      "without this the second arm looks reachable on its own")
+
+    def test_the_first_arm_needs_nothing_before_it(self):
+        from frameladder.graph import obligations_for_branch
+        p = program(self.SRC)
+        arms = [s for s in p.paragraph("AR-MAIN")["statements"]
+                if s["type"] == "EVALUATE"][0]["children"]
+        atoms = [str(a) for a in
+                 obligations_for_branch(p, "AR-MAIN", arms[0]["line_start"], True)]
+        self.assertEqual(atoms, ["A-ON = True"])
+
+    def test_the_second_arm_is_actually_reachable(self):
+        from frameladder.graph import obligations_for_branch
+        p = program(self.SRC)
+        arms = [s for s in p.paragraph("AR-MAIN")["statements"]
+                if s["type"] == "EVALUATE"][0]["children"]
+        extra = obligations_for_branch(p, "AR-MAIN", arms[1]["line_start"], True)
+        plan = build_plan(p, "AR-MAIN", entry="AR-MAIN", extra=extra)
+        state = plan.flat_state()
+        self.assertEqual(state.get("WS-B"), "Y")
+        self.assertNotEqual(state.get("WS-A"), "Y")
+        from frameladder.interpreter import Interpreter
+        entered = Interpreter(p, plan.flat_state()).run("AR-MAIN").entered_set
+        self.assertIn("AR-SECOND", entered, "the second arm must actually run")
+        self.assertNotIn("AR-FIRST", entered, "and the first must not")

@@ -426,6 +426,52 @@ opening a missing file for input fails where opening it for output creates it.
   This is the strongest argument against using the tool as a primary parity
   oracle, and it stands.
 
+## Coverage
+
+`frameladder <program> coverage --branches` measures what a whole plan set
+exercises. Branches are counted **by direction**, since taking an `IF` only
+one way is half a branch:
+
+| program | paragraphs | directions |
+|---|---|---|
+| COACTUPC (4,236 lines) | 100% | **66.8%** |
+| COCRDLIC | 100% | 86.7% |
+| COCRDUPC | 100% | 75.6% |
+| COUSR00C | 100% | 71.6% |
+| COTRN02C | 100% | 66.2% |
+
+Paragraph coverage saturates almost immediately and is close to useless as a
+target. Directions do not, and iterating on the gap has been the most
+productive way to find defects in the tool — every gain below came from
+fixing a semantic error, not from adding search:
+
+| | directions |
+|---|---|
+| one plan per paragraph | 49.7% |
+| plans aimed at each decision *direction* | 62.4% |
+| condition-name values parsed with quoted literals | 63.2% |
+| `WHEN` arms given their subject; entry paragraph planable | 65.5% |
+| `EVALUATE` first-match semantics | **66.8%** |
+
+That last one is the shape of most of them. `EVALUATE` takes the *first*
+matching arm, so reaching arm N means arms 1..N−1 all failed. Without that
+obligation a long `EVALUATE` looks satisfiable arm-by-arm and only its first
+arm is ever taken — 76 branches in one paragraph of COACTUPC. Adding it
+naively made things *worse* (54%), because the negations bound before the
+arm's own condition and consumed the slots it needed; settling the arm's own
+condition first is what made it pay.
+
+Two mechanisms measured at ~zero and are recorded as such: divergence
+families add 252 runs for **+1 direction** (they vary values while preserving
+reachability, so they take the same paths — they are for parity probing, not
+coverage), and a warm learned dictionary adds **+1** (it confirms values the
+deterministic chooser already picks).
+
+**What the number does not include.** `COPY ... REPLACING` is not expanded, so
+a paragraph built from 39 replaced copies contributes only the branches
+written inline. The denominator is therefore understated wherever that idiom
+is used, and real coverage of those programs is lower than reported.
+
 ## Agent-assisted
 
 The derivation is deterministic and needs no model. Where it runs out — the
@@ -642,6 +688,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 82 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 91 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

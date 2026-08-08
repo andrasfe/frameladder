@@ -367,7 +367,7 @@ class Provenance:
         return Producer("unknown", var=var, site=writers[0].para)
 
     def _from_record(self, var: str, depth: int, seen: frozenset) -> Producer:
-        if var in self.model.declared or not self.stub_fills:
+        if self.model.knows(var) or not self.stub_fills:
             return Producer("input", var=var)
         group = associate_field(var, self.stub_fills)
         if not group:

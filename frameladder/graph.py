@@ -60,6 +60,34 @@ def substitute(atoms, bindings: dict) -> list:
     return out
 
 
+def _after_earlier_arms(stmt: dict, subject: str, siblings, origin: str) -> list:
+    """EVALUATE takes the *first* arm that matches.
+
+    So reaching arm N means arms 1..N-1 all failed, and without saying so an
+    arm looks satisfiable on its own condition alone - which is why a long
+    EVALUATE ends up with only its first arm ever taken. Consecutive WHENs
+    sharing a body are one alternative each, so every preceding one counts.
+    """
+    out: list = []
+    for sib in siblings or ():
+        if sib is stmt:
+            break
+        if sib.get("type") != "WHEN":
+            continue
+        value = norm(sib.get("attributes", {}).get("value", ""))
+        if not value or value.upper() in ("OTHER", "ANY"):
+            continue
+        if norm(subject).upper() in ("TRUE", "FALSE"):
+            alts = condition_atoms(value, norm(subject).upper() == "TRUE",
+                                   origin)
+            out.extend(alts[0] if alts else [])
+        else:
+            subj = Term("var", name=parse_term(subject).name)
+            for alt in value.split(" OR "):
+                out.append(Atom(subj, "!=", parse_term(alt), origin))
+    return out
+
+
 def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
     value = norm(stmt.get("attributes", {}).get("value", ""))
     if not subject:
@@ -78,7 +106,11 @@ def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
                 alts = condition_atoms(sv, not invert, origin)
                 out.extend(alts[0] if alts else [])
             return out
-        return first_with_alternatives(condition_atoms(value, invert, origin))
+        own = first_with_alternatives(condition_atoms(value, invert, origin))
+        # The arm's own condition is the point of the plan, so it is settled
+        # first; the preceding arms it must out-rank are real obligations but
+        # secondary, and binding them first consumes the slots it needs.
+        return own + _after_earlier_arms(stmt, subject, siblings, origin)
 
     subj = Term("var", name=parse_term(subject).name)
     if value.upper() in ("OTHER", "ANY"):
@@ -95,7 +127,8 @@ def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
     if not alts:
         return []
     head = alts[0]
-    return [Atom(head.lhs, head.op, head.rhs, head.origin, tuple(alts[1:]))]
+    own = [Atom(head.lhs, head.op, head.rhs, head.origin, tuple(alts[1:]))]
+    return own + _after_earlier_arms(stmt, subject, siblings, origin)
 
 
 def _loop_guards(stmt: dict, origin: str) -> tuple[list, dict]:

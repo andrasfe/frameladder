@@ -20,7 +20,7 @@ def rendezvous_value(a: str, b: str, model) -> object:
     Any value at all will do - which is exactly the point.  What sampling
     cannot do is put the *same* one in two independent places.
     """
-    spec = model.pic.get(a) or model.pic.get(b) or "X(16)"
+    spec = model.pic_of(a) or model.pic_of(b) or "X(16)"
     if "X" in spec.upper() or "A" in spec.upper():
         m = re.search(r"[XA]\((\d+)\)", spec, re.I)
         width = int(m.group(1)) if m else max(len(spec), 4)
@@ -501,7 +501,7 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
             # compare against the word NUMERIC and mean nothing.
             if op in (CLASS_OP, CLASS_OP_NOT):
                 shaped = preferred_value(var_term.name,
-                                         model.pic.get(var_term.name, ""),
+                                         model.pic_of(var_term.name),
                                          klass=str(const_term.value),
                                          negated=(op == CLASS_OP_NOT))
                 if shaped is None:
@@ -522,7 +522,7 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 # nothing requires this value, and validation cascades the
                 # ladder cannot see into will reject an implausible one.
                 guess = preferred_value(
-                    var_term.name, model.pic.get(var_term.name, ""),
+                    var_term.name, model.pic_of(var_term.name),
                     evidence=prov.literals.get(var_term.name, ()),
                     op=op, other=const_term.value)
                 if guess is not None and holds(guess, op, const_term.value):

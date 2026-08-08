@@ -191,6 +191,29 @@ class DataModel:
     fd_records: dict = field(default_factory=dict)        # file -> record areas
     organization: dict = field(default_factory=dict)      # file -> SEQUENTIAL/INDEXED
 
+    def look(self, table: dict, name: str, default=None):
+        """Read a per-field table, seeing through qualification.
+
+        `ACSHLIMI OF CACTUPAI` is a distinct reference but the declaration it
+        points at is `ACSHLIMI`, so identity and lookup want different keys.
+        """
+        upper = (name or "").upper()
+        if upper in table:
+            return table[upper]
+        from .ir import base_name
+        return table.get(base_name(upper), default)
+
+    def pic_of(self, name: str) -> str:
+        return self.look(self.pic, name, "") or ""
+
+    def usage_of(self, name: str) -> str:
+        return self.look(self.usage, name, "") or ""
+
+    def knows(self, name: str) -> bool:
+        from .ir import base_name
+        upper = (name or "").upper()
+        return upper in self.declared or base_name(upper) in self.declared
+
     def descendants(self, group: str) -> list[str]:
         return self.children.get(group.upper(), [])
 
