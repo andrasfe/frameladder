@@ -152,20 +152,63 @@ Across **31 programs / 553 targets**:
 
 | | |
 |---|---|
-| plans complete | 540 (98%) |
-| verified reached | 530 (96%) |
-| chain depths reached | 1 to **18 frames** |
+| plans complete | 550 (98%) |
+| verified reached | 426 (76%) |
+| chain depths reached | 1 to 6 frames |
+
+The reached figure was 96% before the interpreter was checked against a real
+compiler, and 96% was wrong — see below.
 
 | program | lines | targets | reached |
 |---|---|---|---|
 | COACTUPC | 4,236 | 84 | 84 |
 | COCRDLIC | 1,459 | 38 | 38 |
 | COCRDUPC | 1,560 | 44 | 44 |
-| CBACT01C | 430 | 15 | 15 |
 | CBSTM03A | 924 | 24 | 17 |
+| CBACT01C | 430 | 16 | 3 |
 
-CBSTM03A is the hard one on purpose: an `ALTER`-driven dispatcher that
-re-enters one paragraph with a different selector each pass. See *Limits*.
+CBSTM03A is an `ALTER`-driven dispatcher that re-enters one paragraph with a
+different selector each pass. CBACT01C is the honest low score: every path runs
+through a file-open whose failure abends the program, and the ladder does not
+yet lift "survive the paragraph performed before this one" as an obligation.
+See *Limits*.
+
+## Checked against a real compiler
+
+Everything above rests on the built-in interpreter, which shares its condition
+parser and control-flow rules with the planner. If those rules are wrong, plan
+and verification are wrong *the same way* and agree with each other — so
+agreement proves nothing.
+
+`conformance/differential.py` breaks the circle. It instruments every
+paragraph with a marker, compiles with GnuCOBOL, runs, and compares the real
+execution against the interpreter's prediction.
+
+```
+20/20 runnable programs traced identically
+```
+
+13 synthetic cases covering the constructs the ladder depends on (`ELSE`,
+`EVALUATE TRUE`, `PERFORM THRU`, `ALTER`, fall-through, abbreviated relations,
+level-88s, relational words) and 7 real CardDemo batch programs.
+
+It found four real bugs, none of which the self-consistent tests could have:
+
+1. **Statements directly under `PROCEDURE DIVISION`, before any label, were
+   silently dropped.** That is where the program *starts*, so the entry point
+   was wrong for every program in the CBACT/CBTRN family and the first named
+   paragraph was mistaken for the mainline.
+2. **`CALL 'CEE3ABD'` was treated as returning.** It is the Language
+   Environment abend service and does not return. Because the interpreter ran
+   on past it, programs that should have stopped after four paragraphs appeared
+   to reach everything — which is precisely why the reached figure fell from
+   96% to 76% once this was fixed. The 96% was an artifact.
+3. **`OPEN INPUT ACCTFILE` keyed as `OPEN:INPUT`**, collapsing every open in a
+   program to one operation. The mode belongs in the operation's identity:
+   opening a missing file for input fails where opening it for output creates
+   it.
+4. **`ALTER` targets must contain nothing but their `GO TO`** — a constraint
+   the compiler enforces and the instrumenter has to respect.
 
 `plan` reporting open obligations while `verify` reports REACHED is normal —
 `solved` is deliberately conservative, and some obligations gate nothing.
@@ -180,6 +223,12 @@ Stated rather than hidden; each is reported in the output when it bites.
   program produces the rest) and proved impossible when it does not. Still only
   partial for a dispatcher selector walking TRNXFILE → READTRNX → XREFFILE,
   where a chain re-enters the dispatcher several times.
+- **Surviving an earlier sibling call is not yet an obligation.** Reaching a
+  frame requires that the paragraphs performed before it did not abend. The
+  obligation is derivable — a prototype lifted exactly the right condition on
+  CBACT01C — but the binding layer attributes the status to the wrong operation
+  and over-produces outcome sequences, so it is not in the shipped version.
+  This is the single biggest remaining gap and the whole of CBACT01C's 3/16.
 - **Ordering constraints are solved pairwise, not as a system.** Several
   coupled orderings over the same values would need a topological assignment;
   each is currently witnessed on its own.

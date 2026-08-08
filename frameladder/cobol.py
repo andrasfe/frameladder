@@ -68,6 +68,7 @@ _LEVEL88 = re.compile(r"^\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(?:ARE\s+|IS\s
 
 _SELECT = re.compile(r"\bSELECT\s+(?:OPTIONAL\s+)?([A-Z0-9][A-Z0-9-]*)", re.I)
 _FILE_STATUS = re.compile(r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9][A-Z0-9-]*)", re.I)
+_ORGANIZATION = re.compile(r"\bORGANIZATION\s+(?:IS\s+)?([A-Z-]+)", re.I)
 
 
 _FD = re.compile(r"^\s*FD\s+([A-Z0-9][A-Z0-9-]*)", re.I)
@@ -113,6 +114,7 @@ def parse_file_control(path: str) -> dict:
     instead of as two outcomes of one operation.
     """
     out: dict = {}
+    organizations = out.setdefault("__organizations__", {})
     current = None
     buffer = ""
     for line in read_lines(path):
@@ -126,6 +128,9 @@ def parse_file_control(path: str) -> dict:
         st = _FILE_STATUS.search(buffer)
         if st and current:
             out[current] = st.group(1).upper()
+        org = _ORGANIZATION.search(buffer)
+        if org and current:
+            organizations[current] = org.group(1).upper()
         if "." in text:
             buffer = ""
             if st:
@@ -145,6 +150,7 @@ class DataModel:
     condition_names: dict = field(default_factory=dict)   # 88 name -> (parent, values)
     file_status: dict = field(default_factory=dict)       # file -> status variable
     fd_records: dict = field(default_factory=dict)        # file -> record areas
+    organization: dict = field(default_factory=dict)      # file -> SEQUENTIAL/INDEXED
 
     def descendants(self, group: str) -> list[str]:
         return self.children.get(group.upper(), [])
@@ -157,6 +163,7 @@ class DataModel:
         self.declared |= other.declared
         self.condition_names.update(other.condition_names)
         self.file_status.update(other.file_status)
+        self.organization.update(other.organization)
         for f, recs in other.fd_records.items():
             self.fd_records.setdefault(f, []).extend(recs)
         for group, kids in other.children.items():
@@ -166,7 +173,9 @@ class DataModel:
 
 def parse_data_division(path: str) -> DataModel:
     model = DataModel()
-    model.file_status.update(parse_file_control(path))
+    control = parse_file_control(path)
+    model.organization.update(control.pop("__organizations__", {}))
+    model.file_status.update(control)
     model.fd_records.update(parse_fd_records(path))
     stack: list[tuple[int, str]] = []
     buffer = ""
@@ -277,8 +286,20 @@ def _procedure_lines(lines: list[Line]) -> list[Line]:
     return []
 
 
+ENTRY_PARAGRAPH = "_ENTRY_"
+
+
 def split_paragraphs(lines: list[Line]) -> list[tuple[str, list[Line]]]:
-    """Area-A labels start paragraphs; everything after one belongs to it."""
+    """Area-A labels start paragraphs; everything after one belongs to it.
+
+    Statements can also sit directly under ``PROCEDURE DIVISION`` with no
+    label at all, and that unnamed run is where the program *starts*.
+    Dropping it - as any parser that waits for the first label does - hides
+    the real entry point and makes the first named paragraph look like the
+    mainline, which is usually a subroutine.  It is collected here under a
+    synthetic name that cannot collide with a COBOL identifier, and which
+    nothing can PERFORM, because nothing can.
+    """
     paragraphs: list[tuple[str, list[Line]]] = []
     current_name: str | None = None
     current: list[Line] = []
@@ -291,9 +312,10 @@ def split_paragraphs(lines: list[Line]) -> list[tuple[str, list[Line]]]:
                 paragraphs.append((current_name, current))
             current_name, current = header.group(1).upper(), []
             continue
-        if current_name is not None:
-            current.append(line)
-    if current_name is not None:
+        if current_name is None:
+            current_name = ENTRY_PARAGRAPH
+        current.append(line)
+    if current_name is not None and current:
         paragraphs.append((current_name, current))
     return paragraphs
 

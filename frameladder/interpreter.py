@@ -27,6 +27,12 @@ MAX_DEPTH = 64
 MAX_LOOP = 200
 RUNAWAY = 400        # one paragraph running this often is a loop, not progress
 
+# Standard runtime services that terminate the program rather than return.
+# Knowing these is the same kind of knowledge as knowing that abort() does
+# not return - it is about the platform, not about any one program - and
+# without it every abend path looks like it carries on executing.
+TERMINATING_CALLS = {"CEE3ABD", "ILBOABN0", "ILBOABN", "CANCEL"}
+
 
 class _Goto(Exception):
     def __init__(self, target: str):
@@ -155,8 +161,10 @@ class Interpreter:
             try:
                 self.perform(para["name"], depth=0)
             except _Stop:
-                self.trace.stopped = ("runaway loop in %s" % self.trace.runaway
-                                      if self.trace.runaway else "STOP RUN / GOBACK")
+                if not self.trace.stopped:
+                    self.trace.stopped = ("runaway loop in %s" % self.trace.runaway
+                                          if self.trace.runaway
+                                          else "STOP RUN / GOBACK")
                 break
             except _Goto as jump:
                 if jump.target in self._names:
@@ -363,6 +371,9 @@ class Interpreter:
         from .provenance import op_key
         key = op_key(norm(stmt.get("text", "")))
         self.calls[key] = self.calls.get(key, 0) + 1
+        if key.startswith("CALL:") and key[5:] in TERMINATING_CALLS:
+            self.trace.stopped = "terminated by %s" % key[5:]
+            raise _Stop()
         entries = self.stubs.get(key, [])
         matched = False
         for index, entry in enumerate(entries):

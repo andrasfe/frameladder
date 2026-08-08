@@ -37,10 +37,17 @@ def op_key(text: str) -> str:
     if m:
         return "EXEC:%s%s" % (m.group(1).upper(),
                               ":" + m.group(2).upper() if m.group(2) else "")
-    m = re.search(r"\b(READ|WRITE|OPEN|CLOSE|REWRITE|START|DELETE)\s+([A-Z0-9-]+)",
-                  text, re.I)
+    # `OPEN INPUT ACCTFILE-FILE` names the mode before the file, so the
+    # naive "word after the verb" is the mode and every OPEN collapses to
+    # one operation called OPEN:INPUT. The mode also decides the outcome -
+    # opening a missing file for input fails where opening it for output
+    # creates it - so it belongs in the operation's identity.
+    m = re.search(r"\b(READ|WRITE|OPEN|CLOSE|REWRITE|START|DELETE)\s+"
+                  r"((?:INPUT|OUTPUT|I-O|EXTEND)\s+)?([A-Z0-9-]+)", text, re.I)
     if m:
-        return "%s:%s" % (m.group(1).upper(), m.group(2).upper())
+        verb = m.group(1).upper()
+        mode = (m.group(2) or "").strip().upper()
+        return "%s%s:%s" % (verb, "-" + mode if mode else "", m.group(3).upper())
     return "EXTERNAL"
 
 
