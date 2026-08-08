@@ -125,18 +125,33 @@ def origin_site(origin: str):
         return None
 
 
-def _resolve_88(atom: Atom, model) -> Atom:
-    """``IF ACCT-ACTIVE`` is an obligation on the field the 88 sits under."""
-    if atom.rhs.kind == "const" and atom.rhs.value is True and atom.lhs.kind == "var":
-        entry = model.condition_names.get(atom.lhs.name)
-        if entry:
-            parent, values = entry
-            for raw in values:
-                term = parse_term(raw)
-                if term.kind == "const":
-                    return Atom(Term("var", name=parent.upper()),
-                                atom.op, term, atom.origin)
-    return atom
+def _resolve_88(atom: Atom, model) -> list:
+    """``IF ACCT-ACTIVE`` is an obligation on the field the 88 sits under.
+
+    A condition-name with several values needs both directions handled
+    differently. Making it *true* means matching any one of them, which is a
+    choice - so the first becomes the atom and the rest its alternatives.
+    Making it *false* means matching none, which is a conjunction: taking
+    only the first lets the solver pick another value that leaves the
+    condition true after all.
+    """
+    if not (atom.rhs.kind == "const" and atom.rhs.value is True
+            and atom.lhs.kind == "var"):
+        return [atom]
+    entry = model.condition_names.get(atom.lhs.name)
+    if not entry:
+        return [atom]
+    parent, raw_values = entry
+    subject = Term("var", name=parent.upper())
+    values = [parse_term(v) for v in raw_values]
+    values = [v for v in values if v.kind == "const"]
+    if not values:
+        return [atom]
+    if atom.op == "=":
+        head, spares = values[0], tuple(
+            Atom(subject, "=", v, atom.origin) for v in values[1:])
+        return [Atom(subject, "=", head, atom.origin, spares)]
+    return [Atom(subject, "!=", v, atom.origin) for v in values]
 
 
 def analyse(program):
@@ -160,7 +175,8 @@ def analyse(program):
 
 def build_plan(program, target: str, *, entry: str | None = None, via=(),
                agent_bindings: dict | None = None, kinds: set | None = None,
-               preferred: dict | None = None, max_rounds: int = 8) -> Plan:
+               preferred: dict | None = None, extra: list | None = None,
+               max_rounds: int = 8) -> Plan:
     """Derive a reaching plan for ``target``.
 
     ``via`` pins the call trace through named frames, so a caller can ask
@@ -187,8 +203,14 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     target = target.upper()
     model = program.model
 
-    path = (chain_via(graph, entry, via, target, kinds=kinds) if via
-            else shortest_chain(graph, entry, target, kinds=kinds))
+    if target == entry and not via:
+        # The entry paragraph always runs, so there is no chain to find - but
+        # its own decisions still need planning, and returning "unreachable"
+        # for the one frame guaranteed to execute is plainly wrong.
+        path = []
+    else:
+        path = (chain_via(graph, entry, via, target, kinds=kinds) if via
+                else shortest_chain(graph, entry, target, kinds=kinds))
     if path is None:
         return Plan(target, [], [], [], [], [],
                     [(Atom(Term("var", name=target), "=", Term("const", value=True)),
@@ -199,7 +221,12 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
 
     # Deepest frame first: its obligations are the most specific, and pinning
     # them constrains what the shallower frames merely have to preserve.
-    atoms = [_resolve_88(a, model) for site in reversed(path) for a in site.guards]
+    atoms = [r for site in reversed(path) for a in site.guards
+             for r in _resolve_88(a, model)]
+    # Obligations the caller wants on top of the chain's own - typically the
+    # condition at the target decision, so the run arrives with it settled
+    # rather than left to whatever the defaults produce.
+    atoms = [r for a in (extra or []) for r in _resolve_88(a, model)] + atoms
 
     bindings: list = []
     rendezvous: list = []
@@ -301,7 +328,11 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         # atoms too, and a condition-name among them means the same thing it
         # does at the top level. Resolving only the first batch left every
         # negated 88 unreadable.
-        atom = _resolve_88(atom, model)
+        resolved = _resolve_88(atom, model)
+        if len(resolved) > 1:
+            for extra_atom in resolved[1:]:
+                queue.append((extra_atom, round_no))
+        atom = resolved[0]
         lhs, rhs = atom.lhs, atom.rhs
         at = origin_site(atom.origin)
 

@@ -1410,3 +1410,92 @@ class TestRecordLayout(unittest.TestCase):
         out = render(m, "REC", {"B": "WXYZ"})
         self.assertEqual(len(out), 7)
         self.assertEqual(out[3:7], "WXYZ")
+
+
+class TestCoverage(unittest.TestCase):
+    """Coverage is the union of what a plan set touched, counted by direction."""
+
+    SRC = HEADER + """       01  WS-F PIC X VALUE 'N'.
+           88  F-ON  VALUE 'Y'.
+           88  F-OFF VALUE 'N', ' '.
+       PROCEDURE DIVISION.
+       AP-MAIN.
+           IF WS-F = 'Y'
+              PERFORM AP-YES
+           ELSE
+              PERFORM AP-NO
+           END-IF
+           GOBACK
+           .
+       AP-YES.
+           CONTINUE
+           .
+       AP-NO.
+           CONTINUE
+           .
+"""
+
+    def test_a_direction_is_half_a_branch(self):
+        from frameladder.coverage import accumulate, branches_of
+        from frameladder.interpreter import Interpreter
+        p = program(self.SRC)
+        self.assertEqual(len(branches_of(p)), 1)
+        one = Interpreter(p, {"WS-F": "Y"}).run("AP-MAIN")
+        cov = accumulate(p, [one])
+        self.assertEqual(cov.direction_pct, 50.0, "one way is half the branch")
+        both = Interpreter(p, {"WS-F": "N"}).run("AP-MAIN")
+        cov = accumulate(p, [one, both])
+        self.assertEqual(cov.direction_pct, 100.0)
+
+    def test_gaps_separate_never_from_one_way(self):
+        from frameladder.coverage import accumulate, missing
+        from frameladder.interpreter import Interpreter
+        p = program(self.SRC)
+        cov = accumulate(p, [Interpreter(p, {"WS-F": "Y"}).run("AP-MAIN")])
+        gaps = missing(p, cov)
+        self.assertEqual(len(gaps["untouched"]), 0, "it was evaluated")
+        self.assertEqual(len(gaps["one_way_only"]), 1, "but only one way")
+
+    def test_negating_a_condition_name_excludes_every_value(self):
+        # F-OFF is 'N' or ' '. Making it false must rule out both; ruling out
+        # only the first lets the solver pick the other and leave it true.
+        from frameladder.ladder import _resolve_88
+        atom = ir.Atom(ir.Term("var", name="F-OFF"), "!=",
+                       ir.Term("const", value=True))
+        p = program(self.SRC)
+        resolved = _resolve_88(atom, p.model)
+        self.assertEqual(len(resolved), 2)
+        self.assertTrue(all(a.op == "!=" for a in resolved))
+
+    def test_a_condition_name_value_may_contain_a_space(self):
+        p = program(self.SRC)
+        _parent, values = p.model.condition_names["F-OFF"]
+        self.assertIn("' '", values, "a quoted space is one value, not two")
+
+    def test_the_entry_paragraph_can_be_planned(self):
+        # The entry always runs, so reporting its own decisions unreachable
+        # is plainly wrong - and it is where a mainline keeps its dispatch.
+        p = program(self.SRC)
+        plan = build_plan(p, "AP-MAIN", entry="AP-MAIN")
+        self.assertEqual(plan.chain, ["AP-MAIN"])
+        self.assertTrue(plan.solved)
+
+    def test_branch_obligations_reach_inside_an_evaluate(self):
+        from frameladder.graph import obligations_for_branch
+        p = program(HEADER + """       01  WS-S PIC X(2).
+       PROCEDURE DIVISION.
+       AQ-MAIN.
+           EVALUATE WS-S
+             WHEN 'AA'
+               CONTINUE
+             WHEN 'BB'
+               CONTINUE
+           END-EVALUATE
+           GOBACK
+           .
+""")
+        line = [s for s in p.paragraph("AQ-MAIN")["statements"]
+                if s["type"] == "EVALUATE"][0]["children"][1]["line_start"]
+        atoms = obligations_for_branch(p, "AQ-MAIN", line, True)
+        self.assertTrue(atoms, "a WHEN arm must yield its own obligation")
+        self.assertEqual(str(atoms[0]), "WS-S = 'BB'")

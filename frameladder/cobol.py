@@ -80,6 +80,24 @@ _USAGE_CANON = {"COMPUTATIONAL": "COMP", "COMPUTATIONAL-1": "COMP-1",
                 "COMPUTATIONAL-4": "COMP-4", "COMPUTATIONAL-5": "COMP-5",
                 "PACKED-DECIMAL": "COMP-3"}
 _LEVEL88 = re.compile(r"^\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(?:ARE\s+|IS\s+)?(.*)$", re.I)
+_88_VALUE = re.compile(r"'[^']*'|\"[^\"]*\"|[^\s,]+")
+
+
+def _split_88_values(text: str) -> list:
+    """The values of a condition-name, without breaking quoted literals.
+
+    ``88 FLG-BLANK VALUE ' '`` is one value - a space - and splitting on
+    whitespace turns it into two lone quotes, which then resolve to nothing.
+    Since a level-88 is how COBOL names most of its states, that quietly
+    disables a large share of them.
+    """
+    out = []
+    for m in _88_VALUE.finditer(text or ""):
+        token = m.group(0).strip()
+        if token.upper() in ("THRU", "THROUGH") or not token:
+            continue
+        out.append(token.rstrip("."))
+    return out
 
 
 _SELECT = re.compile(r"\bSELECT\s+(?:OPTIONAL\s+)?([A-Z0-9][A-Z0-9-]*)", re.I)
@@ -220,8 +238,7 @@ def parse_data_division(path: str) -> DataModel:
                 continue
             m88 = _LEVEL88.match(chunk)
             if m88 and stack:
-                values = [v.strip() for v in re.split(r"[,\s]+(?:THRU|THROUGH)?\s*",
-                                                      m88.group(2)) if v.strip()]
+                values = _split_88_values(m88.group(2))
                 model.condition_names[m88.group(1).upper()] = (stack[-1][1], values)
                 continue
             m = _DECL.match(chunk)

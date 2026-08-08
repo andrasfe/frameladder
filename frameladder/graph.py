@@ -181,6 +181,64 @@ def walk_guarded(paragraph: dict, visit):
     rec(paragraph.get("statements", []), [], {}, {})
 
 
+def obligations_for_branch(program, paragraph: str, line: int,
+                           direction: bool) -> list:
+    """What must hold for one decision to go a particular way.
+
+    Aiming a plan at a paragraph only satisfies the guards on the way *to*
+    it; every condition inside then evaluates against whatever the defaults
+    happen to be, which is why so many end up always false. Aiming at a
+    direction adds the condition itself, plus the guards enclosing it within
+    the paragraph, so the run arrives with the decision already determined.
+    """
+    para = program.paragraph(paragraph)
+    if para is None:
+        return []
+    found: list = []
+
+    # A WHEN arm does not carry its own subject; the EVALUATE above it does.
+    subjects: dict = {}
+
+    def index(stmt):
+        if stmt.get("type") == "EVALUATE":
+            subject = stmt.get("attributes", {}).get("subject", "")
+            for arm in stmt.get("children") or []:
+                if arm.get("type") == "WHEN":
+                    subjects[arm.get("line_start", 0)] = (subject,
+                                                          stmt.get("children"))
+        for child in stmt.get("children") or []:
+            index(child)
+
+    for stmt in para.get("statements", []):
+        index(stmt)
+
+    def visit(stmt, pname, guards, induction, literals):
+        if stmt.get("line_start", 0) != line:
+            return
+        kind = stmt.get("type", "")
+        attrs = stmt.get("attributes", {})
+        origin = "%s:%d" % (pname, line)
+        own: list = []
+        if kind == "IF":
+            alts = condition_atoms(attrs.get("condition", ""), not direction,
+                                   origin)
+            own = first_with_alternatives(alts)
+        elif kind == "WHEN":
+            subject, siblings = subjects.get(line, ("", [stmt]))
+            own = _when_guards(stmt, subject, siblings or [stmt], origin)
+            if not direction:
+                own = [a for atom in own for a in negate_atom(atom)]
+        elif kind.startswith("PERFORM"):
+            own, _induct = _loop_guards(stmt, origin)
+            if not direction:
+                own = [a for atom in own for a in negate_atom(atom)]
+        if own or guards:
+            found.extend(list(guards) + list(own))
+
+    walk_guarded(para, visit)
+    return found
+
+
 def build_graph(program) -> dict:
     """PERFORM and GO TO edges, plus the two COBOL-specific ones a naive
     graph misses.

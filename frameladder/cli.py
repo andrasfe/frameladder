@@ -323,6 +323,100 @@ def _constraint_of(binding):
     return None, None
 
 
+def cmd_coverage(args):
+    """What a whole plan set exercises, and what it leaves untouched."""
+    program = _program(args)
+    journal = Journal(args.work_dir)
+    from .coverage import accumulate, missing
+    from .interpreter import Interpreter
+    from .ladder import analyse, build_family
+    from .conformance_defaults import io_defaults
+    analyse(program)
+    entry = _entry(program, args)
+    known = journal.bindings()
+
+    traces = []
+    if args.branches:
+        # One plan per decision *direction*, which is what the metric counts.
+        from .coverage import branches_of
+        from .graph import obligations_for_branch
+        for b in branches_of(program):
+            for direction in (True, False):
+                extra = obligations_for_branch(program, b.paragraph, b.line,
+                                               direction)
+                try:
+                    plan = build_plan(program, b.paragraph, entry=args.entry,
+                                      agent_bindings=known, extra=extra)
+                except Exception:                            # noqa: BLE001
+                    continue
+                if not plan.chain:
+                    continue
+                interp = Interpreter(program, plan.input_state(),
+                                     stubs=plan.stub_plan(),
+                                     terminals=plan.terminals,
+                                     defaults=io_defaults(program))
+                try:
+                    traces.append(interp.run(entry))
+                except Exception:                            # noqa: BLE001
+                    continue
+
+    for target in program.paragraph_names[1:]:
+        plans = []
+        if args.families:
+            plans = [m["plan"] for m in
+                     build_family(program, target, entry=args.entry,
+                                  limit=args.families)]
+        if not plans:
+            plan = build_plan(program, target, entry=args.entry,
+                              agent_bindings=known)
+            plans = [plan] if plan.chain else []
+        for plan in plans:
+            interp = Interpreter(program, plan.input_state(),
+                                 stubs=plan.stub_plan(),
+                                 terminals=plan.terminals,
+                                 defaults=io_defaults(program))
+            try:
+                traces.append(interp.run(entry))
+            except Exception:                                # noqa: BLE001
+                continue
+
+    cov = accumulate(program, traces)
+    gaps = missing(program, cov)
+    payload = dict(cov.summary())
+    payload.update({
+        "program": program.name, "entry": entry,
+        "unreached_paragraphs": gaps["paragraphs"],
+        "untouched_branches": [{"paragraph": b.paragraph, "line": b.line,
+                                "kind": b.kind, "condition": b.condition}
+                               for b in gaps["untouched"]],
+        "one_way_only": [{"paragraph": b.paragraph, "line": b.line,
+                          "kind": b.kind, "condition": b.condition,
+                          "only": went}
+                         for b, went in gaps["one_way_only"]],
+    })
+
+    def render(p):
+        print("%s   %d runs" % (p["program"], p["runs"]))
+        print("  paragraphs %-12s %5.1f%%" % (p["paragraphs"], p["paragraph_pct"]))
+        print("  directions %-12s %5.1f%%" % (p["directions"], p["direction_pct"]))
+        if p["unreached_paragraphs"]:
+            print("\nnever entered (%d): %s"
+                  % (len(p["unreached_paragraphs"]),
+                     ", ".join(p["unreached_paragraphs"][:10])))
+        if p["untouched_branches"]:
+            print("\nnever evaluated (%d):" % len(p["untouched_branches"]))
+            for b in p["untouched_branches"][: args.limit]:
+                print("   %s:%d %-5s %s" % (b["paragraph"], b["line"],
+                                            b["kind"], b["condition"][:60]))
+        if p["one_way_only"]:
+            print("\nonly ever went one way (%d):" % len(p["one_way_only"]))
+            for b in p["one_way_only"][: args.limit]:
+                print("   %s:%d %-5s %-46s always %s"
+                      % (b["paragraph"], b["line"], b["kind"],
+                         b["condition"][:46], b["only"]))
+    return _emit(payload, args.json, render)
+
+
 def cmd_names(args):
     """Sweep this program's own vocabulary, rather than assume a prior one.
 
@@ -661,6 +755,15 @@ def build_parser():
     e.add_argument("--variables", help="comma-separated variable names")
     e.add_argument("--source", action="store_true", help="include the source text")
     e.set_defaults(func=cmd_explain)
+
+    cv = sub.add_parser("coverage", help="what a plan set exercises, and what "
+                                        "it leaves untouched")
+    cv.add_argument("--branches", action="store_true",
+                    help="also aim a plan at each decision direction")
+    cv.add_argument("--families", type=int, default=0,
+                    help="also run N divergence-family members per target")
+    cv.add_argument("--limit", type=int, default=12)
+    cv.set_defaults(func=cmd_coverage)
 
     nm = sub.add_parser("names", help="this program's own naming vocabulary, "
                                      "ranked by how much it would settle")
