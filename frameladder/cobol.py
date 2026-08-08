@@ -204,6 +204,7 @@ def parse_data_division(path: str) -> DataModel:
     model.fd_records.update(parse_fd_records(path))
     stack: list[tuple[int, str]] = []
     buffer = ""
+    fillers = 0
     in_procedure = False
 
     for line in read_lines(path):
@@ -229,9 +230,15 @@ def parse_data_division(path: str) -> DataModel:
             level, name, rest = int(m.group(1)), m.group(2).upper(), m.group(3)
             if level in (66, 88):
                 continue
+            if name == "FILLER":
+                # Unreferenceable, but it occupies bytes: leave it out of the
+                # declared set so nothing can bind it, and give it a unique
+                # name so the record layout still adds up.
+                fillers += 1
+                name = "FILLER#%d" % fillers
             while stack and stack[-1][0] >= level:
                 stack.pop()
-            if name != "FILLER":                  # a placeholder, not a field
+            if not name.startswith("FILLER#"):
                 model.declared.add(name)
             if stack:
                 model.parent[name] = stack[-1][1]

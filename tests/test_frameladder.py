@@ -1336,3 +1336,77 @@ class TestDictionary(unittest.TestCase):
         for text in ("X NOT= Y", "X NOT = Y", "X IS NOT= Y", "X NOT EQUAL Y"):
             atoms = conditions.condition_atoms(text)[0]
             self.assertEqual(str(atoms[0]), "X != Y", text)
+
+
+class TestRecordLayout(unittest.TestCase):
+    """Offsets and byte lengths - checked against GnuCOBOL in conformance/."""
+
+    def _model(self, text):
+        import tempfile
+        f = tempfile.NamedTemporaryFile("w", suffix=".cpy", delete=False)
+        f.write(text)
+        f.close()
+        return cobol.parse_data_division(f.name)
+
+    def test_usage_decides_the_width(self):
+        from frameladder.layout import byte_length
+        # Same PIC, three representations, three sizes. A layout computed from
+        # PIC alone puts everything after the first packed field at the wrong
+        # offset.
+        self.assertEqual(byte_length("S9(4)"), 4)             # DISPLAY
+        self.assertEqual(byte_length("S9(4)", "COMP-3"), 3)   # packed
+        self.assertEqual(byte_length("S9(4)", "COMP"), 2)     # binary
+        self.assertEqual(byte_length("S9(9)", "COMP"), 4)
+        self.assertEqual(byte_length("S9(4)V99", "COMP-3"), 4)
+
+    def test_separate_sign_costs_a_byte(self):
+        from frameladder.layout import byte_length
+        self.assertEqual(byte_length("S9(3)", "", "TRAILING"), 3)
+        self.assertEqual(byte_length("S9(3)", "", "TRAILING SEPARATE"), 4)
+
+    def test_redefines_does_not_advance_the_cursor(self):
+        from frameladder.layout import record_layout
+        m = self._model("""       01  REC.
+           05  A PIC X(4).
+           05  B REDEFINES A PIC 9(4).
+           05  C PIC X(2).
+""")
+        fields = {f.name: f for f in record_layout(m, "REC")}
+        self.assertEqual(fields["A"].offset, 0)
+        self.assertEqual(fields["B"].offset, 0, "an alias shares the bytes")
+        self.assertEqual(fields["C"].offset, 4, "and does not push C along")
+        self.assertEqual(fields["REC"].length, 6)
+
+    def test_occurs_multiplies_the_whole_subtree(self):
+        from frameladder.layout import record_layout
+        m = self._model("""       01  REC.
+           05  T OCCURS 3 TIMES.
+               10  X PIC X(2).
+               10  Y PIC X(3).
+           05  Z PIC X(1).
+""")
+        fields = {f.name: f for f in record_layout(m, "REC")}
+        self.assertEqual(fields["T"].length, 15, "5 bytes, three times")
+        self.assertEqual(fields["Z"].offset, 15)
+
+    def test_filler_takes_space_without_being_a_field(self):
+        from frameladder.layout import record_layout
+        m = self._model("""       01  REC.
+           05  A PIC X(2).
+           05  FILLER PIC X(5).
+           05  B PIC X(3).
+""")
+        fields = {f.name: f for f in record_layout(m, "REC")}
+        self.assertEqual(fields["B"].offset, 7, "the filler is counted")
+        self.assertEqual(fields["REC"].length, 10)
+        self.assertNotIn("FILLER", m.declared, "but it cannot be referenced")
+
+    def test_values_land_at_their_offsets(self):
+        from frameladder.layout import render
+        m = self._model("""       01  REC.
+           05  A PIC X(3).
+           05  B PIC X(4).
+""")
+        out = render(m, "REC", {"B": "WXYZ"})
+        self.assertEqual(len(out), 7)
+        self.assertEqual(out[3:7], "WXYZ")

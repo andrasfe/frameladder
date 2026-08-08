@@ -15,6 +15,8 @@ chain     0000-MAIN -> 1000-PROCESS-INPUTS -> 1200-EDIT-MAP-INPUTS
 
 Nothing to install, no dependencies, no network, no model.
 
+Working on the repo rather than with it? See [`AGENTS.md`](AGENTS.md).
+
 ---
 
 ## Why outwards
@@ -346,6 +348,31 @@ put one after the `=`, which cannot match before a quote. `IF WS-ST NOT =
 '00'` therefore fell through to the bare `=` and produced a variable called
 `WS-ST NOT`. 63 occurrences in the corpus.
 
+## From field values to a record
+
+A plan says what value a field should hold. A harness needs the *bytes* — the
+record a file contains or a subprogram is handed — and the distance between
+those two is most of the work of building mainframe test data.
+
+That distance is exactly what `USAGE` closes. `PIC S9(4)` is **four** bytes as
+DISPLAY, **three** as COMP-3 and **two** as COMP, so a layout computed from
+`PIC` alone puts every field after the first packed one at the wrong offset —
+and a record wrong from byte nine onwards is worse than no record, because it
+looks plausible. `REDEFINES` does not advance the cursor; `OCCURS` multiplies
+a whole subtree; `FILLER` cannot be referenced but still takes space.
+
+`layout.py` computes offsets and lengths, checked against the compiler the
+same way everything else is:
+
+```
+records checked against GnuCOBOL: 19
+  lengths agree : 19 (100%)
+```
+
+Worth being clear about what this does *not* yet do: it places DISPLAY values,
+and packed and binary fields need real encoding rather than text. It is the
+groundwork for comparing outputs, not a finished record writer.
+
 ## The external world
 
 A program's interesting behaviour is mostly decided by things it does not
@@ -615,6 +642,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 76 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 82 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```
