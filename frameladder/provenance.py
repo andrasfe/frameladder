@@ -127,11 +127,27 @@ class Provenance:
                 elif kind in STUB_KINDS:
                     key = op_key(text)
                     self.call_literals.setdefault(key, []).append(dict(literals))
-                    for var in stub_outputs(text):
+                    outputs = list(stub_outputs(text))
+                    for f, status in self.model.file_status.items():
+                        if re.search(r"\b%s\b" % re.escape(f), text, re.I):
+                            outputs.append(status)
+                    if kind in ("READ", "RETURN"):
+                        for f, records in self.model.fd_records.items():
+                            if re.search(r"\b%s\b" % re.escape(f), text, re.I):
+                                outputs.extend(records)
+                    for var in outputs:
                         w = Writer(pname, line, "STUB", op_key=key,
                                    guards=tuple(guards), literals=dict(literals))
                         self._add(var, w)
                         self.payloads.add(var)
+                        # A record filled straight by the operation - READ ...
+                        # INTO REC - is as much a place for undeclared fields
+                        # to come from as one filled by a later MOVE. Register
+                        # it so a field whose copybook is missing can still be
+                        # traced back to the read that produced it.
+                        self.stub_fills.setdefault(var, Writer(
+                            pname, line, "FILL", source=var, op_key=key,
+                            guards=tuple(guards), literals=dict(literals)))
                         for child in self.model.descendants(var):
                             self._add(child, w)
                             self.payloads.add(child)
@@ -260,7 +276,14 @@ class Provenance:
                 up = self.producer(src.name, (w.para, w.line), depth + 1,
                                    seen | {var})
                 if up.kind in ("stub", "literal", "input"):
-                    return Producer(up.kind, var=up.var or src.name,
+                    # Walking up to a *group* - a commarea, a whole record -
+                    # loses which field was being asked about, and every
+                    # field then shares one slot and collides with the rest.
+                    # The field is what a harness sets, so keep its name.
+                    upstream = up.var or src.name
+                    if up.kind == "input" and self.model.descendants(upstream):
+                        upstream = var
+                    return Producer(up.kind, var=upstream,
                                     site=up.site or w.para, op_key=up.op_key,
                                     value=up.value,
                                     discriminators=self.discriminators(

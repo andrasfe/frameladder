@@ -15,8 +15,8 @@ _RELATIONS = [
     "IS GREATER THAN", "IS LESS THAN", "GREATER THAN OR EQUAL TO",
     "LESS THAN OR EQUAL TO", "EQUAL TO", "GREATER THAN", "LESS THAN",
     "NOT EQUAL", "NOT GREATER", "NOT LESS", "IS EQUAL", "IS GREATER",
-    "IS LESS", "EQUALS", "EQUAL", "EXCEEDS", "NOT =", "IS NOT", ">=", "<=",
-    "<>", "!=", "=", ">", "<",
+    "IS LESS", "EQUALS", "EQUAL", "EXCEEDS", "GREATER", "LESS",
+    "NOT =", "IS NOT", ">=", "<=", "<>", "!=", "=", ">", "<",
 ]
 _COMPARE = re.compile(
     r"^(.*?)\s*(" + "|".join(

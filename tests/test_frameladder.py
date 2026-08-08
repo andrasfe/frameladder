@@ -337,3 +337,164 @@ class TestInterpreter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSynergies(unittest.TestCase):
+    """Constraint shapes where the relation is fixed but the values are free,
+    plus the cases where the answer is a proof rather than a plan."""
+
+    def test_boolean_is_not_arithmetic(self):
+        # bool subclasses int in Python, so negating a truth value used to
+        # produce 2 - which is not a value any COBOL field can hold.
+        from frameladder.ladder import witness
+        self.assertIs(witness("!=", ir.Term("const", value=True), set()), False)
+
+    def test_separation_between_two_produced_values(self):
+        p = program(HEADER + """       01  WS-SEL PIC X(4).
+       01  AREA-A PIC X(4).
+       01  REC-A PIC X(4).
+       01  REC-B PIC X(4).
+       PROCEDURE DIVISION.
+       N-MAIN.
+           MOVE 'AAAA' TO WS-SEL
+           CALL 'SUB' USING AREA-A
+           MOVE AREA-A TO REC-A
+           MOVE 'BBBB' TO WS-SEL
+           CALL 'SUB' USING AREA-A
+           MOVE AREA-A TO REC-B
+           IF REC-A NOT EQUAL REC-B
+              PERFORM N-DEEP
+           END-IF
+           GOBACK
+           .
+       N-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "N-DEEP", entry="N-MAIN")
+        self.assertTrue(plan.rendezvous, "expected a constructed pair")
+        values = [b.value for b in plan.bindings]
+        self.assertEqual(len(set(values)), 2, "the two sides must differ")
+
+    def test_ordering_between_two_produced_values(self):
+        p = program(HEADER + """       01  WS-LO PIC 9(4).
+       01  WS-HI PIC 9(4).
+       PROCEDURE DIVISION.
+       O-MAIN.
+           IF WS-HI GREATER WS-LO
+              PERFORM O-DEEP
+           END-IF
+           GOBACK
+           .
+       O-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "O-DEEP", entry="O-MAIN")
+        state = plan.flat_state()
+        self.assertGreater(state["WS-HI"], state["WS-LO"])
+        self.assertTrue(verify(p, plan, "O-MAIN")["reached"])
+
+    def test_file_status_is_an_output_of_its_io(self):
+        src = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INFILE
+                  FILE STATUS IS WS-ST.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-REC PIC X(80).
+       WORKING-STORAGE SECTION.
+       01  WS-ST PIC XX.
+       PROCEDURE DIVISION.
+       P-MAIN.
+           READ IN-FILE
+           GOBACK
+           .
+"""
+        p = program(src)
+        self.assertEqual(p.model.file_status.get("IN-FILE"), "WS-ST")
+        self.assertIn("IN-REC", p.model.fd_records.get("IN-FILE", []))
+        from frameladder.ladder import analyse
+        _graph, prov = analyse(p)
+        self.assertEqual(prov.producer("WS-ST").kind, "stub")
+
+    def test_two_values_for_one_read_are_a_sequence(self):
+        # '00' for the record and '10' at end of file is how every COBOL read
+        # loop works; treating the second as a conflict makes it unsolvable.
+        src = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INFILE
+                  FILE STATUS IS WS-ST.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-REC PIC X(80).
+       WORKING-STORAGE SECTION.
+       01  WS-ST PIC XX.
+       PROCEDURE DIVISION.
+       Q-MAIN.
+           READ IN-FILE
+           IF WS-ST = '00'
+              READ IN-FILE
+              IF WS-ST NOT EQUAL '00'
+                 PERFORM Q-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       Q-DEEP.
+           EXIT
+           .
+"""
+        p = program(src)
+        plan = build_plan(p, "Q-DEEP", entry="Q-MAIN")
+        outcomes = plan.stub_plan().get("READ:IN-FILE", [])
+        self.assertGreaterEqual(len(outcomes), 2,
+                                "expected an ordered outcome sequence")
+        self.assertEqual([o["seq"] for o in outcomes], sorted(o["seq"] for o in outcomes))
+
+    def test_unwritable_variable_gives_an_infeasibility_proof(self):
+        # WS-NEVER is declared and never assigned, so demanding two values of
+        # it is not a search problem - the chain is dead, and saying so is
+        # the useful answer.
+        p = program(HEADER + """       01  WS-NEVER PIC X.
+       PROCEDURE DIVISION.
+       R-MAIN.
+           IF WS-NEVER = '0'
+              IF WS-NEVER = '1'
+                 PERFORM R-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       R-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "R-DEEP", entry="R-MAIN")
+        self.assertTrue(any("INFEASIBLE" in why
+                            for _atom, why in plan.open_obligations),
+                        "expected a proof, not a vague failure")
+
+    def test_declared_constant_is_not_a_knob(self):
+        p = program(HEADER + """       01  WS-VAL PIC X(4).
+       PROCEDURE DIVISION.
+       S-MAIN.
+           IF WS-VAL = 'ABCD'
+              PERFORM S-DEEP
+           END-IF
+           GOBACK
+           .
+       S-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "S-DEEP", entry="S-MAIN")
+        self.assertEqual(plan.flat_state().get("WS-VAL"), "ABCD")

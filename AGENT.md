@@ -107,10 +107,17 @@ obligations turn out not to gate anything. Trust `verify`.
 
 ## What is derived for you — do not redo it by hand
 
-- **Rendezvous.** When a guard requires two *produced* values to be equal
-  (a key read from one file matching a key read from another), there is
-  nothing to solve: the ladder picks a value and plants it at both producers.
-  Any value works; agreement is the whole content of the obligation.
+- **Rendezvous, separation, ordering.** When a guard relates two *produced*
+  values — equal, unequal, or in order — the condition fixes the relationship
+  and says nothing about the values. The ladder constructs a witnessing pair
+  rather than searching for one.
+- **Outcome sequences.** Two obligations on one file-status field are not a
+  conflict; they are consecutive outcomes of one read, and the plan emits them
+  in order. `FILE STATUS IS` and `FD` records are attributed to their I/O.
+- **Infeasibility proofs.** If a variable the program never writes has to hold
+  two different values, the chain is dead. You will see `INFEASIBLE: ... and
+  nothing in the program writes it`. That is a finished answer — do not spend
+  effort trying to satisfy it. Pick a different chain or a different target.
 - **Guard avoidance.** An obligation contradicting a literal assignment is not
   dead if that assignment sits under a condition. The obligation moves onto
   the guard and the ladder recurses.
@@ -127,9 +134,10 @@ obligations turn out not to gate anything. Trust `verify`.
   binding per variable cannot express that. Bind its *initial* value and let
   the program advance it; if the chain re-enters the dispatcher, expect the
   ladder to bind only one of the values it needs.
-- **Per-invocation stub sequencing.** `--terminal` is per operation, not per
-  discriminator, so a program that routes opens and reads through one
-  subprogram cannot have both a succeeding open and an ending read.
+- **`--terminal` is per operation, not per discriminator**, so a program that
+  routes opens and reads through one subprogram cannot have both a succeeding
+  open and an ending read.
+- **Ordering is witnessed pairwise**, not solved as a system of constraints.
 - **Subscripts are flattened.** `WS-TAB(I)` and `WS-TAB` are one cell, so
   table-indexed plans are verified loosely. `approximations` in the output
   says when this bit.

@@ -28,6 +28,12 @@ def rendezvous_value(a: str, b: str, model) -> object:
     return int("1" * max(1, min(width, 15)))
 
 
+def _numeric(value) -> bool:
+    """bool is a subclass of int in Python, so a truth value would otherwise
+    be arithmetic - and negating it yields 2, which is not a COBOL value."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def witness(op: str, other: Term, domain: set) -> object:
     """A value satisfying ``x op other``."""
     if other.kind != "const":
@@ -39,15 +45,69 @@ def witness(op: str, other: Term, domain: set) -> object:
         for cand in sorted(domain, key=repr):
             if cand != val:
                 return cand
-        if isinstance(val, (int, float)):
+        if _numeric(val):
             return val + 1
+        if isinstance(val, bool):
+            return not val
         return "X" if val != "X" else "Y"
-    if isinstance(val, (int, float)):
+    if _numeric(val):
         return {">": val + 1, ">=": val, "<": val - 1, "<=": val}[op]
     for cand in sorted(domain, key=repr):
         if holds(cand, op, val):
             return cand
     return val if op in (">=", "<=") else None
+
+
+# --------------------------------------------------------------------------
+# Relations that fix the relationship but not the values
+# --------------------------------------------------------------------------
+
+def _pair_for(op: str, a: str, b: str, model) -> tuple | None:
+    """Two values satisfying ``a op b`` when *neither* side is a constant.
+
+    Equality is the famous case - any value works as long as it is the same
+    one - but it is not the only one.  A disequality needs two values that
+    merely differ; an ordering needs two that are merely in order.  In each
+    the condition constrains the *relationship* and says nothing about the
+    values, so there is nothing to search for: construct a witnessing pair
+    and write it down.
+    """
+    if op == "=":
+        v = rendezvous_value(a, b, model)
+        return v, v
+    spec = (model.pic.get(a) or model.pic.get(b) or "X(8)").upper()
+    textual = "X" in spec or "A" in spec
+    if op == "!=":
+        return ("AAAAAAAAAAAAAAAA"[:_width(spec)], "BBBBBBBBBBBBBBBB"[:_width(spec)]) \
+            if textual else (1, 2)
+    if op in (">", ">="):
+        return ("BBBBBBBBBBBBBBBB"[:_width(spec)], "AAAAAAAAAAAAAAAA"[:_width(spec)]) \
+            if textual else (2, 1)
+    if op in ("<", "<="):
+        return ("AAAAAAAAAAAAAAAA"[:_width(spec)], "BBBBBBBBBBBBBBBB"[:_width(spec)]) \
+            if textual else (1, 2)
+    return None
+
+
+def _width(spec: str) -> int:
+    m = re.search(r"[XA9]\((\d+)\)", spec)
+    return int(m.group(1)) if m else max(1, min(len(spec), 16))
+
+
+def _companion(op: str, fixed, model, other_name: str):
+    """The other half of a pair, once one side is pinned."""
+    if op == "=":
+        return fixed
+    if _numeric(fixed):
+        return {"!=": fixed + 1, ">": fixed - 1, ">=": fixed,
+                "<": fixed + 1, "<=": fixed}.get(op)
+    if isinstance(fixed, str):
+        bump = "A" if not fixed.startswith("A") else "B"
+        lowered = bump * len(fixed) if fixed else bump
+        return {"!=": lowered if lowered != fixed else "Z" * max(1, len(fixed)),
+                ">": "A" * max(1, len(fixed)), ">=": fixed,
+                "<": "Z" * max(1, len(fixed)), "<=": fixed}.get(op)
+    return None
 
 
 def origin_site(origin: str):
@@ -132,6 +192,8 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     assigned: dict = {}
     avoided: dict = {}
 
+    sequences: dict = {}
+
     def bind(producer: Producer, value, reason: str, source: str = "ladder",
              atom=None) -> bool:
         prior = assigned.get(producer.slot)
@@ -139,6 +201,27 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
             return prior.value == value
         b = Binding(producer.slot, producer, value, reason, source, atom)
         assigned[producer.slot] = b
+        sequences[producer.slot] = [b]
+        bindings.append(b)
+        return True
+
+    def extend_sequence(producer: Producer, value, reason: str, atom=None) -> bool:
+        """Record a *later* outcome of an operation already given one.
+
+        A read returns '00' for a record and '10' at end of file. Both
+        obligations are real and neither is wrong; treating the second as a
+        conflicting binding turns an ordinary file loop into an unsolvable
+        one. Only an external operation can do this - a program input has
+        just the one value.
+        """
+        if producer.kind != "stub":
+            return False
+        history = sequences.setdefault(producer.slot, [])
+        if any(b.value == value for b in history):
+            return True
+        b = Binding(producer.slot, producer, value, reason, "ladder", atom,
+                    seq=len(history))
+        history.append(b)
         bindings.append(b)
         return True
 
@@ -177,17 +260,15 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         return len(chain)
 
     def program_advanced(var: str) -> bool:
-        """Does the program itself move this variable on, unconditionally?
+        """Does the program itself ever assign this variable?
 
-        A dispatcher's file selector is set by the program at every step, so
-        a chain can need it to hold two different values at two different
-        moments. Only the *first* is settable - the entry state - and the
-        program produces the rest.
+        A chain can need one variable to hold two different values at two
+        different moments - a phase flag before and after the phase changes.
+        That is only a contradiction if nothing can change it in between.
+        If the program writes it at all, conditionally or not, the entry
+        state supplies the first value and the program produces the rest.
         """
-        from .ir import parse_term as _pt
-        return any(w.kind == "MOVE" and not w.conditional
-                   and _pt(w.source).kind == "const"
-                   for w in prov.writers.get(var.upper(), []))
+        return bool(prov.writers.get(var.upper()))
 
     queue = deque((a, 0) for a in atoms)
     handled: set = set()
@@ -198,6 +279,11 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         if marker in handled or round_no > max_rounds:
             continue
         handled.add(marker)
+        # Derived obligations - a negated guard, an alternative branch - are
+        # atoms too, and a condition-name among them means the same thing it
+        # does at the top level. Resolving only the first batch left every
+        # negated 88 unreadable.
+        atom = _resolve_88(atom, model)
         lhs, rhs = atom.lhs, atom.rhs
         at = origin_site(atom.origin)
 
@@ -209,27 +295,36 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         # ---- both sides produced: the coupling case ----------------------
         if lhs.kind == "var" and rhs.kind == "var":
             pa, pb = prov.producer(lhs.name, at), prov.producer(rhs.name, at)
-            if atom.op != "=":
-                if atom.op not in ("<=", ">="):
-                    open_obs.append((atom, "strict ordering between two produced "
-                                           "values (%s, %s)" % (pa.slot, pb.slot)))
-                continue
             if pa.kind == "literal" or pb.kind == "literal":
                 lit, other = (pa, pb) if pa.kind == "literal" else (pb, pa)
                 if not bind(other, lit.value,
                             "matched to literal %r fixed at %s" % (lit.value, lit.site)):
                     open_obs.append((atom, "conflicting binding for %s" % other.slot))
                 continue
-            value = rendezvous_value(lhs.name, rhs.name, model)
-            if assigned.get(pa.slot):
-                value = assigned[pa.slot].value
-            elif assigned.get(pb.slot):
-                value = assigned[pb.slot].value
-            if bind(pa, value, "rendezvous with %s" % pb.slot) and \
-               bind(pb, value, "rendezvous with %s" % pa.slot):
-                rendezvous.append((pa.slot, pb.slot, value))
+            pair = _pair_for(atom.op, lhs.name, rhs.name, model)
+            if pair is None:
+                open_obs.append((atom, "no constructible pair for %s between "
+                                       "%s and %s" % (atom.op, pa.slot, pb.slot)))
+                continue
+            left, right = pair
+            # If either side is already pinned, keep it and solve for the other.
+            if assigned.get(pa.slot) is not None:
+                left = assigned[pa.slot].value
+                right = _companion(atom.op, left, model, rhs.name)
+            elif assigned.get(pb.slot) is not None:
+                right = assigned[pb.slot].value
+                left = _companion(flip(atom.op), right, model, lhs.name)
+            if left is None or right is None:
+                open_obs.append((atom, "cannot solve %s against the pinned side"
+                                 % atom.op))
+                continue
+            label = {"=": "rendezvous", "!=": "separation"}.get(atom.op, "ordering")
+            if bind(pa, left, "%s with %s" % (label, pb.slot), atom=atom) and \
+               bind(pb, right, "%s with %s" % (label, pa.slot), atom=atom):
+                rendezvous.append((pa.slot, pb.slot,
+                                   left if atom.op == "=" else [left, right]))
             else:
-                open_obs.append((atom, "rendezvous blocked by an earlier binding"))
+                open_obs.append((atom, "%s blocked by an earlier binding" % label))
             continue
 
         # ---- one side produced, one constant -----------------------------
@@ -267,11 +362,32 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 if revise(existing, op, const_term):
                     settled = True
                     break
-                if program_advanced(var_term.name) and op == "=":
+                if extend_sequence(
+                        producer, value,
+                        "outcome %d of %s  [%s]" % (len(sequences.get(producer.slot, [])),
+                                                    producer.op_key, candidate.origin),
+                        atom=candidate):
+                    notes.append("%s returns %r then %r"
+                                 % (producer.op_key, existing.value, value))
+                    settled = True
+                    break
+                if not program_advanced(var_term.name):
+                    # Nothing writes it, so it holds one value for the whole
+                    # run. Two obligations wanting different values is not a
+                    # gap in the search - it is a proof that this chain
+                    # cannot be taken, and saying so is the useful answer.
+                    open_obs.append((candidate,
+                                     "INFEASIBLE: %s must be %r and also %s %r, "
+                                     "and nothing in the program writes it"
+                                     % (var_term.name, existing.value, op,
+                                        const_term.value)))
+                    settled = True
+                    break
+                if program_advanced(var_term.name):
                     earlier = (existing.atom is None
                                or chain_position(candidate)
                                < chain_position(existing.atom))
-                    if earlier:
+                    if earlier and op == "=":
                         notes.append("%s: entry value %r (the program advances "
                                      "it to %r later)"
                                      % (var_term.name, value, existing.value))

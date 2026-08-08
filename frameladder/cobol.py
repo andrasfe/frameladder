@@ -66,6 +66,73 @@ _OCCURS = re.compile(r"\bOCCURS\s+(\d+)", re.I)
 _LEVEL88 = re.compile(r"^\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(?:ARE\s+|IS\s+)?(.*)$", re.I)
 
 
+_SELECT = re.compile(r"\bSELECT\s+(?:OPTIONAL\s+)?([A-Z0-9][A-Z0-9-]*)", re.I)
+_FILE_STATUS = re.compile(r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9][A-Z0-9-]*)", re.I)
+
+
+_FD = re.compile(r"^\s*FD\s+([A-Z0-9][A-Z0-9-]*)", re.I)
+_O1 = re.compile(r"^\s*01\s+([A-Z0-9][A-Z0-9-]*)", re.I)
+
+
+def parse_fd_records(path: str) -> dict:
+    """Map each file to the record areas an I/O statement fills.
+
+    ``FD EXPORT-INPUT`` followed by ``01 EXPORT-INPUT-RECORD`` means a READ
+    on that file writes that record.  Without it the record's fields look
+    like program inputs, and a field holding one value for this record and
+    a different one for the next reads as a contradiction rather than as
+    two reads.
+    """
+    out: dict = {}
+    current = None
+    for line in read_lines(path):
+        if re.search(r"\bPROCEDURE\s+DIVISION\b", line.text, re.I):
+            break
+        fd = _FD.match(line.text)
+        if fd:
+            current = fd.group(1).upper()
+            out.setdefault(current, [])
+            continue
+        if current:
+            rec = _O1.match(line.text)
+            if rec:
+                out[current].append(rec.group(1).upper())
+            elif re.match(r"^\s*(FD|SD|WORKING-STORAGE|LOCAL-STORAGE|LINKAGE)\b",
+                          line.text, re.I):
+                current = None
+    return out
+
+
+def parse_file_control(path: str) -> dict:
+    """Map each file to the variable its I/O status lands in.
+
+    ``SELECT ACCTFILE-FILE ... FILE STATUS IS ACCTFILE-STATUS`` makes that
+    variable an *output* of every READ, WRITE, OPEN and CLOSE on the file.
+    Miss it and the status field looks like a plain input, which makes
+    "the read succeeded, then hit end-of-file" read as a contradiction
+    instead of as two outcomes of one operation.
+    """
+    out: dict = {}
+    current = None
+    buffer = ""
+    for line in read_lines(path):
+        text = line.text
+        if re.search(r"\bPROCEDURE\s+DIVISION\b", text, re.I):
+            break
+        buffer += " " + text.strip()
+        m = _SELECT.search(buffer)
+        if m:
+            current = m.group(1).upper()
+        st = _FILE_STATUS.search(buffer)
+        if st and current:
+            out[current] = st.group(1).upper()
+        if "." in text:
+            buffer = ""
+            if st:
+                current = None
+    return out
+
+
 @dataclass
 class DataModel:
     """Record layout: what contains what, and how wide each field is."""
@@ -76,6 +143,8 @@ class DataModel:
     parent: dict = field(default_factory=dict)
     declared: set = field(default_factory=set)
     condition_names: dict = field(default_factory=dict)   # 88 name -> (parent, values)
+    file_status: dict = field(default_factory=dict)       # file -> status variable
+    fd_records: dict = field(default_factory=dict)        # file -> record areas
 
     def descendants(self, group: str) -> list[str]:
         return self.children.get(group.upper(), [])
@@ -87,6 +156,9 @@ class DataModel:
         self.parent.update(other.parent)
         self.declared |= other.declared
         self.condition_names.update(other.condition_names)
+        self.file_status.update(other.file_status)
+        for f, recs in other.fd_records.items():
+            self.fd_records.setdefault(f, []).extend(recs)
         for group, kids in other.children.items():
             self.children.setdefault(group, []).extend(kids)
         return self
@@ -94,6 +166,8 @@ class DataModel:
 
 def parse_data_division(path: str) -> DataModel:
     model = DataModel()
+    model.file_status.update(parse_file_control(path))
+    model.fd_records.update(parse_fd_records(path))
     stack: list[tuple[int, str]] = []
     buffer = ""
     in_procedure = False

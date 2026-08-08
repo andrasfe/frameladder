@@ -182,6 +182,7 @@ class Binding:
     reason: str
     source: str = "ladder"         # 'ladder' | 'agent'
     atom: Any = None               # the obligation that caused it
+    seq: int = 0                   # position in this operation's outcome sequence
 
 
 @dataclass
@@ -206,24 +207,37 @@ class Plan:
                 if b.producer.kind in ("input", "unknown")}
 
     def stub_plan(self) -> dict:
+        """Outcomes per operation, in the order they are delivered.
+
+        An external operation returns a *sequence*: a record, then another,
+        then end-of-file. Two bindings on the same field are therefore not
+        in conflict - they are consecutive outcomes - so ordering matters
+        and `seq` carries it.
+        """
         out: dict = {}
-        for b in self.bindings:
+        for b in sorted(self.bindings, key=lambda x: x.seq):
             if b.producer.kind != "stub":
                 continue
             out.setdefault(b.producer.op_key, []).append({
                 "when": b.producer.discriminators,
                 "set": {b.producer.var: b.value},
+                "seq": b.seq,
                 "inferred": b.producer.inferred,
             })
         return out
 
     def flat_state(self) -> dict:
-        """Every binding as one variable->value map, which is what the
-        interpreter and any downstream harness actually consume."""
+        """Every binding as one variable->value map.
+
+        Only the *first* outcome of each operation is included: a flattened
+        view cannot represent a sequence, and the first is what the run
+        starts from.
+        """
         state = dict(self.input_state())
         for entries in self.stub_plan().values():
             for entry in entries:
-                state.update(entry["set"])
+                for name, value in entry["set"].items():
+                    state.setdefault(name, value)
         return state
 
     def to_dict(self) -> dict:

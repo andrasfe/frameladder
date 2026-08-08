@@ -38,18 +38,39 @@ goal on (a,b,c)  -> emit
 COBOL paragraphs have no parameters, so "arguments" means the live-in set and
 the call chain is the PERFORM/GO TO chain. Nothing else changes.
 
-Two mechanisms carry the weight:
+## Constraints that fix a relationship, not a value
 
-**Rendezvous.** When a guard requires two *produced* values to be equal, there
-is nothing to solve. The obligation is that two independent producers agree, so
-the ladder picks a value and plants it at both. Any value works — agreement is
-the whole content of the obligation, and it costs O(1) here where sampling
-costs the size of the domain squared.
+The recurring win is a constraint shape where the condition says everything
+about how two values relate and *nothing* about what they are. There is then
+nothing to search for — construct a witnessing pair and write it down.
 
-**Guard avoidance.** An obligation that contradicts a literal assignment is not
+**Rendezvous** (`A = B`, both produced). A key read from one file matching a
+key loaded from another. Sampling has to draw the same needle twice; the ladder
+picks any value and plants it at both producers. O(1) against |domain|².
+
+**Separation** (`A != B`) and **ordering** (`A < B`, `A > B`). The same shape.
+Two values that merely differ, or are merely in order, are constructed rather
+than found.
+
+**Guard avoidance.** An obligation contradicting a literal assignment is not
 dead if that assignment sits under a condition. `MOVE 'Y' TO END-OF-FILE` under
 `WHEN '10'` means `END-OF-FILE != 'Y'` is reachable by making the return code
-anything else. The obligation moves onto the guard, and the ladder recurses.
+anything else. The obligation moves onto the guard and the ladder recurses.
+
+**Outcome sequences.** A read returns `'00'` for a record and `'10'` at
+end-of-file. Two obligations on one status field are not a contradiction —
+they are consecutive outcomes of one operation, and the plan emits them in
+order. Recognising this needs the `FILE STATUS IS` clause and the `FD` record
+to be attributed to the I/O that writes them, so both are parsed.
+
+**Infeasibility proofs.** When a variable the program *never writes* is
+required to hold two different values, that is not a gap in the search — it is
+a proof that the chain is dead, delivered in O(1). On COACTVWC the tool reports
+`WS-INPUT-FLAG must be '0' and also '1', and nothing in the program writes it`;
+the field is declared on line 50 and never mentioned again.
+
+Together these took the corpus from 197 unresolved obligations to 41 — of which
+40 *are* infeasibility proofs.
 
 ## Agent-assisted
 
@@ -128,16 +149,24 @@ reference is the incomplete one.
 
 Every reachable paragraph, planned and then verified by execution:
 
-| program | lines | targets | reached | max chain |
-|---|---|---|---|---|
-| COACTUPC | 4,236 | 84 | 83 | 6 frames |
-| COCRDLIC | 1,459 | 38 | 38 | 6 frames |
-| COCRDUPC | 1,560 | 44 | 44 | 3 frames |
-| CBSTM03A | 924 | 24 | 17 | 5 frames |
+Across **31 programs / 553 targets**, every plan verified by running it:
 
-CBSTM03A is the hard one on purpose: its control flow is an `ALTER`-driven
-dispatcher that re-enters one paragraph with a different selector each pass.
-See *Limits*.
+| | |
+|---|---|
+| plans complete | 540 (98%) |
+| verified reached | 530 (96%) |
+| chain depths reached | 1 to **18 frames** |
+
+| program | lines | targets | reached |
+|---|---|---|---|
+| COACTUPC | 4,236 | 84 | 84 |
+| COCRDLIC | 1,459 | 38 | 38 |
+| COCRDUPC | 1,560 | 44 | 44 |
+| CBACT01C | 430 | 15 | 15 |
+| CBSTM03A | 924 | 24 | 17 |
+
+CBSTM03A is the hard one on purpose: an `ALTER`-driven dispatcher that
+re-enters one paragraph with a different selector each pass. See *Limits*.
 
 `plan` reporting open obligations while `verify` reports REACHED is normal —
 `solved` is deliberately conservative, and some obligations gate nothing.
@@ -147,10 +176,14 @@ Trust `verify`.
 
 Stated rather than hidden; each is reported in the output when it bites.
 
-- **A variable that must hold different values at different moments.** One
-  binding per variable cannot express a dispatcher selector walking
-  TRNXFILE → READTRNX → XREFFILE. Bind its initial value and let the program
-  advance it.
+- **A variable that must hold different values at different moments.** Handled
+  when the program writes it (the entry state supplies the first value and the
+  program produces the rest) and proved impossible when it does not. Still only
+  partial for a dispatcher selector walking TRNXFILE → READTRNX → XREFFILE,
+  where a chain re-enters the dispatcher several times.
+- **Ordering constraints are solved pairwise, not as a system.** Several
+  coupled orderings over the same values would need a topological assignment;
+  each is currently witnessed on its own.
 - **`--terminal` is per operation, not per discriminator**, so a program
   routing opens and reads through one subprogram cannot have both a succeeding
   open and an ending read.
@@ -162,6 +195,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 20 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 27 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```
