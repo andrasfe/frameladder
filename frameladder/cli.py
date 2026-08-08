@@ -332,7 +332,7 @@ def cmd_coverage(args):
     from .ladder import analyse, build_family
     from .learned import Learned
     from .provenance import Provenance
-    from .conformance_defaults import io_defaults
+    from .conformance_defaults import io_defaults, WORLDS
     _graph, prov = analyse(program)
     entry = _entry(program, args)
     known = journal.bindings()
@@ -345,16 +345,16 @@ def cmd_coverage(args):
             if learned.best(name) is not None}
     seen_directions: set = set()
 
-    def run_plan(plan):
+    def run_plan(plan, world="bare"):
         """Run it, and remember the values if it covered anything new."""
         interp = Interpreter(program, plan.input_state(),
                              stubs=plan.stub_plan(), terminals=plan.terminals,
-                             defaults=io_defaults(program))
+                             defaults=io_defaults(program, world))
         try:
             trace = interp.run(entry)
         except Exception:                                    # noqa: BLE001
             return None
-        fresh = {(g.paragraph, g.line, g.kind, bool(g.result))
+        fresh = {(g.paragraph, g.ordinal, g.kind, bool(g.result))
                  for g in trace.guards} - seen_directions
         seen_directions.update(fresh)
         if args.learn:
@@ -392,9 +392,11 @@ def cmd_coverage(args):
         pool = {name: sorted(values, key=repr)
                 for name, values in prov.literals.items() if values}
         rng = random.Random(args.seed)
-        for _ in range(args.sample):
+        for _ in range(args.sample):   # noqa: B007  - _ selects the world
             state = {name: rng.choice(values) for name, values in pool.items()}
-            interp = Interpreter(program, state, defaults=io_defaults(program))
+            interp = Interpreter(program, state,
+                                 defaults=io_defaults(program,
+                                                      WORLDS[_ % len(WORLDS)]))
             try:
                 traces.append(interp.run(entry))
             except Exception:                                # noqa: BLE001
@@ -411,9 +413,10 @@ def cmd_coverage(args):
                               agent_bindings=known, preferred=warm)
             plans = [plan] if plan.chain else []
         for plan in plans:
-            trace = run_plan(plan)
-            if trace is not None:
-                traces.append(trace)
+            for world in WORLDS:
+                trace = run_plan(plan, world)
+                if trace is not None:
+                    traces.append(trace)
 
     if args.learn:
         learned.save()

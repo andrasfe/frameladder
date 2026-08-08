@@ -147,7 +147,17 @@ def _condition_atoms(condition: str, negate: bool = False,
     if not text:
         return [[]]
     while text.upper().startswith("NOT "):
-        text, negate = text[4:].strip(), not negate
+        rest = text[4:].strip()
+        # NOT binds tighter than AND and OR, so `NOT A AND B` is
+        # `(NOT A) AND B`. Absorbing the NOT into everything that follows
+        # inverts the sense of the whole expression whenever a top-level
+        # operator comes after it -- and since the splits below recurse,
+        # leaving the NOT in place lets it be applied to its own operand.
+        # `NOT (A OR B)` is unaffected: the operator is inside the parens,
+        # so neither split sees it here.
+        if len(split_top(rest, "OR")) > 1 or len(split_top(rest, "AND")) > 1:
+            break
+        text, negate = rest, not negate
     while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):
         text = text[1:-1].strip()
 

@@ -174,22 +174,15 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**29 programs, median 79.5%, range 7.1-97.6%.** Quote the median and the
-range; the mean hides CBEXPORT.
+**28 programs, median 82.4%, range 50.0-97.6%.** Quote the median and the
+range.
 
-Two outliers are diagnosed and worth taking first, because both are single
-defects rather than search failures:
-
-- **CBEXPORT 7.1%** - `NOT` in `conditions.py` distributes over the whole
-  expression instead of binding to its operand, so `NOT (A OR (B AND C))`
-  is mis-normalised. It sits in this program's main read loop, which is why
-  one bug costs the entire file. CBIMPORT has the same shape.
-- **CBACT01C 50%, CBTRN03C 57.8%** - the survival gap in item 1 below.
+The lowest are now CSUTLDTC (50%, a date validator called only via its
+LINKAGE entry) and CBEXPORT (59.5%). Neither is a single defect any more;
+both need the survival obligation in item 1.
 
 ## Open work, in the order I would take it
 
-0. **`NOT` precedence in `conditions.py`.** One defect, one program at 7%.
-   Cheapest real point on the board.
 1. **Surviving an earlier sibling call is not yet an obligation.** Reaching a
    frame requires that paragraphs performed before it did not abend. A
    prototype lifted exactly the right condition on CBACT01C, but the binding
