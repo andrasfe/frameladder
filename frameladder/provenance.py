@@ -418,6 +418,29 @@ class Provenance:
                 out.append(w)
         return out
 
+    def establishing_writes(self, var: str, op: str, value) -> list:
+        """Conditional writes that would satisfy ``var op value`` if they ran.
+
+        The mirror of :meth:`blocking_writes`. When an obligation cannot be
+        met by the entry state because the program overwrites the field on
+        the way, the field is not therefore hopeless - it is *produced*, and
+        the obligation becomes: reach the write that produces it. That turns
+        a dead end into a set of guards to satisfy, which is the same kind of
+        problem the ladder already solves one level out.
+
+        `SET <88> TO TRUE` counts here as well as MOVE, since after the
+        attribution fix it carries the value it establishes.
+        """
+        from .ir import holds
+        out = []
+        for w in self.writers.get(var.upper(), []):
+            if w.kind not in ("MOVE", "SET"):
+                continue
+            src = parse_term(w.source)
+            if src.kind == "const" and holds(src.value, op, value):
+                out.append(w)
+        return out
+
     def frame_source(self, paragraph: str, span: int = 0) -> list:
         """The raw source of one paragraph - what an agent needs to read when
         the deterministic tiers give up on it."""

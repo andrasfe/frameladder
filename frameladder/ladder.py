@@ -550,9 +550,38 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                         existing.value = value
                         existing.atom = candidate
                     else:
-                        notes.append("%s: %r is reached by the program advancing "
-                                     "it, not by the entry state"
-                                     % (var_term.name, value))
+                        # The entry state cannot carry this value: something
+                        # earlier in the run needs the field to hold
+                        # something else. But the program writes the field,
+                        # so the value is *produced* - and the obligation
+                        # becomes reaching the write that produces it.
+                        #
+                        # Settling here with only a note was the tool's worst
+                        # habit: the obligation was neither met nor reported,
+                        # so the plan called itself solved while binding
+                        # nothing, and every consumer that trusted `solved`
+                        # was misled.
+                        makers = prov.establishing_writes(var_term.name, op,
+                                                          const_term.value)
+                        if makers:
+                            for w in makers:
+                                for guard in w.guards:
+                                    derived.append(
+                                        (guard, "reach %s TO %s at %s:%d"
+                                         % (w.source, var_term.name,
+                                            w.para, w.line)))
+                                    queue.append((guard, round_no + 1))
+                            notes.append("%s: %r is produced at %s:%d, so that "
+                                         "write has to be reached"
+                                         % (var_term.name, const_term.value,
+                                            makers[0].para, makers[0].line))
+                        else:
+                            open_obs.append(
+                                (candidate,
+                                 "%s must be %r here but is %r earlier, and no "
+                                 "write in the program produces %r"
+                                 % (var_term.name, const_term.value,
+                                    existing.value, const_term.value)))
                     settled = True
                     break
                 failures.append("%s already bound to %r" % (producer.slot,
