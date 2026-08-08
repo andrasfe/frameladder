@@ -170,6 +170,48 @@ paragraph reads before writing. The README had described a paragraph's
 worked from call-site guards, which is enough to *reach* a frame and not
 enough to say what a witness is really about.
 
+## Heuristics: shape, then plausibility
+
+Two different jobs need two different kinds of value, and both live in the
+free slots.
+
+**Shape** comes from class conditions. `IF WS-X IS NUMERIC` compares nothing —
+it asks whether the bytes are digits — so the PIC clause decides what
+satisfies it. This was previously parsed as a *relation*: `ACCT-ID IS NOT
+NUMERIC` became `ACCT-ID != NUMERIC`, comparing the field against the word
+`NUMERIC`. Plausible-looking and meaningless, 27 times in the corpus.
+
+**Plausibility** comes from the name, together with the shape — the
+combination matters, not either alone:
+
+| field | PIC | value |
+|---|---|---|
+| `ACCT-OPEN-DATE` | `X(8)` | `20250115` |
+| `ACCT-OPEN-DATE` | `X(10)` | `2025-01-15` |
+| `CUST-ADDR-STATE-CD` | `X(2)` | `NY` |
+| `DALYTRAN-ORIG-TS` | `X(26)` | `2025-01-15-12.30.45.000000` |
+
+Both apply only to free slots, so a heuristic can never contradict something
+the program requires. Where they compete, shape wins: a realistic date that
+fails `IS NUMERIC` is worse than dull digits that pass.
+
+**Reach:** 749 declared fields carry a recognised role, 519 yield a value from
+name and PIC together, and **153 of 1,180 free bindings (13%)** get one.
+
+**Honest limits.** The corpus figure did not move — and cannot. The
+interpreter evaluates only the guards the ladder already lifted, so a
+plausible value and `'AAAA'` behave identically to it; validation cascades
+that call subprograms are no-ops. The compilable programs abend on file-open
+before reaching any validation. So the payoff is real in a real runtime and
+**unmeasured here**.
+
+Chasing why class conditions never fired surfaced something sharper: the
+ladder takes the *shortest* chain, which is systematically the route that
+**skips validation**, because validated paths carry more obligations. Optimal
+for reaching code; backwards for parity testing, where the validated path is
+where the interesting semantics are. `--via` forces the hard route today; a
+"prefer the guarded path" chain selector would do it by default.
+
 ## Agent-assisted
 
 The derivation is deterministic and needs no model. Where it runs out — the
@@ -357,6 +399,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 40 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 45 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

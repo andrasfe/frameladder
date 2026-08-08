@@ -708,3 +708,72 @@ class TestWitnessStore(unittest.TestCase):
         self.assertEqual(state["WS-F"], "YY", "equality must survive a preference")
         self.assertEqual(state["WS-G"], "GG", "a free slot may take one")
         self.assertTrue(verify(p, plan, "Z-MAIN")["reached"])
+
+
+class TestHeuristics(unittest.TestCase):
+    def test_class_condition_is_not_a_relation(self):
+        # `IS NOT` matches the relational operators, so without recognising
+        # class conditions first this parses as `ACCT-ID != NUMERIC` - which
+        # looks plausible and compares against the word NUMERIC.
+        from frameladder.conditions import CLASS_OP, CLASS_OP_NOT
+        atoms = conditions.condition_atoms("ACCT-ID IS NOT NUMERIC")[0]
+        self.assertEqual(atoms[0].op, CLASS_OP_NOT)
+        self.assertEqual(atoms[0].rhs.value, "NUMERIC")
+        self.assertEqual(atoms[0].lhs.name, "ACCT-ID")
+        plain = conditions.condition_atoms("WS-X IS NUMERIC")[0]
+        self.assertEqual(plain[0].op, CLASS_OP)
+        self.assertEqual(plain[0].lhs.name, "WS-X")
+
+    def test_role_depends_on_name_and_shape_together(self):
+        from frameladder.heuristics import semantic_value
+        # The same field name at two widths wants two different values, and a
+        # validator will reject the other one.
+        self.assertEqual(semantic_value("ACCT-OPEN-DATE", "X(8)"), "20250115")
+        self.assertEqual(semantic_value("ACCT-OPEN-DATE", "X(10)"), "2025-01-15")
+        self.assertEqual(semantic_value("CUST-ADDR-STATE-CD", "X(2)"), "NY")
+        self.assertIsNone(semantic_value("WS-FOO", "X(4)"),
+                          "an unrecognised name must not be guessed at")
+
+    def test_class_condition_drives_a_conforming_value(self):
+        p = program(HEADER + """       01  WS-IN PIC X(4).
+       PROCEDURE DIVISION.
+       AA-MAIN.
+           IF WS-IN IS NUMERIC
+              PERFORM AA-DEEP
+           END-IF
+           GOBACK
+           .
+       AA-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "AA-DEEP", entry="AA-MAIN")
+        value = plan.flat_state()["WS-IN"]
+        self.assertTrue(str(value).strip().isdigit(),
+                        "a class condition constrains shape, not value")
+        self.assertEqual(len(str(value)), 4, "shape follows the PIC")
+
+    def test_negated_class_condition_takes_the_other_shape(self):
+        p = program(HEADER + """       01  WS-IN PIC X(4).
+       PROCEDURE DIVISION.
+       AB-MAIN.
+           IF WS-IN IS NOT NUMERIC
+              PERFORM AB-DEEP
+           END-IF
+           GOBACK
+           .
+       AB-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "AB-DEEP", entry="AB-MAIN")
+        self.assertFalse(str(plan.flat_state()["WS-IN"]).strip().isdigit())
+
+    def test_shape_beats_plausibility(self):
+        # A realistic date that fails IS NUMERIC is worse than digits that
+        # pass: the class test is an obligation the program actually stated.
+        from frameladder.heuristics import preferred_value
+        shaped = preferred_value("ACCT-OPEN-DATE", "X(10)", klass="NUMERIC")
+        self.assertTrue(str(shaped).isdigit())
+        plain = preferred_value("ACCT-OPEN-DATE", "X(10)")
+        self.assertEqual(plain, "2025-01-15")

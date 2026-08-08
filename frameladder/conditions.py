@@ -76,6 +76,28 @@ def expand_abbreviated(parts: list[str]) -> list[str]:
     return out
 
 
+# `WS-X IS NUMERIC` constrains the *shape* of a value rather than its value,
+# so it is not a relation and must be recognised before the relational
+# operators are tried - otherwise "IS NOT" matches and NUMERIC is read as a
+# value to compare against, which looks plausible and is nonsense.
+_CLASS = re.compile(r"^(.*?)\s+IS\s+(NOT\s+)?(NUMERIC|ALPHABETIC(?:-[A-Z]+)?|"
+                    r"POSITIVE|NEGATIVE|ZERO)\s*$", re.I)
+CLASS_OP = "IS"
+CLASS_OP_NOT = "IS-NOT"
+
+
+def class_condition(text: str, negate: bool, origin: str):
+    m = _CLASS.match(norm(text))
+    if not m:
+        return None
+    subject = parse_term(m.group(1))
+    if subject.kind != "var":
+        return None
+    inverted = bool(m.group(2)) != negate
+    return [[Atom(subject, CLASS_OP_NOT if inverted else CLASS_OP,
+                  Term("const", value=m.group(3).upper()), origin)]]
+
+
 def condition_atoms(condition: str, negate: bool = False,
                     origin: str = "") -> list[list[Atom]]:
     """Expand a condition into alternatives, each a conjunction of atoms.
@@ -104,6 +126,10 @@ def _condition_atoms(condition: str, negate: bool = False,
         text, negate = text[4:].strip(), not negate
     while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):
         text = text[1:-1].strip()
+
+    shaped = class_condition(text, negate, origin)
+    if shaped is not None:
+        return shaped
 
     ors = expand_abbreviated(split_top(text, "OR"))
     if len(ors) > 1:

@@ -5,7 +5,8 @@ from __future__ import annotations
 import re
 from collections import deque
 
-from .conditions import condition_atoms
+from .conditions import CLASS_OP, CLASS_OP_NOT, condition_atoms
+from .heuristics import preferred_value
 from .graph import build_graph, chain_via, execution_order, shortest_chain
 from .ir import (Atom, Binding, Plan, Producer, Term, flip, holds,
                  negate_atom, parse_term)
@@ -449,7 +450,35 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                                 % (producer.value, producer.site))
                 continue
 
+            # A class condition constrains the shape of the value, so the
+            # PIC clause decides what satisfies it; a plain witness would
+            # compare against the word NUMERIC and mean nothing.
+            if op in (CLASS_OP, CLASS_OP_NOT):
+                shaped = preferred_value(var_term.name,
+                                         model.pic.get(var_term.name, ""),
+                                         klass=str(const_term.value),
+                                         negated=(op == CLASS_OP_NOT))
+                if shaped is None:
+                    failures.append("no value satisfies %s" % candidate)
+                    continue
+                producer = prov.producer(var_term.name, at)
+                if bind(producer, shaped,
+                        "shape required by %s  [%s]" % (candidate, candidate.origin),
+                        atom=candidate, free=False):
+                    settled = True
+                    break
+                failures.append("conflicting binding for %s" % producer.slot)
+                continue
+
             is_free = op != "="
+            if is_free:
+                # A free slot is where a plausible value is free of charge:
+                # nothing requires this value, and validation cascades the
+                # ladder cannot see into will reject an implausible one.
+                guess = preferred_value(var_term.name,
+                                        model.pic.get(var_term.name, ""))
+                if guess is not None and holds(guess, op, const_term.value):
+                    value = guess
             if is_free and var_term.name in preferred:
                 carried = preferred[var_term.name]
                 if holds(carried, op, const_term.value):
