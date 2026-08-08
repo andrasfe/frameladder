@@ -82,6 +82,15 @@ its name looks status-ish.
 
 This has been the productive discipline, and it is worth keeping:
 
+**A settled obligation must be bound or reported, never neither.** The
+worst defect found so far was silent: when the entry state could not carry a
+value, `build_plan` wrote a note and marked the obligation settled, so plans
+reported `solved` while binding nothing. Coverage looked fine because other
+paths found those directions anyway - only an audit of `solved` plans that
+bound no state exposed it. If a branch settles an obligation, it either
+produced a binding or it appended to `open_obligations`. There is no third
+option, and a plan that claims to be solved is a claim someone will rely on.
+
 **Measure before building.** Several plausible features measured at zero and
 were not built: name-based sibling transfer (0% once guarded), prefix
 inheritance of witnesses (0%, because the chooser was already deterministic).
@@ -162,8 +171,25 @@ enters 93 of COACTUPC's 99 paragraphs, because most are reached by
 fall-through rather than by a guard. **96/99 is not a result.** Direction
 coverage is the number that measures anything, and it is the one to quote.
 
+## Where coverage stands
+
+Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
+**29 programs, median 79.5%, range 7.1-97.6%.** Quote the median and the
+range; the mean hides CBEXPORT.
+
+Two outliers are diagnosed and worth taking first, because both are single
+defects rather than search failures:
+
+- **CBEXPORT 7.1%** - `NOT` in `conditions.py` distributes over the whole
+  expression instead of binding to its operand, so `NOT (A OR (B AND C))`
+  is mis-normalised. It sits in this program's main read loop, which is why
+  one bug costs the entire file. CBIMPORT has the same shape.
+- **CBACT01C 50%, CBTRN03C 57.8%** - the survival gap in item 1 below.
+
 ## Open work, in the order I would take it
 
+0. **`NOT` precedence in `conditions.py`.** One defect, one program at 7%.
+   Cheapest real point on the board.
 1. **Surviving an earlier sibling call is not yet an obligation.** Reaching a
    frame requires that paragraphs performed before it did not abend. A
    prototype lifted exactly the right condition on CBACT01C, but the binding
