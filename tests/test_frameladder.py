@@ -498,3 +498,111 @@ class TestSynergies(unittest.TestCase):
 """)
         plan = build_plan(p, "S-DEEP", entry="S-MAIN")
         self.assertEqual(plan.flat_state().get("WS-VAL"), "ABCD")
+
+
+class TestDivergence(unittest.TestCase):
+    """Free values spent on exposing divergence rather than on constants."""
+
+    def test_collation_pairs_cross_class_boundaries(self):
+        from frameladder import divergence
+        # Verified against GnuCOBOL under both collating sequences: ordering
+        # disagrees between EBCDIC and ASCII for exactly these class pairs.
+        for low, high in divergence.collation_pairs(1):
+            a, b = divergence.char_class(low.value), divergence.char_class(high.value)
+            self.assertNotEqual(a, b, "a same-class pair proves nothing")
+            self.assertIn(tuple(sorted((a, b))),
+                          {tuple(sorted(p)) for p in divergence.UNSTABLE_CLASS_PAIRS})
+
+    def test_boundary_candidates_follow_the_pic(self):
+        from frameladder.divergence import boundary_candidates
+        text = {c.category for c in boundary_candidates("X(4)")}
+        self.assertTrue({"spaces", "low-values", "over-width"} <= text)
+        num = {c.category for c in boundary_candidates("S9(3)")}
+        self.assertTrue({"zero", "all-nines", "overflow", "negative-max"} <= num)
+        # The over-width value must actually exceed the field, or it is not a
+        # truncation probe at all.
+        over = [c for c in boundary_candidates("X(4)") if c.category == "over-width"]
+        self.assertEqual(len(over[0].value), 5)
+
+    def test_candidates_never_break_their_own_constraint(self):
+        from frameladder.divergence import candidates_for
+        from frameladder.cobol import DataModel
+        model = DataModel()
+        model.pic["WS-A"] = "X(2)"
+        for cand in candidates_for("WS-A", "!=", "AB", model, {"AB", "CD"}, {}):
+            self.assertNotEqual(cand.value, "AB",
+                                "a candidate that breaks the constraint would "
+                                "change which path runs")
+
+    def test_free_and_forced_bindings_are_distinguished(self):
+        p = program(HEADER + """       01  WS-F PIC X(2).
+       01  WS-G PIC X(2).
+       PROCEDURE DIVISION.
+       T-MAIN.
+           IF WS-F = 'YY'
+              IF WS-G NOT EQUAL 'ZZ'
+                 PERFORM T-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       T-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "T-DEEP", entry="T-MAIN")
+        by_var = {b.producer.var: b.free for b in plan.bindings}
+        self.assertFalse(by_var["WS-F"], "equality pins the value")
+        self.assertTrue(by_var["WS-G"], "disequality leaves it free")
+
+    def test_family_members_all_still_reach_the_target(self):
+        from frameladder.ladder import build_family
+        p = program(HEADER + """       01  WS-F PIC X(2).
+       PROCEDURE DIVISION.
+       U-MAIN.
+           IF WS-F NOT EQUAL 'ZZ'
+              PERFORM U-DEEP
+           END-IF
+           GOBACK
+           .
+       U-DEEP.
+           EXIT
+           .
+""")
+        family = build_family(p, "U-DEEP", entry="U-MAIN", limit=8,
+                              verify_each=lambda pl: verify(p, pl, "U-MAIN")["reached"])
+        self.assertGreater(len(family), 1, "expected more than the baseline")
+        for member in family:
+            self.assertTrue(verify(p, member["plan"], "U-MAIN")["reached"])
+        values = {repr(m["plan"].flat_state()) for m in family}
+        self.assertEqual(len(values), len(family), "members must differ")
+
+    def test_rendezvous_partners_move_together(self):
+        # Changing one side of an agreement without the other would break the
+        # constraint that made the slot free.
+        from frameladder.ladder import build_family
+        p = program(HEADER + """       01  AREA-A PIC X(4).
+       01  REC-A PIC X(4).
+       01  REC-B PIC X(4).
+       PROCEDURE DIVISION.
+       V-MAIN.
+           CALL 'SUB' USING AREA-A
+           MOVE AREA-A TO REC-A
+           CALL 'SUB' USING AREA-A
+           MOVE AREA-A TO REC-B
+           IF REC-A = REC-B
+              PERFORM V-DEEP
+           END-IF
+           GOBACK
+           .
+       V-DEEP.
+           EXIT
+           .
+""")
+        base = build_plan(p, "V-DEEP", entry="V-MAIN")
+        self.assertTrue(base.rendezvous)
+        for member in build_family(p, "V-DEEP", entry="V-MAIN", limit=6):
+            state = member["plan"].flat_state()
+            paired = [state[v] for v in ("REC-A", "REC-B", "AREA-A") if v in state]
+            self.assertLessEqual(len(set(map(repr, paired))), 1,
+                                 "both ends of a rendezvous must hold one value")

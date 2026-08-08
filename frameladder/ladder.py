@@ -195,11 +195,12 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     sequences: dict = {}
 
     def bind(producer: Producer, value, reason: str, source: str = "ladder",
-             atom=None) -> bool:
+             atom=None, free: bool = False) -> bool:
         prior = assigned.get(producer.slot)
         if prior is not None:
             return prior.value == value
-        b = Binding(producer.slot, producer, value, reason, source, atom)
+        b = Binding(producer.slot, producer, value, reason, source, atom,
+                    free=free)
         assigned[producer.slot] = b
         sequences[producer.slot] = [b]
         bindings.append(b)
@@ -319,8 +320,10 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                                  % atom.op))
                 continue
             label = {"=": "rendezvous", "!=": "separation"}.get(atom.op, "ordering")
-            if bind(pa, left, "%s with %s" % (label, pb.slot), atom=atom) and \
-               bind(pb, right, "%s with %s" % (label, pa.slot), atom=atom):
+            if bind(pa, left, "%s with %s" % (label, pb.slot), atom=atom,
+                    free=True) and \
+               bind(pb, right, "%s with %s" % (label, pa.slot), atom=atom,
+                    free=True):
                 rendezvous.append((pa.slot, pb.slot,
                                    left if atom.op == "=" else [left, right]))
             else:
@@ -433,7 +436,7 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 continue
 
             if bind(producer, value, "from %s  [%s]" % (candidate, candidate.origin),
-                    atom=candidate):
+                    atom=candidate, free=(op != "=")):
                 settled = True
                 break
             failures.append("conflicting binding for %s" % producer.slot)
@@ -453,3 +456,92 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
 
     return Plan(target, chain, [s.kind for s in path], atoms, bindings,
                 rendezvous, open_obs, derived, notes, terminals)
+
+
+# --------------------------------------------------------------------------
+# Families: one derivation, many tests
+# --------------------------------------------------------------------------
+
+def _const_side(atom):
+    """The constant a binding was solved against, if there was one."""
+    if atom is None:
+        return None, "="
+    if atom.rhs.kind == "const":
+        return atom.rhs.value, atom.op
+    if atom.lhs.kind == "const":
+        return atom.lhs.value, flip(atom.op)
+    return None, atom.op
+
+
+def build_family(program, target: str, *, entry: str | None = None, via=(),
+                 limit: int = 12, verify_each=None) -> list:
+    """Plans that all reach the same target, differing only where it is free.
+
+    Deriving the chain is the expensive part and it is identical for every
+    member, so the marginal cost of another test is close to nothing. What
+    varies is exactly the set of values the constraints did not pin - which
+    means every member provably reaches the same target, and any difference
+    in behaviour between two implementations is attributable to one value.
+    """
+    from .divergence import candidates_for
+
+    base = build_plan(program, target, entry=entry, via=via)
+    if not base.chain:
+        return []
+    _graph, prov = analyse(program)
+    model = program.model
+
+    slot_var = {b.slot: b.producer.var for b in base.bindings}
+    partner = {}
+    for left, right, _value in base.rendezvous:
+        partner[left] = right
+        partner[right] = left
+
+    out = [{"plan": base, "varied": None, "category": "baseline",
+            "why": "the plan as derived"}]
+    seen = {repr(base.flat_state())}
+
+    # Round-robin across slots rather than exhausting one: a family that
+    # varies six variables once each probes six independent failure modes,
+    # where one that varies a single variable six times probes one.
+    queues = []
+    for binding in base.bindings:
+        if not binding.free:
+            continue
+        other, op = _const_side(binding.atom)
+        var = binding.producer.var
+        cands = candidates_for(var, op, other, model,
+                               prov.literals.get(var, set()),
+                               model.condition_names)
+        if cands:
+            queues.append((binding, var, list(cands)))
+
+    while queues and len(out) < limit:
+        still: list = []
+        for binding, var, cands in queues:
+            if not cands or len(out) >= limit:
+                if cands:
+                    still.append((binding, var, cands))
+                continue
+            cand = cands.pop(0)
+            overrides = {var: cand.value}
+            # A rendezvous is an agreement between two producers; moving one
+            # side without the other would break the very constraint that
+            # made the slot free, and the plan would stop reaching its target.
+            mate = partner.get(binding.slot)
+            if mate and slot_var.get(mate):
+                overrides[slot_var[mate]] = cand.value
+            plan = build_plan(program, target, entry=entry, via=via,
+                              agent_bindings=overrides)
+            key = repr(plan.flat_state())
+            if key not in seen and (verify_each is None or verify_each(plan)):
+                seen.add(key)
+                out.append({"plan": plan, "varied": var,
+                            "category": cand.category, "why": cand.why,
+                            "value": cand.value})
+            if cands:
+                still.append((binding, var, cands))
+        if not still:
+            break
+        queues = still
+    return out

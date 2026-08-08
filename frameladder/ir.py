@@ -183,6 +183,7 @@ class Binding:
     source: str = "ladder"         # 'ladder' | 'agent'
     atom: Any = None               # the obligation that caused it
     seq: int = 0                   # position in this operation's outcome sequence
+    free: bool = False             # the constraint fixed a relationship, not a value
 
 
 @dataclass
@@ -248,6 +249,7 @@ class Plan:
             "obligations": [{"atom": str(a), "origin": a.origin} for a in self.atoms],
             "derived": [{"atom": str(a), "why": w} for a, w in self.derived],
             "bindings": [{"slot": b.slot, "value": b.value, "reason": b.reason,
+                          "free": b.free,
                           "source": b.source, "kind": b.producer.kind,
                           "var": b.producer.var, "op_key": b.producer.op_key,
                           "when": b.producer.discriminators,

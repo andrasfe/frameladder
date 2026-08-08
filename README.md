@@ -72,6 +72,67 @@ the field is declared on line 50 and never mentioned again.
 Together these took the corpus from 197 unresolved obligations to 41 — of which
 40 *are* infeasibility proofs.
 
+## Free values are not free
+
+`frameladder` knows something unusual: for every binding it makes, whether the
+constraint pinned the **value** or only a **relationship**. Across the corpus,
+**56% of bindings are free** — the plan reaches its target under *any*
+assignment to them.
+
+Those slots used to be filled with `'AAAA'`, `'BBBB'` and `4111111111111111`.
+For migration parity that is the one choice guaranteed to reveal nothing.
+
+So spend them. Each free slot becomes a set of candidate values, each chosen
+because some real migration gets it wrong, and each still satisfying the
+constraint that made the slot free:
+
+- **PIC boundaries** — width-exact, one byte over (COBOL truncates the tail
+  silently), all-nines, one past the field, negative zero, a digit finer than
+  the scale
+- **Figurative constants** — `SPACES`, `LOW-VALUES`, `HIGH-VALUES` are three
+  distinct states that ports habitually collapse into one
+- **Program literals** — the values this variable is actually compared against
+- **Level-88 values** — an equivalence partition the programmer wrote down
+- **Collation crossovers** — see below
+
+```bash
+frameladder COACTUPC.cbl family EDIT-US-PHONE-LINENUM
+```
+```
+14 tests, all reaching EDIT-US-PHONE-LINENUM
+varied                 category           why
+(baseline)             baseline           the plan as derived
+ACUP-CHANGE-ACTION     spaces             all spaces
+WS-DATACHANGED-FLAG    low-values         LOW-VALUES; ports often collapse this into empty/null
+LIT-THISPGM            over-width         one byte too long; COBOL truncates the tail silently
+```
+
+One derivation, many tests: the chain is identical for every member, so the
+marginal cost of another test is near zero. Corpus-wide that turns 563
+derivations into **3,784 validated tests** — every one re-verified as still
+reaching its target, and every one differing in a single value, so a
+divergence is attributable to that value.
+
+### Collation is the sharpest instance
+
+z/OS is EBCDIC; essentially every migration target is ASCII. They disagree on
+ordering for exactly three class pairs, verified against GnuCOBOL under both
+collating sequences rather than taken from lore:
+
+| pair | ASCII | EBCDIC |
+|---|---|---|
+| digit vs upper | `'5' < 'M'` ✓ | ✗ |
+| digit vs lower | `'5' < 'm'` ✓ | ✗ |
+| upper vs lower | `'M' < 'm'` ✓ | ✗ |
+
+Same class, or anything against space, is stable. So an ordering constraint
+witnessed by `'AAAA'` and `'BBBB'` holds identically on both platforms and
+proves nothing, while one witnessed across a class boundary **flips the
+branch**. That is a control-flow divergence, the worst kind — the migrated
+program does not merely compute a different number, it takes a different path.
+The tool applies this only to alphanumeric comparisons, because numeric ones
+compare values rather than bytes and are stable.
+
 ## Agent-assisted
 
 The derivation is deterministic and needs no model. Where it runs out — the
@@ -105,6 +166,7 @@ frameladder PROGRAM [--copybooks DIR] [--entry PARA] [--work-dir DIR] [--json] C
 | `plan TARGET` | bindings, rendezvous couplings, open obligations |
 | `verify TARGET` | run it; on failure, say exactly where and why |
 | `explain FRAME --variables A,B --source` | one frame, with provenance |
+| `family TARGET` | many tests reaching one target, differing only where free |
 | `sweep` | plan and verify every target |
 | `bind` / `note` / `resume` | the journal, so a loop survives a restart |
 
@@ -188,6 +250,21 @@ execution against the interpreter's prediction.
 20/20 runnable programs traced identically
 ```
 
+`conformance/plan_check.py` goes further and tests the claim that actually
+matters — that a *generated plan* reaches its target in GnuCOBOL, not just
+that default runs agree. It injects the plan's entry state as MOVE statements,
+compiles, and looks for the target:
+
+| | |
+|---|---|
+| interpreter says REACHED, GnuCOBOL agrees | **21** |
+| interpreter says REACHED, GnuCOBOL does not | 4 |
+| interpreter says not reached, GnuCOBOL reaches it | 0 |
+
+All four disagreements are plans that also require outcomes from external
+operations, which entry-state injection cannot supply. Among plans whose
+requirements *can* be injected, agreement is 21/21.
+
 13 synthetic cases covering the constructs the ladder depends on (`ELSE`,
 `EVALUATE TRUE`, `PERFORM THRU`, `ALTER`, fall-through, abbreviated relations,
 level-88s, relational words) and 7 real CardDemo batch programs.
@@ -243,6 +320,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 27 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 33 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

@@ -306,6 +306,31 @@ def cmd_explain(args):
     return _emit(payload, args.json, render)
 
 
+def cmd_family(args):
+    """A set of tests that all reach the target, differing only where free."""
+    program = _program(args)
+    entry = _entry(program, args)
+    from .ladder import build_family
+    members = build_family(
+        program, args.target.upper(), entry=args.entry, via=_via(args),
+        limit=args.limit,
+        verify_each=(None if args.no_verify
+                     else lambda pl: verify(program, pl, entry)["reached"]))
+    payload = {"target": args.target.upper(), "entry": entry,
+               "members": [{"varied": m["varied"], "category": m["category"],
+                            "why": m["why"], "value": m.get("value"),
+                            "state": m["plan"].flat_state()} for m in members]}
+
+    def render(p):
+        print("%d tests, all reaching %s" % (len(p["members"]), p["target"]))
+        print("%-22s %-18s %s" % ("varied", "category", "why"))
+        for m in p["members"]:
+            print("%-22s %-18s %s" % (m["varied"] or "(baseline)",
+                                      m["category"], m["why"]))
+            print("   %s" % json.dumps(m["state"], default=str)[:150])
+    return _emit(payload, args.json, render)
+
+
 def cmd_sweep(args):
     """Plan and verify every reachable paragraph. The unsolved ones are the
     work list an agent should pick up."""
@@ -423,6 +448,15 @@ def build_parser():
     e.add_argument("--variables", help="comma-separated variable names")
     e.add_argument("--source", action="store_true", help="include the source text")
     e.set_defaults(func=cmd_explain)
+
+    fm = sub.add_parser("family", help="many tests that reach one target, "
+                                       "differing only in the free values")
+    fm.add_argument("target")
+    fm.add_argument("--via")
+    fm.add_argument("--limit", type=int, default=12)
+    fm.add_argument("--no-verify", action="store_true",
+                    help="skip re-verifying each member (faster, less safe)")
+    fm.set_defaults(func=cmd_family)
 
     sw = sub.add_parser("sweep", help="plan and verify every reachable target")
     sw.set_defaults(func=cmd_sweep)
