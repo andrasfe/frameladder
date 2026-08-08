@@ -875,3 +875,84 @@ class TestExternalWorld(unittest.TestCase):
                  for e in plan.stub_plan().get("CALL:SUB", [])]
         self.assertEqual(len(set(w for w in whens if w)), 2,
                          "one subprogram, two invocations, two outcomes")
+
+
+class TestDependencies(unittest.TestCase):
+    """What routing through a frame obliges a test to control."""
+
+    SRC = HEADER + """       01  WS-F PIC X.
+       01  WS-AREA PIC X(4).
+       PROCEDURE DIVISION.
+       AE-MAIN.
+           IF WS-F = 'A'
+              PERFORM AE-CHEAP
+           ELSE
+              PERFORM AE-DEAR
+           END-IF
+           PERFORM AE-TARGET
+           GOBACK
+           .
+       AE-CHEAP.
+           GO TO AE-TARGET
+           .
+       AE-DEAR.
+           PERFORM AE-CALLS
+           GO TO AE-TARGET
+           .
+       AE-CALLS.
+           CALL 'SUBONE' USING WS-AREA
+           .
+       AE-TARGET.
+           EXIT
+           .
+"""
+
+    def setUp(self):
+        from frameladder.ladder import analyse
+        self.p = program(self.SRC)
+        self.graph, self.prov = analyse(self.p)
+
+    def test_reach_is_transitive_not_just_direct(self):
+        from frameladder.dependencies import direct_operations, external_reach
+        direct = direct_operations(self.p, self.prov)
+        reach = external_reach(self.p, self.graph, self.prov)
+        # The call lives in AE-CALLS, but AE-DEAR is what commits you to it.
+        self.assertIn("AE-CALLS", direct)
+        self.assertNotIn("AE-DEAR", direct)
+        self.assertIn("CALL:SUBONE", reach["AE-DEAR"])
+        self.assertEqual(reach["AE-CHEAP"], set(),
+                         "a frame that reaches nothing external costs nothing")
+
+    def test_cycles_do_not_hang_the_fixpoint(self):
+        p = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       AF-MAIN.
+           PERFORM AF-LOOP
+           .
+       AF-LOOP.
+           CALL 'SUBTWO'
+           PERFORM AF-MAIN
+           .
+""")
+        from frameladder.ladder import analyse
+        from frameladder.dependencies import external_reach
+        graph, prov = analyse(p)
+        reach = external_reach(p, graph, prov)
+        self.assertIn("CALL:SUBTWO", reach["AF-MAIN"])
+
+    def test_commitments_subtract_what_the_plan_already_supplies(self):
+        from frameladder.dependencies import Commitment
+        c = Commitment("F", {"CALL:A", "CALL:B"}, {"CALL:A"})
+        self.assertEqual(c.uncontrolled, {"CALL:B"})
+        self.assertEqual(c.cost, 1)
+
+    def test_routes_are_ranked_by_what_they_commit_you_to(self):
+        from frameladder.dependencies import route_options
+        options = route_options(self.p, self.graph, self.prov,
+                                "AE-MAIN", "AE-TARGET")
+        self.assertGreater(len(options), 1)
+        costs = [len(o["operations"]) for o in options]
+        self.assertEqual(costs, sorted(costs), "cheapest first")
+        by_via = {o["via"]: len(o["operations"]) for o in options}
+        self.assertLess(by_via.get("AE-CHEAP", 99), by_via.get("AE-DEAR", 0),
+                        "the route avoiding the call must rank cheaper")

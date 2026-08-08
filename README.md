@@ -341,14 +341,20 @@ reference is the incomplete one.
 
 ## Results
 
-Every reachable paragraph, planned and then verified by running it.
-Across **31 programs / 553 targets**:
+Every reachable paragraph, planned and then verified by running it. Across
+**44 programs / 34,005 lines / 922 targets**:
 
 | | |
 |---|---|
-| plans complete | 550 (98%) |
-| verified reached | 426 (76%) |
-| chain depths reached | 1 to 6 frames |
+| plans complete | 869 (94%) |
+| verified reached | 718 (78%) |
+| per-program reached | median **100%**, min 12%, max 100%, σ 33 |
+
+**Read the spread, not the mean.** A single aggregate hides that this works
+completely on most programs and barely at all on a few. The same is true of
+every ratio here: "56% of bindings are free" is really *median 70%, range
+0–100%, σ 32*. These are not properties of COBOL; they are properties of this
+corpus.
 
 The reached figure was 96% before the interpreter was checked against a real
 compiler, and 96% was wrong — see below.
@@ -422,6 +428,29 @@ It found four real bugs, none of which the self-consistent tests could have:
 `plan` reporting open obligations while `verify` reports REACHED is normal —
 `solved` is deliberately conservative, and some obligations gate nothing.
 Trust `verify`.
+
+## What this corpus is, and is not
+
+Most of it is **AWS CardDemo — a teaching sample**. It is small, recent,
+written in one house style, and free of the things that make real estates
+hard: forty years of accretion, 20k-line programs, deep copybook hierarchies,
+`GO TO DEPENDING ON`, `SORT`/`MERGE`, nested programs, dynamic `CALL` on a
+variable. The widened corpus adds DB2 programs and one scrambled
+production-derived program (3,215 lines, 117 paragraphs), but 44 programs and
+34k lines is still three or four orders of magnitude smaller than the estates
+this is meant for.
+
+So treat every number here as a measurement of this corpus, not an estimate
+for yours. Two things are worth knowing about the bias:
+
+- **The variance is larger than the differences being claimed.** Free-binding
+  share runs 0–100% (σ 32); per-program reachability runs 12–100% (σ 33). Any
+  headline mean is averaging over programs that behave nothing like each other.
+- **The size bias has a known direction.** The six largest programs average
+  79% free bindings against 55% for the rest, so if real programs are bigger,
+  the free-slot share — the thing the divergence work spends — is more likely
+  understated here than overstated. That is an argument for the approach, not
+  evidence for the number.
 
 ## Limits
 

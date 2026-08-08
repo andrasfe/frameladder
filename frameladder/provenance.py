@@ -142,6 +142,7 @@ class Provenance:
         self.selectors: dict = {}       # op_key -> discriminating fields
         self.literals: dict = {}        # var -> literals it is compared against
         self.payloads: set = set()
+        self.operations: dict = {}      # paragraph -> external ops performed
         self._index()
         self._find_selectors()
         self._harvest_literals()
@@ -187,6 +188,11 @@ class Provenance:
                     site_literals = dict(literals)
                     site_literals.update(exec_selectors(text))
                     self.call_literals.setdefault(key, []).append(site_literals)
+                    # An operation counts as external whether or not it hands
+                    # anything back: CLOSE, SYNCPOINT and a CALL with no USING
+                    # all touch the outside world, and a test still has to
+                    # account for them.
+                    self.operations.setdefault(pname, set()).add(key)
                     outputs = list(stub_outputs(text))
                     for f, status in self.model.file_status.items():
                         if re.search(r"\b%s\b" % re.escape(f), text, re.I):

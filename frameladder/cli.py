@@ -306,6 +306,44 @@ def cmd_explain(args):
     return _emit(payload, args.json, render)
 
 
+def cmd_crossroads(args):
+    """At a decision point: what each route obliges you to control."""
+    program = _program(args)
+    from .ladder import analyse, build_plan
+    from .dependencies import commitments, route_options
+    graph, prov = analyse(program)
+    entry = _entry(program, args)
+    target = args.target.upper()
+
+    plan = build_plan(program, target, entry=args.entry, via=_via(args))
+    along = commitments(program, graph, prov, plan.chain, plan)
+    options = route_options(program, graph, prov, entry, target)
+    if args.limit:
+        options = options[: args.limit]
+    payload = {
+        "target": target, "entry": entry,
+        "chain": [{"frame": c.frame, "operations": sorted(c.operations),
+                   "uncontrolled": sorted(c.uncontrolled)} for c in along],
+        "routes": options,
+    }
+
+    def render(p):
+        print("%s -> %s" % (p["entry"], p["target"]))
+        print("\nalong the chosen chain, what each frame commits you to")
+        print("%-34s %5s  %s" % ("frame", "ops", "not yet controlled"))
+        for c in p["chain"]:
+            print("%-34s %5d  %s" % (c["frame"], len(c["operations"]),
+                                     ", ".join(c["uncontrolled"]) or "-"))
+        print("\nroutes in, cheapest first")
+        print("%-30s %6s %7s %5s  %s" % ("via", "depth", "guards", "ops",
+                                         "operations"))
+        for o in p["routes"]:
+            print("%-30s %6d %7d %5d  %s"
+                  % (o["via"] or "(shortest)", o["depth"], o["guards"],
+                     len(o["operations"]), ", ".join(o["operations"][:3])))
+    return _emit(payload, args.json, render)
+
+
 def cmd_family(args):
     """A set of tests that all reach the target, differing only where free."""
     program = _program(args)
@@ -448,6 +486,13 @@ def build_parser():
     e.add_argument("--variables", help="comma-separated variable names")
     e.add_argument("--source", action="store_true", help="include the source text")
     e.set_defaults(func=cmd_explain)
+
+    cr = sub.add_parser("crossroads", help="what each route obliges you to "
+                                          "control in the outside world")
+    cr.add_argument("target")
+    cr.add_argument("--via")
+    cr.add_argument("--limit", type=int, default=10)
+    cr.set_defaults(func=cmd_crossroads)
 
     fm = sub.add_parser("family", help="many tests that reach one target, "
                                        "differing only in the free values")
