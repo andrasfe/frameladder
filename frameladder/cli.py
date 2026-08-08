@@ -801,9 +801,11 @@ def build_parser():
 
     cv = sub.add_parser("coverage", help="what a plan set exercises, and what "
                                         "it leaves untouched")
-    cv.add_argument("--sample", type=int, default=0,
+    cv.add_argument("--sample", type=int, default=150,
                     help="also run N states sampled from the program's own "
-                         "literals; complementary to the derived plans")
+                         "literals, in each I/O world; complementary to the "
+                         "derived plans and on by default because the union "
+                         "beats either alone. 0 disables it")
     cv.add_argument("--seed", type=int, default=7,
                     help="seed for --sample, so runs are reproducible")
     cv.add_argument("--routes", type=int, default=4,
