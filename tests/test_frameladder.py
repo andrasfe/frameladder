@@ -956,3 +956,79 @@ class TestDependencies(unittest.TestCase):
         by_via = {o["via"]: len(o["operations"]) for o in options}
         self.assertLess(by_via.get("AE-CHEAP", 99), by_via.get("AE-DEAR", 0),
                         "the route avoiding the call must rank cheaper")
+
+
+class TestFaultVocabulary(unittest.TestCase):
+    """What an operation is allowed to say went wrong."""
+
+    def _model(self):
+        from frameladder.cobol import DataModel
+        m = DataModel()
+        m.file_status["IN-FILE"] = "WS-ST"
+        return m
+
+    def test_channel_comes_from_the_select_not_the_name(self):
+        from frameladder.faults import channel_of
+        model = self._model()
+        self.assertEqual(channel_of("WS-ST", model), "file")
+        self.assertEqual(channel_of("SQLCODE", model), "sql")
+        self.assertEqual(channel_of("WS-RESP", model), "cics")
+        # A field that merely looks status-ish is not one; guessing would put
+        # file-status codes into fields that are not file statuses.
+        self.assertIsNone(channel_of("WS-STATUS-MESSAGE", model))
+
+    def test_useful_codes_come_before_obscure_ones(self):
+        from frameladder.faults import codes_for
+        codes = codes_for("WS-ST", self._model())
+        self.assertEqual(codes[0], "00")
+        # End-of-file and not-found unlock real code; a duplicate alternate
+        # index almost never does.
+        self.assertLess(codes.index("10"), codes.index("02"))
+        self.assertLess(codes.index("23"), codes.index("02"))
+
+    def test_program_literals_outrank_platform_codes(self):
+        from frameladder.faults import enrich_domain
+        ordered = enrich_domain("WS-ST", self._model(), {"77"})
+        self.assertEqual(ordered[0], "77",
+                         "a value the program itself tests is the better choice")
+        self.assertIn("10", ordered)
+
+    def test_negation_resolves_to_a_real_status(self):
+        src = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INFILE
+                  ORGANIZATION IS SEQUENTIAL
+                  FILE STATUS IS WS-ST.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-REC PIC X(80).
+       WORKING-STORAGE SECTION.
+       01  WS-ST PIC XX.
+       PROCEDURE DIVISION.
+       AG-MAIN.
+           READ IN-FILE
+           IF WS-ST NOT = '00'
+              PERFORM AG-DEEP
+           END-IF
+           GOBACK
+           .
+       AG-DEEP.
+           EXIT
+           .
+"""
+        p = program(src)
+        plan = build_plan(p, "AG-DEEP", entry="AG-MAIN")
+        chosen = plan.stub_plan()["READ:IN-FILE"][0]["set"]["WS-ST"]
+        # The program names the value to avoid and no alternative, so without
+        # a vocabulary the witness invents a string that is not a file status.
+        self.assertIn(chosen, {"10", "23", "35", "22", "02", "04"})
+        self.assertNotEqual(chosen, "X")
+
+    def test_a_non_status_field_gets_no_codes(self):
+        from frameladder.faults import enrich_domain
+        model = self._model()
+        self.assertEqual(enrich_domain("CUST-FIRST-NAME", model, {"BOB"}), ["BOB"])

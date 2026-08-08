@@ -6,6 +6,7 @@ import re
 from collections import deque
 
 from .conditions import CLASS_OP, CLASS_OP_NOT, condition_atoms
+from .faults import enrich_domain
 from .heuristics import preferred_value
 from .graph import build_graph, chain_via, execution_order, shortest_chain
 from .ir import (Atom, Binding, Plan, Producer, Term, flip, holds,
@@ -43,7 +44,9 @@ def witness(op: str, other: Term, domain: set) -> object:
     if op == "=":
         return val
     if op == "!=":
-        for cand in sorted(domain, key=repr):
+        # `domain` may arrive ordered by usefulness; sorting it again would
+        # throw that away and pick whatever happens to sort first.
+        for cand in (domain if isinstance(domain, list) else sorted(domain, key=repr)):
             if cand != val:
                 return cand
         if _numeric(val):
@@ -53,7 +56,7 @@ def witness(op: str, other: Term, domain: set) -> object:
         return "X" if val != "X" else "Y"
     if _numeric(val):
         return {">": val + 1, ">=": val, "<": val - 1, "<=": val}[op]
-    for cand in sorted(domain, key=repr):
+    for cand in (domain if isinstance(domain, list) else sorted(domain, key=repr)):
         if holds(cand, op, val):
             return cand
     return val if op in (">=", "<=") else None
@@ -360,7 +363,13 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
             var_term, const_term = ((c_lhs, c_rhs) if c_lhs.kind == "var"
                                     else (c_rhs, c_lhs))
             op = candidate.op if c_lhs.kind == "var" else flip(candidate.op)
+            # A negation names the value to avoid and none to use instead.
+            # For a status channel the platform defines the alternatives, so
+            # the choice is a real code rather than an invented string.
             domain = prov.literals.get(var_term.name, set())
+            if op == "!=":
+                producer_key = prov.producer(var_term.name, at).op_key
+                domain = enrich_domain(var_term.name, model, domain, producer_key)
             value = witness(op, const_term, domain)
             if value is None:
                 failures.append("no witness value for %s" % candidate)

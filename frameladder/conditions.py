@@ -18,10 +18,24 @@ _RELATIONS = [
     "IS LESS", "EQUALS", "EQUAL", "EXCEEDS", "GREATER", "LESS",
     "NOT =", "IS NOT", ">=", "<=", "<>", "!=", "=", ">", "<",
 ]
+def _relation_pattern(text: str) -> str:
+    """A word-operator needs word boundaries; a symbol cannot have them.
+
+    `NOT =` is both. Wrapping the whole thing in \b..\b puts a boundary
+    after the `=`, which cannot match before a quote - so `WS-ST NOT = '00'`
+    fell through to the bare `=` and the variable came out as `WS-ST NOT`.
+    """
+    body = re.escape(text).replace(r"\ ", r"\s+")
+    if text[0].isalpha():
+        body = r"\b" + body
+    if text[-1].isalnum():
+        body = body + r"\b"
+    return body
+
+
 _COMPARE = re.compile(
-    r"^(.*?)\s*(" + "|".join(
-        (r"\b%s\b" % r.replace(" ", r"\s+")) if r[0].isalpha() else re.escape(r)
-        for r in _RELATIONS) + r")\s*(.*)$", re.I)
+    r"^(.*?)\s*(" + "|".join(_relation_pattern(r) for r in _RELATIONS)
+    + r")\s*(.*)$", re.I)
 
 _OP_WORDS = {
     "EQUAL": "=", "EQUALS": "=", "EQUAL TO": "=", "IS EQUAL": "=",

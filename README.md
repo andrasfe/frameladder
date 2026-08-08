@@ -212,6 +212,43 @@ for reaching code; backwards for parity testing, where the validated path is
 where the interesting semantics are. `--via` forces the hard route today; a
 "prefer the guarded path" chain selector would do it by default.
 
+## Choosing what an operation returns
+
+Outcomes are picked **by obligation, not by enumeration**. The ladder asks
+what a guard on the chain requires, walks back through the MOVE chains to the
+operation that produces that variable, and makes it return the required value.
+
+That is the right default: it only ever generates outcomes the program
+actually distinguishes. There is no point returning file status 47 to a
+program that never tests it, and a harness that enumerates the whole status
+table spends most of its budget on branches that do not exist.
+
+It breaks in exactly one place — a **negation**. `IF ACCTFILE-STATUS NOT =
+'00'` names the value to avoid and none to use instead, so with nothing else
+in evidence the witness invents a string. Measured across the corpus that was
+happening 123 times, and an invented string is not a file status: the code
+goes on to test it against `'10'` and `'23'` and takes neither branch.
+
+So negations draw on the platform's fixed vocabulary — file status, SQLCODE,
+CICS RESP — ordered by how much behaviour each unlocks, with the program's own
+literals always ranked first. A field is only offered a vocabulary when it
+demonstrably belongs to one: `FILE STATUS IS` names the status field in the
+SELECT, `SQLCODE` is `SQLCODE`, a `RESP` operand names itself. No naming
+guesswork, because putting status codes into a field that is not a status
+field is worse than picking badly.
+
+| | before | after |
+|---|---|---|
+| invented `'X'` placeholders | 123 | **6** |
+| `'10'` end-of-file | 58 | **175** |
+| verified reached | 78% | **81%** |
+
+Writing the test for this found a parser bug worth its own mention: `NOT =`
+is a word operator that ends in a symbol, and wrapping it in word boundaries
+put one after the `=`, which cannot match before a quote. `IF WS-ST NOT =
+'00'` therefore fell through to the bare `=` and produced a variable called
+`WS-ST NOT`. 63 occurrences in the corpus.
+
 ## The external world
 
 A program's interesting behaviour is mostly decided by things it does not
@@ -481,6 +518,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 50 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 59 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```
