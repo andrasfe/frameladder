@@ -422,7 +422,15 @@ def build_graph(program) -> dict:
             attrs = stmt.get("attributes", {})
             kind = stmt.get("type", "")
             line = stmt.get("line_start", 0)
-            if kind in ("PERFORM", "GO_TO", "GOTO") and attrs.get("target"):
+            if kind in ("GO_TO", "GOTO") and attrs.get("targets"):
+                # A computed GO TO reaches every label in its list. One edge
+                # leaves the other n-1 arms looking unreachable, so no chain
+                # is ever built to them.
+                for tgt in attrs["targets"]:
+                    if tgt:
+                        _sites.append(CallSite(pname, tgt.upper(), line,
+                                               list(guards), "goto"))
+            elif kind in ("PERFORM", "GO_TO", "GOTO") and attrs.get("target"):
                 for tgt in re.split(r"\s+THRU\s+|\s+THROUGH\s+", attrs["target"],
                                     flags=re.I):
                     tgt = tgt.strip().upper()

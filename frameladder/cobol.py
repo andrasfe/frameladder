@@ -595,8 +595,14 @@ class _Parser:
         # Inline PERFORM: UNTIL / VARYING / n TIMES.
         attrs = {}
         joined = " ".join(w.word for w in words)
-        if upper and upper[0] == "VARYING":
-            attrs["varying"] = joined
+        # WITH TEST AFTER makes the loop do-while: the body runs once before
+        # the condition is ever evaluated. Dropping it turns a loop that
+        # always executes into one that may never execute, and the branch
+        # after it sees a counter that was never incremented.
+        if re.search(r"\bTEST\s+AFTER\b", joined, re.I):
+            attrs["test_after"] = True
+        if "VARYING" in upper:
+            attrs["varying"] = joined[joined.upper().index("VARYING"):]
         else:
             m = re.search(r"\bUNTIL\b(.*)", joined, re.I)
             if m:
@@ -615,13 +621,25 @@ class _Parser:
         if self.peek() == "TO":
             self.i += 1
         words = self.take_until_boundary()
+        joined = " ".join(w.word for w in words)
         target = words[0].word.upper() if words else ""
-        depending = bool(re.search(r"\bDEPENDING\b",
-                                   " ".join(w.word for w in words), re.I))
+        m = re.search(r"\bDEPENDING\s+ON\s+([A-Z0-9-]+)", joined, re.I)
+        attrs: dict[str, Any] = {"target": target, "depending": bool(m)}
+        if m:
+            # `GO TO L1 L2 L3 DEPENDING ON K` is a computed jump: K selects
+            # the K-th label, one-based, and falls through when K is outside
+            # the list. Keeping only the first label turns an n-way switch
+            # into an unconditional branch, so n-1 arms become unreachable
+            # and the edges to them never appear in the call graph.
+            head_part = joined[:m.start()]
+            attrs["targets"] = [w.upper() for w in
+                                re.findall(r"[A-Z0-9][A-Z0-9-]*", head_part, re.I)
+                                if w.upper() not in ("TO", "GO")]
+            attrs["selector"] = m.group(1).upper()
         return {"type": "GO_TO",
-                "text": "GO TO " + " ".join(w.word for w in words),
+                "text": "GO TO " + joined,
                 "line_start": head.line, "line_end": head.line,
-                "attributes": {"target": target, "depending": depending},
+                "attributes": attrs,
                 "children": []}
 
     def simple_statement(self) -> dict:
@@ -664,6 +682,17 @@ class _Parser:
             if m:
                 attrs["name"], attrs["value"] = m.group(1).upper(), m.group(2).upper()
         kind = {"GOBACK": "GOBACK", "STOP": "STOP", "EXIT": "EXIT"}.get(verb, verb)
+        if kind == "EXIT" and words:
+            # A bare `EXIT` is a no-op landing pad. `EXIT PARAGRAPH` and
+            # `EXIT SECTION` are control flow - they leave the paragraph the
+            # way a GO TO its end would - and `EXIT PROGRAM` ends the run.
+            # Reading all three as the no-op means the statements after an
+            # early exit look reachable when they are not.
+            first = words[0].word.upper()
+            if first in ("PARAGRAPH", "SECTION"):
+                kind = "EXIT_PARAGRAPH"
+            elif first == "PROGRAM":
+                kind = "EXIT_PROGRAM"
         return {"type": kind, "text": text, "line_start": head.line,
                 "line_end": words[-1].line if words else head.line,
                 "attributes": attrs, "children": []}

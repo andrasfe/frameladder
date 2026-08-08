@@ -110,6 +110,13 @@ boring thing won"* is the useful part.
 single mean averages over programs that behave nothing like each other. Quote
 median and range.
 
+**Constructs this corpus does not use are still worth fixing.** `GO TO ...
+DEPENDING ON`, `SEARCH`, `PERFORM VARYING ... AFTER` and `EXIT PARAGRAPH`
+have zero or one site in CardDemo, so they cost nothing here and everything
+on an estate that uses them. `conformance/microdiff` is the place to fix
+them, because it measures the language rather than the corpus - which is
+the only defence against tuning the tool to one teaching sample.
+
 **Validate against the compiler, not against yourself.** The interpreter
 shares its condition parser with the planner, so agreement between them
 proves nothing. `conformance/` exists to break that circle, and it has found

@@ -14,10 +14,20 @@ interpreter small; it means array-indexed plans are verified loosely, and
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .conditions import condition_atoms
 from .ir import holds, norm, parse_term
+
+
+def _decimals(spec: str) -> int:
+    """Digits after the implied decimal point in a PIC clause."""
+    m = re.search(r"V9\((\d+)\)", spec)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"V(9+)", spec)
+    return len(m.group(1)) if m else 0
 
 # Reaching a target takes hundreds of steps, not thousands. A
 # generous ceiling only means a non-terminating plan burns
@@ -112,6 +122,10 @@ class _Goto(Exception):
 
 class _Stop(Exception):
     pass
+
+
+class _ExitParagraph(Exception):
+    """`EXIT PARAGRAPH` / `EXIT SECTION`: leave this paragraph, keep running."""
 
 
 @dataclass
@@ -443,6 +457,42 @@ class Interpreter:
         self._layouts[group] = fields
         return fields
 
+    def _fit(self, name: str, value):
+        """Store a value the way the receiving field actually holds it.
+
+        COBOL truncates on *both* kinds of MOVE and in opposite directions:
+        an alphanumeric field is left-aligned, so the tail is lost, while a
+        numeric one aligns on the decimal point, so the high-order digits go
+        and `MOVE 12345 TO PIC 9(2)` leaves 45. A port that treats a field as
+        a string or an int loses one of those two, silently, and the
+        difference only surfaces as a branch going the other way.
+
+        This is a parity tool, so getting it wrong here is not a rounding
+        error - it is the class of defect the tool exists to find.
+        """
+        spec = (self.model.pic_of(name) or "").upper()
+        if not spec or value is None or isinstance(value, bool):
+            return value
+        m = re.search(r"[XA9]\((\d+)\)", spec)
+        width = int(m.group(1)) if m else len(re.sub(r"[^XA9]", "", spec))
+        if not width:
+            return value
+        if "X" in spec or "A" in spec:
+            text = value if isinstance(value, str) else str(value)
+            return text[:width] if len(text) > width else text
+        if isinstance(value, str) and not value.strip().lstrip("+-").isdigit():
+            return value                     # not a number; leave it alone
+        try:
+            number = int(str(value).strip())
+        except (TypeError, ValueError):
+            return value
+        digits = width - _decimals(spec)
+        if digits <= 0:
+            return number
+        limit = 10 ** digits
+        kept = abs(number) % limit
+        return -kept if number < 0 else kept
+
     def assign(self, name: str, value) -> None:
         name = name.upper()
         # Values the plan pins are the stub returns and program inputs; the
@@ -450,7 +500,7 @@ class Interpreter:
         # tested, so they hold.
         if name in self._pinned:
             return
-        self.state[name] = value
+        self.state[name] = self._fit(name, value)
         fields = self._elementary(name)
         if not fields:
             for child in self.model.descendants(name):
@@ -535,7 +585,10 @@ class Interpreter:
                 return
             self.trace.entered.append(start)
             self._tick(start)
-            self.block(para.get("statements", []), para["name"], depth)
+            try:
+                self.block(para.get("statements", []), para["name"], depth)
+            except _ExitParagraph:
+                pass
             return
 
         first, last = self._names.index(start), self._names.index(end)
@@ -547,7 +600,10 @@ class Interpreter:
             self.trace.entered.append(para["name"])
             self._tick(para["name"])
             try:
-                self.block(para.get("statements", []), para["name"], depth)
+                try:
+                    self.block(para.get("statements", []), para["name"], depth)
+                except _ExitParagraph:
+                    pass
             except _Goto as jump:
                 # A jump inside the range keeps the PERFORM alive; one that
                 # leaves the range propagates out of it.
@@ -629,7 +685,8 @@ class Interpreter:
             target = (attrs.get("target") or "").strip()
             condition = attrs.get("condition")
             if condition and children:
-                self._loop(condition, children, para, depth, line, ordinal)
+                self._loop(condition, children, para, depth, line, ordinal,
+                           bool(attrs.get("test_after")))
                 return
             if condition:
                 count = 0
@@ -651,16 +708,34 @@ class Interpreter:
                 return
             condition = attrs.get("condition")
             if condition:
-                self._loop(condition, children, para, depth, line, ordinal)
+                self._loop(condition, children, para, depth, line, ordinal,
+                           bool(attrs.get("test_after")))
                 return
             self.block(children, para, depth)
             return
 
         if kind in ("GO_TO", "GOTO"):
             target = self.altered.get(para) or attrs.get("target")
+            # `GO TO L1 L2 L3 DEPENDING ON K` selects the K-th label,
+            # one-based, and falls through when K is outside the list.
+            # Always taking the first turns an n-way switch into an
+            # unconditional branch.
+            if attrs.get("depending") and not self.altered.get(para):
+                labels = attrs.get("targets") or []
+                try:
+                    index = int(float(str(self.value_of(
+                        parse_term(attrs.get("selector", "")))).strip()))
+                except (TypeError, ValueError):
+                    index = 0
+                if 1 <= index <= len(labels):
+                    raise _Goto(labels[index - 1].upper())
+                return                       # out of range: fall through
             if target:
                 raise _Goto(target.upper())
             return
+
+        if kind == "EXIT_PARAGRAPH":
+            raise _ExitParagraph()
 
         if kind == "ALTER":
             altered, destination = attrs.get("altered"), attrs.get("destination")
@@ -763,8 +838,15 @@ class Interpreter:
         return out
 
     def _loop(self, condition: str, children, para: str, depth: int, line: int,
-              ordinal: int = -1):
+              ordinal: int = -1, test_after: bool = False):
         count = 0
+        # WITH TEST AFTER is do-while: the body runs once before the
+        # condition is ever looked at. Treated as the default TEST BEFORE, a
+        # loop that always executes becomes one that may never execute, and
+        # whatever it was counting is still zero at the branch below it.
+        if test_after:
+            self.block(children, para, depth)
+            count += 1
         while count < MAX_LOOP and not self.evaluate(condition):
             self.block(children, para, depth)
             count += 1
@@ -774,27 +856,44 @@ class Interpreter:
 
     def _varying(self, clause: str, children, para: str, depth: int, line: int,
                  ordinal: int = -1):
-        import re
-        m = re.search(r"VARYING\s+([A-Z0-9-]+)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.*)",
-                      norm(clause), re.I)
-        if not m:
+        # One phrase per VARYING/AFTER. AFTER nests *inside*: the last phrase
+        # runs its whole range for every value of the one before it, and is
+        # reset to its FROM each time. Executing only the first phrase runs
+        # the body n times where COBOL runs it n*m, so anything counting
+        # inside the loop lands on the wrong number.
+        phrases = re.findall(
+            r"(?:VARYING|AFTER)\s+([A-Z0-9-]+)\s+FROM\s+(\S+)\s+BY\s+(\S+)"
+            r"\s+UNTIL\s+(.*?)(?=\s+AFTER\s+|$)", norm(clause), re.I)
+        if not phrases:
             self.block(children, para, depth)
             return
-        var, start, by, until = (m.group(1).upper(), parse_term(m.group(2)).value,
-                                 parse_term(m.group(3)).value, m.group(4))
-        self.assign(var, start)
-        count = 0
-        entered = False
-        while count < MAX_LOOP and not self.evaluate(until):
-            entered = True
-            self.block(children, para, depth)
-            try:
-                self.assign(var, float(self.value_of(parse_term(var))) + float(by))
-            except (TypeError, ValueError):
-                break
-            count += 1
-        self.trace.guards.append(GuardEvent(para, line, "PERFORM_VARYING", until,
-                                            entered, self._snapshot(until),
+        entered = [False]
+        budget = [MAX_LOOP * MAX_LOOP]
+
+        def level(index: int) -> None:
+            var, start, by, until = phrases[index]
+            var = var.upper()
+            self.assign(var, parse_term(start).value)
+            step = parse_term(by).value
+            count = 0
+            while count < MAX_LOOP and budget[0] > 0 and not self.evaluate(until):
+                budget[0] -= 1
+                if index + 1 < len(phrases):
+                    level(index + 1)
+                else:
+                    entered[0] = True
+                    self.block(children, para, depth)
+                try:
+                    self.assign(var, float(self.value_of(parse_term(var)))
+                                + float(step))
+                except (TypeError, ValueError):
+                    break
+                count += 1
+
+        level(0)
+        self.trace.guards.append(GuardEvent(para, line, "PERFORM_VARYING",
+                                            phrases[0][3], entered[0],
+                                            self._snapshot(phrases[0][3]),
                                             ordinal))
 
     # -- arithmetic --------------------------------------------------------
