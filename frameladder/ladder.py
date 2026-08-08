@@ -114,6 +114,72 @@ def _companion(op: str, fixed, model, other_name: str):
     return None
 
 
+def constraints_on(atoms, model) -> dict:
+    """Every comparison each variable must satisfy, gathered before choosing.
+
+    Picking a value the moment an obligation is seen is what makes a
+    satisfiable system look infeasible: negating two condition-names over one
+    field yields `!= '0'` and `!= ' '`, and a witness chosen for the first in
+    isolation happily returns `' '`. Both constraints are on the same
+    variable and any third value satisfies them, so the variable - not the
+    obligation - is the unit that has to be solved.
+    """
+    out: dict = {}
+    for atom in atoms:
+        for resolved in _resolve_88(atom, model):
+            lhs, rhs = resolved.lhs, resolved.rhs
+            if lhs.kind == "var" and rhs.kind == "const":
+                out.setdefault(lhs.name, []).append((resolved.op, rhs.value))
+            elif rhs.kind == "var" and lhs.kind == "const":
+                out.setdefault(rhs.name, []).append((flip(resolved.op),
+                                                     lhs.value))
+    return out
+
+
+def solve_variable(var: str, wanted: list, domain, model, first_choice=None):
+    """A value satisfying *all* the comparisons on one variable.
+
+    Candidates come from what the program itself mentions, then the
+    platform's vocabulary, then a couple of constructed fall-backs - and each
+    is checked against every constraint rather than only the one that
+    prompted the search.
+    """
+    if not wanted:
+        return first_choice
+    seen, candidates = set(), []
+
+    def offer(value):
+        key = repr(value)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(value)
+
+    if first_choice is not None:
+        offer(first_choice)
+    for _op, value in wanted:
+        offer(value)
+    for value in (domain if isinstance(domain, list) else sorted(domain, key=repr)):
+        offer(value)
+    spec = (model.pic_of(var) if hasattr(model, "pic_of")
+            else model.pic.get(var, "")) or ""
+    textual = "X" in spec.upper() or "A" in spec.upper() or not spec
+    width = 1
+    m = re.search(r"[XA9]\((\d+)\)", spec)
+    if m:
+        width = int(m.group(1))
+    if textual:
+        for filler in ("Z", "9", "A", "0", " ", "\x00"):
+            offer(filler * width)
+    else:
+        for number in (0, 1, -1, 9, 99, 999):
+            offer(number)
+
+    for candidate in candidates:
+        if all(holds(candidate, op, value) for op, value in wanted):
+            return candidate
+    return None
+
+
 def origin_site(origin: str):
     if not origin or ":" not in origin:
         return None
@@ -314,6 +380,9 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         state supplies the first value and the program produces the rest.
         """
         return bool(prov.writers.get(var.upper()))
+
+    # Solve per variable, not per obligation: gather every comparison first.
+    wanted_by_var = constraints_on(atoms + [a for a, _ in derived], model)
 
     queue = deque((a, 0) for a in atoms)
     handled: set = set()
@@ -531,6 +600,19 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 carried = preferred[var_term.name]
                 if holds(carried, op, const_term.value):
                     value = carried
+
+            # Last word. Whatever evidence, a VALUE clause or a preference
+            # proposed, it still has to satisfy *every* constraint on this
+            # variable rather than only the obligation being processed - a
+            # declared default very often satisfies one and breaks another,
+            # and that is what makes a satisfiable system report itself
+            # infeasible.
+            wanted = wanted_by_var.get(var_term.name) or []
+            if len(wanted) > 1 and not all(holds(value, o, v) for o, v in wanted):
+                together = solve_variable(var_term.name, wanted, domain, model)
+                if together is not None:
+                    value = together
+
             if bind(producer, value, "from %s  [%s]" % (candidate, candidate.origin),
                     atom=candidate, free=is_free):
                 settled = True

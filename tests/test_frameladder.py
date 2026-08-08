@@ -1635,3 +1635,69 @@ class TestFigurativeValues(unittest.TestCase):
         self.assertEqual(p.model.initial["WS-B"], " ")
         self.assertEqual(p.model.initial["WS-C"], 0)
         self.assertEqual(p.model.initial["WS-D"], "AB")
+
+
+class TestPerVariableSolving(unittest.TestCase):
+    """A variable is the unit that gets solved, not an obligation."""
+
+    def test_two_negations_on_one_field_are_satisfiable(self):
+        from frameladder.ladder import constraints_on, solve_variable
+        p = program(HEADER + """       01  WS-F PIC X.
+           88  F-ZERO  VALUE '0'.
+           88  F-BLANK VALUE ' '.
+       PROCEDURE DIVISION.
+       AV-MAIN.
+           IF NOT F-ZERO
+              IF NOT F-BLANK
+                 PERFORM AV-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       AV-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "AV-DEEP", entry="AV-MAIN")
+        value = plan.flat_state().get("WS-F")
+        # Choosing a value for `!= '0'` in isolation happily returns ' ',
+        # which then breaks `!= ' '` and the whole system reports itself
+        # infeasible although any third value satisfies both.
+        self.assertNotIn(value, ("0", " "))
+        self.assertTrue(verify(p, plan, "AV-MAIN")["reached"])
+
+    def test_constraints_are_gathered_per_variable(self):
+        from frameladder.ladder import constraints_on
+        atoms = [ir.Atom(ir.Term("var", name="X"), "!=", ir.Term("const", value="0")),
+                 ir.Atom(ir.Term("var", name="X"), "!=", ir.Term("const", value=" ")),
+                 ir.Atom(ir.Term("var", name="Y"), "=", ir.Term("const", value="A"))]
+        p = program(HEADER + """       01  WS-Z PIC X.
+       PROCEDURE DIVISION.
+       AW-MAIN.
+           GOBACK
+           .
+""")
+        found = constraints_on(atoms, p.model)
+        self.assertEqual(sorted(found["X"]), [("!=", " "), ("!=", "0")])
+        self.assertEqual(found["Y"], [("=", "A")])
+
+    def test_a_declared_default_does_not_win_over_the_whole_system(self):
+        # WS-F starts as ' ', which satisfies `!= '0'` on its own and breaks
+        # `!= ' '`. The default is a preference, not an answer.
+        p = program(HEADER + """       01  WS-F PIC X VALUE ' '.
+       PROCEDURE DIVISION.
+       AX-MAIN.
+           IF WS-F NOT = '0'
+              IF WS-F NOT = ' '
+                 PERFORM AX-DEEP
+              END-IF
+           END-IF
+           GOBACK
+           .
+       AX-DEEP.
+           EXIT
+           .
+""")
+        plan = build_plan(p, "AX-DEEP", entry="AX-MAIN")
+        self.assertNotIn(plan.flat_state().get("WS-F"), ("0", " "))
+        self.assertTrue(verify(p, plan, "AX-MAIN")["reached"])
