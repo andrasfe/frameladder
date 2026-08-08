@@ -1032,3 +1032,59 @@ class TestFaultVocabulary(unittest.TestCase):
         from frameladder.faults import enrich_domain
         model = self._model()
         self.assertEqual(enrich_domain("CUST-FIRST-NAME", model, {"BOB"}), ["BOB"])
+
+
+class TestGenericity(unittest.TestCase):
+    """What the tool knows must come from the program, not from assuming the
+    program was written in English by an American bank."""
+
+    def test_the_program_outranks_the_name_table(self):
+        from frameladder.heuristics import semantic_value
+        # ACCT-OPEN-DATE would get 2025-01-15 from the en-US pack, but if the
+        # source compares it against something else, that is a fact rather
+        # than an assumption and wins.
+        self.assertEqual(semantic_value("ACCT-OPEN-DATE", "X(10)"), "2025-01-15")
+        self.assertEqual(
+            semantic_value("ACCT-OPEN-DATE", "X(10)", evidence={"1999-12-31"}),
+            "1999-12-31")
+
+    def test_evidence_must_fit_the_field(self):
+        from frameladder.heuristics import from_evidence
+        # A literal too long for the field would be truncated on storage, so
+        # it is not usable as the value.
+        self.assertIsNone(from_evidence({"TOOLONGVALUE"}, "X(4)"))
+        self.assertEqual(from_evidence({"AB", "ABCD"}, "X(4)"), "ABCD")
+
+    def test_non_english_names_work_through_a_pack(self):
+        import json
+        import tempfile
+        from frameladder import heuristics
+        # A German estate: GEB-DAT is a date, and nothing in the built-in
+        # en-US table says so.
+        self.assertIsNone(heuristics.semantic_value("KUNDE-GEB-DAT", "X(8)"))
+        pack = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump({"roles": {"date": ["GEB-DAT", "DATUM"]},
+                   "samples": {"date": {"8": "31121999"}}}, pack)
+        pack.close()
+        saved_roles = list(heuristics._ROLES)
+        saved_samples = dict(heuristics._SAMPLES)
+        try:
+            heuristics.load_pack(pack.name)
+            self.assertEqual(heuristics.role_of("KUNDE-GEB-DAT"), "date")
+            self.assertEqual(heuristics.semantic_value("KUNDE-GEB-DAT", "X(8)"),
+                             "31121999")
+        finally:
+            heuristics._ROLES[:] = saved_roles
+            heuristics._SAMPLES.clear()
+            heuristics._SAMPLES.update(saved_samples)
+
+    def test_status_codes_are_platform_not_program(self):
+        from frameladder.cobol import DataModel
+        from frameladder.faults import codes_for
+        # These are the platform's fixed vocabulary, like HTTP status codes -
+        # the one kind of built-in knowledge that is not a guess about naming.
+        model = DataModel()
+        model.file_status["F"] = "WS-ST"
+        self.assertIn("10", codes_for("WS-ST", model))
+        self.assertEqual(codes_for("SOME-OTHER-FIELD", model), [],
+                         "a field outside a known channel gets no vocabulary")

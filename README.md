@@ -181,8 +181,20 @@ satisfies it. This was previously parsed as a *relation*: `ACCT-ID IS NOT
 NUMERIC` became `ACCT-ID != NUMERIC`, comparing the field against the word
 `NUMERIC`. Plausible-looking and meaningless, 27 times in the corpus.
 
-**Plausibility** comes from the name, together with the shape — the
-combination matters, not either alone:
+**Plausibility** is sought in a strict order, and the order matters more than
+the sources.
+
+*Evidence from the program first.* If a field is compared against literals
+anywhere in the source, those are what its own logic distinguishes — facts
+about this program rather than assumptions about programs in general, and
+they work whatever language the names are in. **56% of free bindings get a
+value this way.**
+
+*Convention only as a fallback,* consulted when the source says nothing. The
+built-in name table is English and US-shaped, and it earns **1%** — so an
+estate whose fields are called `GEB-DAT` or `VERS-NR` loses almost nothing,
+and `--conventions FILE` supplies its own pack rather than being served
+nothing. The name and the shape are read together:
 
 | field | PIC | value |
 |---|---|---|
@@ -195,8 +207,22 @@ Both apply only to free slots, so a heuristic can never contradict something
 the program requires. Where they compete, shape wins: a realistic date that
 fails `IS NUMERIC` is worse than dull digits that pass.
 
-**Reach:** 749 declared fields carry a recognised role, 519 yield a value from
-name and PIC together, and **153 of 1,180 free bindings (13%)** get one.
+**Where free-slot values come from**
+
+| source | share |
+|---|---|
+| the program itself — literals it compares the field against | **873 (56%)** |
+| the en-US convention pack | 18 (1%) |
+| nothing plausible available | 661 (43%) |
+
+The convention pack was the part most at risk of being an assumption about
+COBOL rather than a fact about a program, and measuring it settled the
+question: it does 1% of the work, and it is replaceable.
+
+The one piece of built-in knowledge that is *not* a naming guess is the
+platform's status vocabulary — file status, SQLCODE, CICS RESP. Those are
+fixed the way HTTP status codes are fixed, and a field is only offered them
+when the source demonstrably puts it in that channel.
 
 **Honest limits.** The corpus figure did not move — and cannot. The
 interpreter evaluates only the guards the ladder already lifted, so a
@@ -518,6 +544,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 59 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 63 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

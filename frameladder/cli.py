@@ -16,6 +16,10 @@ from .provenance import Provenance
 
 
 def _program(args):
+    pack = getattr(args, "conventions", None)
+    if pack:
+        from .heuristics import load_pack
+        load_pack(pack)
     return load_program(args.program, args.copybooks)
 
 
@@ -449,6 +453,9 @@ def build_parser():
                     "obligations outwards along the call chain.")
     p.add_argument("program", help="COBOL source (.cbl) or pre-parsed AST (.ast)")
     p.add_argument("--copybooks", help="directory of copybooks")
+    p.add_argument("--conventions", metavar="FILE",
+                   help="naming-convention pack; the built-in one is en-US "
+                        "and only used where the program itself says nothing")
     p.add_argument("--entry", help="paragraph to start from (default: the first)")
     p.add_argument("--work-dir", help="directory for the journal")
     p.add_argument("--json", action="store_true", help="machine-readable output")

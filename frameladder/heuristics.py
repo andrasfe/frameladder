@@ -8,13 +8,22 @@ anything interesting.
 anything - it asks whether the bytes are digits - so the obligation is on the
 form of the value, and the PIC clause says what form satisfies it.
 
-*Plausibility* comes from the name. Real COBOL guards its deep code with
-validation cascades, and much of what they check is not visible in any
-condition the ladder can lift: a date is handed to a subprogram, an amount is
-run through ``NUMVAL``, an id is looked up. A field called ``ACCT-OPEN-DATE``
-holding ``'AAAAAAAA'`` fails at the first edit paragraph and the trace never
-gets near the target. Naming conventions are the only signal available about
-what a field is for, and in COBOL shops they are unusually reliable.
+*Plausibility* is harder, and the order it is sought in matters more than the
+sources themselves.
+
+**Evidence from the program comes first.** If a field is compared against
+literals anywhere in the source, those literals are what its own logic
+distinguishes - and they are facts about this program rather than guesses
+about programs in general. This works whatever language the field names are
+in.
+
+**Convention is the fallback.** Only when the program says nothing does the
+name get consulted: a field called ``ACCT-OPEN-DATE`` holding ``'AAAAAAAA'``
+fails at the first edit paragraph and never reaches the target. But a name
+table is a *convention pack*, not a law - the built-in one is English and
+US-shaped, and an estate whose fields are called ``GEB-DAT`` or ``VERS-NR``
+should supply its own rather than be silently served nothing. Hence
+:func:`load_pack`.
 
 Both are only ever applied to *free* slots - where a constraint fixed a
 relationship and left the value open - so a heuristic can never contradict
@@ -49,6 +58,9 @@ _ROLES = [
     ("code", ("CODE", "CD", "TYPE", "CAT", "GROUP")),
 ]
 
+# The built-in pack is en-US by convention and deliberately quarantined here,
+# so that swapping it out is a supported operation rather than a fork.
+DEFAULT_PACK_NAME = "en-US"
 _SAMPLES = {
     "date": {8: "20250115", 10: "2025-01-15", 6: "250115", 7: "2025015"},
     "timestamp": {26: "2025-01-15-12.30.45.000000", 16: "2025-01-15-12.3",
@@ -64,6 +76,52 @@ _SAMPLES = {
 
 _WORDS = {"name": "JOHN SMITH", "address": "1 MAIN STREET",
           "status": "00", "flag": "Y", "code": "A"}
+
+
+def load_pack(path: str) -> dict:
+    """Replace the built-in naming conventions with a site's own.
+
+    A JSON document of ``{"roles": {role: [tokens]}, "samples": {role:
+    {width: value}}, "words": {role: value}}``. Supplying one is how an
+    estate whose field names are not English gets the same benefit as one
+    whose names are.
+    """
+    import json
+    with open(path, "r", errors="replace") as fh:
+        pack = json.load(fh)
+    if pack.get("roles"):
+        _ROLES.clear()
+        _ROLES.extend((role, tuple(t.upper() for t in tokens))
+                      for role, tokens in pack["roles"].items())
+    for role, table in (pack.get("samples") or {}).items():
+        _SAMPLES[role] = {int(w): v for w, v in table.items()}
+    _WORDS.update(pack.get("words") or {})
+    return pack
+
+
+def _fits(value, pic: str) -> bool:
+    """Would this value survive being stored in the field?"""
+    text, width, _signed, _dec = _pic(pic)
+    if not width:
+        return True
+    if text:
+        return isinstance(value, str) and len(value) <= width
+    return not isinstance(value, str)
+
+
+def from_evidence(evidence, pic: str):
+    """A value the program itself compares this field against.
+
+    Preferred over any naming convention: these are facts about this source
+    rather than assumptions about how fields are usually named, so they carry
+    over to an estate written in any language.
+    """
+    usable = [v for v in evidence or () if _fits(v, pic)]
+    if not usable:
+        return None
+    # Longest first: a value that fills the field exercises more of it than a
+    # one-character flag that happens to sort first.
+    return sorted(usable, key=lambda v: (-len(str(v)), repr(v)))[0]
 
 
 def role_of(name: str) -> str | None:
@@ -117,13 +175,16 @@ def conforming_value(pic: str, klass: str, negated: bool = False):
     return None
 
 
-def semantic_value(name: str, pic: str):
+def semantic_value(name: str, pic: str, evidence=()):
     """A plausible value for a field, from its name and its declared shape.
 
     The shape matters as much as the name: a date in ``X(8)`` is ``20250115``
     and the same date in ``X(10)`` is ``2025-01-15``, and a validator will
     reject the other one.
     """
+    found = from_evidence(evidence, pic)
+    if found is not None:
+        return found
     role = role_of(name)
     if role is None:
         return None
@@ -160,7 +221,7 @@ def semantic_value(name: str, pic: str):
 
 
 def preferred_value(name: str, pic: str, klass: str | None = None,
-                    negated: bool = False):
+                    negated: bool = False, evidence=()):
     """The value to reach for in a free slot.
 
     Shape beats plausibility: a realistic date that fails ``IS NUMERIC`` is
@@ -169,4 +230,4 @@ def preferred_value(name: str, pic: str, klass: str | None = None,
     """
     if klass:
         return conforming_value(pic, klass, negated)
-    return semantic_value(name, pic)
+    return semantic_value(name, pic, evidence)

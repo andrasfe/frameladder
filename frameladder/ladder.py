@@ -484,8 +484,9 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 # A free slot is where a plausible value is free of charge:
                 # nothing requires this value, and validation cascades the
                 # ladder cannot see into will reject an implausible one.
-                guess = preferred_value(var_term.name,
-                                        model.pic.get(var_term.name, ""))
+                guess = preferred_value(
+                    var_term.name, model.pic.get(var_term.name, ""),
+                    evidence=prov.literals.get(var_term.name, ()))
                 if guess is not None and holds(guess, op, const_term.value):
                     value = guess
             if is_free and var_term.name in preferred:
