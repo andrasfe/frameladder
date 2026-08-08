@@ -51,6 +51,9 @@ class GuardEvent:
     condition: str
     result: bool
     values: dict = field(default_factory=dict)
+    # Position of the decision within its paragraph. This, not `line`, is
+    # what identifies it - COPY expansion gives many decisions one line.
+    ordinal: int = -1
 
 
 @dataclass
@@ -253,13 +256,14 @@ class Interpreter:
         kind = stmt.get("type", "")
         attrs = stmt.get("attributes", {})
         line = stmt.get("line_start", 0)
+        ordinal = stmt.get("ordinal", -1)
         children = stmt.get("children") or []
 
         if kind == "IF":
             condition = attrs.get("condition", "")
             result = self.evaluate(condition)
             self.trace.guards.append(GuardEvent(para, line, "IF", condition, result,
-                                                self._snapshot(condition)))
+                                                self._snapshot(condition), ordinal))
             branch = [c for c in children if c.get("type") != "ELSE"]
             other = [c for c in children if c.get("type") == "ELSE"]
             if result:
@@ -282,7 +286,8 @@ class Interpreter:
                     result = not result
                 self.trace.guards.append(
                     GuardEvent(para, arm.get("line_start", line), "WHEN",
-                               condition, result, self._snapshot(condition)))
+                               condition, result, self._snapshot(condition),
+                               arm.get("ordinal", -1)))
                 if result:
                     self.block(arm.get("children") or [], para, depth)
                     return
@@ -290,7 +295,7 @@ class Interpreter:
                 if norm(arm.get("attributes", {}).get("value", "")).upper() in ("OTHER", "ANY"):
                     self.trace.guards.append(
                         GuardEvent(para, arm.get("line_start", line), "WHEN",
-                                   "OTHER", True, {}))
+                                   "OTHER", True, {}, arm.get("ordinal", -1)))
                     self.block(arm.get("children") or [], para, depth)
                     return
             return
@@ -299,7 +304,7 @@ class Interpreter:
             target = (attrs.get("target") or "").strip()
             condition = attrs.get("condition")
             if condition and children:
-                self._loop(condition, children, para, depth, line)
+                self._loop(condition, children, para, depth, line, ordinal)
                 return
             if condition:
                 count = 0
@@ -307,7 +312,8 @@ class Interpreter:
                     self.perform(target, depth + 1)
                     count += 1
                 self.trace.guards.append(GuardEvent(para, line, "PERFORM_UNTIL",
-                                                    condition, count > 0, {}))
+                                                    condition, count > 0, {},
+                                                    ordinal))
                 return
             if target:
                 self.perform(target, depth + 1)
@@ -316,11 +322,11 @@ class Interpreter:
         if kind == "PERFORM_INLINE":
             varying = attrs.get("varying")
             if varying:
-                self._varying(varying, children, para, depth, line)
+                self._varying(varying, children, para, depth, line, ordinal)
                 return
             condition = attrs.get("condition")
             if condition:
-                self._loop(condition, children, para, depth, line)
+                self._loop(condition, children, para, depth, line, ordinal)
                 return
             self.block(children, para, depth)
             return
@@ -423,15 +429,18 @@ class Interpreter:
                         out[term.name] = self.value_of(term)
         return out
 
-    def _loop(self, condition: str, children, para: str, depth: int, line: int):
+    def _loop(self, condition: str, children, para: str, depth: int, line: int,
+              ordinal: int = -1):
         count = 0
         while count < MAX_LOOP and not self.evaluate(condition):
             self.block(children, para, depth)
             count += 1
         self.trace.guards.append(GuardEvent(para, line, "PERFORM_UNTIL", condition,
-                                            count > 0, self._snapshot(condition)))
+                                            count > 0, self._snapshot(condition),
+                                            ordinal))
 
-    def _varying(self, clause: str, children, para: str, depth: int, line: int):
+    def _varying(self, clause: str, children, para: str, depth: int, line: int,
+                 ordinal: int = -1):
         import re
         m = re.search(r"VARYING\s+([A-Z0-9-]+)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.*)",
                       norm(clause), re.I)
@@ -452,7 +461,8 @@ class Interpreter:
                 break
             count += 1
         self.trace.guards.append(GuardEvent(para, line, "PERFORM_VARYING", until,
-                                            entered, self._snapshot(until)))
+                                            entered, self._snapshot(until),
+                                            ordinal))
 
     def _arithmetic(self, kind: str, stmt) -> None:
         import re
@@ -529,7 +539,8 @@ def verify(program, plan, entry: str, *, terminals: dict | None = None,
         "runaway": trace.runaway,
         "external_calls": interp.calls,
         "blocking_guards": [
-            {"paragraph": e.paragraph, "line": e.line, "kind": e.kind,
+            {"paragraph": e.paragraph, "line": e.line, "ordinal": e.ordinal,
+             "kind": e.kind,
              "condition": e.condition, "values": e.values}
             for e in blocking[:12]
         ],

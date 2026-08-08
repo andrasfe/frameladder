@@ -16,16 +16,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+# The interpreter names a loop by the verb it saw; `branches_of` names it by
+# what it is. Without this the two never join, and every loop in the program
+# sits in the denominator permanently uncoverable - 30 of them across the
+# corpus.
+_KIND = {"PERFORM_UNTIL": "LOOP", "PERFORM_VARYING": "LOOP"}
+
+
 @dataclass(frozen=True)
 class Branch:
     paragraph: str
     line: int
     kind: str
     condition: str
+    ordinal: int = -1
 
     @property
     def key(self) -> tuple:
-        return (self.paragraph, self.line, self.kind)
+        # Ordinal, not line: see cobol._stamp_ordinals. Two decisions
+        # expanded from one COPY share a line and must not share an identity.
+        return (self.paragraph, self.ordinal, self.kind)
 
 
 def branches_of(program) -> list:
@@ -37,23 +47,37 @@ def branches_of(program) -> list:
         attrs = stmt.get("attributes", {})
         line = stmt.get("line_start", 0)
         if kind == "IF":
-            out.append(Branch(para, line, "IF", attrs.get("condition", "")))
+            out.append(Branch(para, line, "IF", attrs.get("condition", ""),
+                              stmt.get("ordinal", -1)))
         elif kind == "EVALUATE":
             for arm in stmt.get("children") or []:
                 if arm.get("type") == "WHEN":
                     out.append(Branch(para, arm.get("line_start", line), "WHEN",
-                                      arm.get("attributes", {}).get("value", "")))
+                                      arm.get("attributes", {}).get("value", ""),
+                                      arm.get("ordinal", -1)))
         elif kind.startswith("PERFORM") and (attrs.get("condition")
                                              or attrs.get("varying")):
             out.append(Branch(para, line, "LOOP",
-                              attrs.get("condition") or attrs.get("varying", "")))
+                              attrs.get("condition") or attrs.get("varying", ""),
+                              stmt.get("ordinal", -1)))
         for child in stmt.get("children") or []:
             walk(child, para)
 
     for para in program.paragraphs:
         for stmt in para.get("statements", []):
             walk(stmt, para["name"])
-    return out
+
+    # Consecutive WHEN arms share one body, so the same statements are
+    # reachable under two arms and the walk meets them twice. They are one
+    # decision in the source and must count once, or the denominator grows
+    # every time a programmer writes `WHEN A / WHEN B`.
+    seen, unique = set(), []
+    for branch in out:
+        if branch.key in seen:
+            continue
+        seen.add(branch.key)
+        unique.append(branch)
+    return unique
 
 
 @dataclass
@@ -90,7 +114,8 @@ def accumulate(program, traces) -> Coverage:
         cov.runs += 1
         cov.paragraphs_hit |= set(trace.entered)
         for event in trace.guards:
-            cov.directions_hit.add((event.paragraph, event.line, event.kind,
+            cov.directions_hit.add((event.paragraph, event.ordinal,
+                                    _KIND.get(event.kind, event.kind),
                                     bool(event.result)))
     return cov
 

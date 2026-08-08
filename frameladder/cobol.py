@@ -511,6 +511,21 @@ class _Parser:
                          "children": body})
         if self.peek() == "END-EVALUATE":
             self.i += 1
+        # Consecutive WHENs share the body that follows them:
+        #     WHEN A
+        #     WHEN B
+        #        do-it
+        # is `A OR B` guarding one body, not an arm A that does nothing.
+        # Left uncorrected, arm A is a hole - taking it exits the EVALUATE,
+        # and every branch inside the body becomes unreachable by that route.
+        # `shared` is deliberately the same list object, so the statements
+        # keep one identity; callers that count branches must key by
+        # position rather than by object.
+        for index in range(len(arms) - 2, -1, -1):
+            if not arms[index]["children"]:
+                arms[index]["children"] = arms[index + 1]["children"]
+                arms[index]["attributes"]["shares_body_with"] = \
+                    arms[index + 1]["attributes"].get("value", "")
         return {"type": "EVALUATE",
                 "text": "EVALUATE " + " ".join(t.word for t in subject),
                 "line_start": head.line, "line_end": head.line,
@@ -628,6 +643,7 @@ def parse_procedure(lines: list[Line]) -> list[dict]:
     for name, body in split_paragraphs(_procedure_lines(lines)):
         parser = _Parser(tokenize(body))
         statements = parser.statements(set())
+        _stamp_ordinals(statements)
         paragraphs.append({
             "name": name,
             "line_start": body[0].number if body else 0,
@@ -689,6 +705,37 @@ def _replacements(clause: str) -> list:
     body = re.sub(r"^\s*REPLACING\s+", "", clause, flags=re.I)
     return [(m.group(1).strip(), m.group(2).strip())
             for m in _PLAIN_REPL.finditer(body)]
+
+
+def _stamp_ordinals(statements: list) -> None:
+    """Give every statement in a paragraph a distinct position.
+
+    Line numbers do not identify a statement. `COPY ... REPLACING` expands a
+    member at the site of the directive, and every line it produces carries
+    the directive's own number - so two different IFs from one copybook are
+    indistinguishable by (paragraph, line, kind). On COACTUPC that collapsed
+    45 of 401 decisions onto another, in the coverage denominator and in the
+    hit set alike: covering one scored both.
+
+    The ordinal is assigned in source order, so it is stable across runs, and
+    `line_start` is left alone because the COPY site is the right thing to
+    show a human.
+
+    Statements shared by consecutive WHEN arms are one object and so take one
+    ordinal, which is what makes the shared body count once.
+    """
+    counter = [0]
+
+    def walk(stmt: dict) -> None:
+        if "ordinal" in stmt:            # shared body, already numbered
+            return
+        stmt["ordinal"] = counter[0]
+        counter[0] += 1
+        for child in stmt.get("children") or []:
+            walk(child)
+
+    for stmt in statements:
+        walk(stmt)
 
 
 def expand_copies(lines: list, directories, depth: int = 0) -> list:
