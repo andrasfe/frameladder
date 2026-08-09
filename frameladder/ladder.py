@@ -192,6 +192,59 @@ def origin_site(origin: str):
         return None
 
 
+def _fold_lengths(atom: Atom, model) -> Atom:
+    """`LENGTH OF X` is a constant when X has a fixed length, so make it one.
+
+    COBOL computes it at compile time from the record layout, and every
+    CICS program opens with the same linkage guard:
+
+        IF EIBCALEN = LENGTH OF DFHCOMMAREA ... ELSE EXEC CICS RETURN
+
+    Left as an intrinsic over a variable, both sides of that comparison are
+    variables, so the planner treats it as a *rendezvous* - it makes them
+    equal to each other at some arbitrary value instead of making EIBCALEN
+    the one number that satisfies it. The guard is then never passed, the
+    program returns on its first statement, and nothing downstream is
+    reachable by any means. Folding it turns an unsolvable coupling into a
+    binding the ladder already knows how to make.
+    """
+    sides = []
+    changed = False
+    for term in (atom.lhs, atom.rhs):
+        if term.kind == "var" and term.func == "LENGTH" and not term.refmod:
+            width = _fixed_width(term.name or (term.args[0].name if term.args
+                                               else ""), model)
+            if width:
+                sides.append(Term("const", value=width))
+                changed = True
+                continue
+        sides.append(term)
+    if not changed:
+        return atom
+    return Atom(sides[0], atom.op, sides[1], atom.origin, atom.alternatives)
+
+
+def _fixed_width(name: str, model) -> int:
+    """Bytes the item occupies, group or elementary, or 0 when unknown."""
+    if not name:
+        return 0
+    try:
+        from .layout import byte_length, record_layout
+    except ImportError:                                  # pragma: no cover
+        return 0
+    spec = model.pic_of(name) or ""
+    if spec:
+        try:
+            return byte_length(spec, model.usage.get(name.upper(), ""))
+        except Exception:                                # noqa: BLE001
+            return 0
+    try:
+        fields = record_layout(model, name)
+    except Exception:                                    # noqa: BLE001
+        return 0
+    return max((f.offset + f.length for f in fields), default=0)
+
+
 def _resolve_88(atom: Atom, model) -> list:
     """``IF ACCT-ACTIVE`` is an obligation on the field the 88 sits under.
 
@@ -202,6 +255,7 @@ def _resolve_88(atom: Atom, model) -> list:
     only the first lets the solver pick another value that leaves the
     condition true after all.
     """
+    atom = _fold_lengths(atom, model)
     if not (atom.rhs.kind == "const" and atom.rhs.value is True
             and atom.lhs.kind == "var"):
         return [atom]

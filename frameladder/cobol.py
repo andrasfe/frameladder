@@ -344,6 +344,31 @@ def parse_data_division(path: str) -> DataModel:
             model.origin[name] = os.path.basename(path)
             stack.append((level, name))
         buffer = ""
+
+    # Fields the platform declares and the application never does: the EXEC
+    # Interface Block, the SQLCA, the MQ constants. Only what the source has
+    # earned by issuing the corresponding verb, and only where it did not
+    # declare the name itself - a program that ships its own copy wins.
+    from .platform_decls import declarations_for, constants_for
+    try:
+        with open(path, "r", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        text = ""
+    supplied, usage = declarations_for(text)
+    for name, spec in supplied.items():
+        if name not in model.pic:
+            model.pic[name] = spec
+            model.declared.add(name)
+            model.origin[name] = "<platform>"
+    for name, how in usage.items():
+        model.usage.setdefault(name, how)
+    for name, value in constants_for(text).items():
+        if name not in model.pic:
+            model.pic[name] = "S9(9)"
+            model.initial[name] = value
+            model.declared.add(name)
+            model.origin[name] = "<platform>"
     return model
 
 
@@ -878,10 +903,22 @@ def find_copybooks(source: str) -> list:
     here = os.path.dirname(os.path.abspath(source))
     found = []
     for base in (here, os.path.dirname(here)):
-        for name in _COPYBOOK_DIRS:
-            candidate = os.path.join(base, name)
-            if os.path.isdir(candidate):
-                found.append(candidate)
+        # Match the directory name case-insensitively by listing the parent
+        # rather than probing a guessed spelling. `COPYBOOK` and `Copybook`
+        # are both common, and on a case-sensitive filesystem - which is
+        # every Linux box this will ever run on - probing the lower-case
+        # spelling silently finds nothing. The result is not an error: the
+        # copybooks are simply never read, every field they declare loses
+        # its PIC, and coverage is quietly worse.
+        try:
+            entries = os.listdir(base)
+        except OSError:
+            continue
+        for entry in sorted(entries):
+            if entry.lower() in _COPYBOOK_DIRS:
+                candidate = os.path.join(base, entry)
+                if os.path.isdir(candidate):
+                    found.append(candidate)
     return found
 
 

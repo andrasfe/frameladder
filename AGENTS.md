@@ -165,6 +165,27 @@ leaves the corpus figure flat, say so and say why it cannot show up there.
   2,640 fields instead of 129, inflating the `declared` set that live-in
   filtering and record association depend on.
 
+## Generalisation is checked, not assumed
+
+Every mechanism here was developed against CardDemo, so each one is
+re-measured on unrelated source before it is believed: IBM's Global Auto
+Mart sample (a different vendor, CICS+BMS+DB2+IMS), CardDemo's own
+`app-*` sample applications, and a synthetic AML screener.
+
+That check has earned its keep. The frontier search that took CardDemo from
+51% to 71% pooled moved the Global Auto Mart programs by **exactly zero** -
+four of the five sat at 2-9% - because every one of them opens with
+
+    IF EIBCALEN = LENGTH OF DFHCOMMAREA ... ELSE EXEC CICS RETURN
+
+and returned on its first statement, so there was no frontier to extend.
+CardDemo writes `IF EIBCALEN = 0` instead and never exposed the gate.
+Folding `LENGTH OF` to a constant took those four to 41-100%.
+
+The lesson generalises past that one bug: a mechanism measured on one
+codebase is measured on one codebase. Run the others before claiming
+anything.
+
 ## The corpus, and what it is worth
 
 44 programs, 34,005 lines, mostly **AWS CardDemo — a teaching sample**. It is
