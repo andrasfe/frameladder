@@ -45,6 +45,36 @@ CICS_CONSTANTS = {
     "DFHVALUE": {"NORMAL": 0, "CURSOR": 1},
 }
 
+# The attention identifier: which key the user pressed. CICS puts it in
+# EIBAID at task start, and a screen program's whole control flow is one
+# `EVALUATE EIBAID`. The names live in the standard `DFHAID` copybook, which
+# ships with CICS and is therefore almost never in an application repository -
+# so every one of them parses as a field nobody declares, holding the empty
+# default, and no arm can match but WHEN OTHER.
+#
+# This is platform vocabulary in the same sense as DFHRESP or an HTTP status
+# code: the values are fixed by CICS, not chosen by whoever wrote the program,
+# and knowing them is not a guess about naming. The bytes below are the
+# display characters the copybook assigns.
+#
+# The limitation, stated plainly: this resolves during parsing, which has no
+# model to consult, so a site that ships a *modified* DFHAID gets the standard
+# values rather than its own. The names are IBM's and redefining them is close
+# to unheard of, but it is a real assumption and not a checked one - unlike
+# the rest of the platform vocabulary here, which only applies where the
+# source itself puts a field in that channel.
+AID_VALUES = {
+    "DFHNULL": "\x00", "DFHENTER": "'", "DFHCLEAR": "_", "DFHCLRP": "\x6a",
+    "DFHPEN": "=", "DFHOPID": "W", "DFHMSRE": "X", "DFHSTRF": "h",
+    "DFHTRIG": '"', "DFHPA1": "%", "DFHPA2": ">", "DFHPA3": ",",
+    "DFHPF1": "1", "DFHPF2": "2", "DFHPF3": "3", "DFHPF4": "4",
+    "DFHPF5": "5", "DFHPF6": "6", "DFHPF7": "7", "DFHPF8": "8",
+    "DFHPF9": "9", "DFHPF10": ":", "DFHPF11": "#", "DFHPF12": "@",
+    "DFHPF13": "A", "DFHPF14": "B", "DFHPF15": "C", "DFHPF16": "D",
+    "DFHPF17": "E", "DFHPF18": "F", "DFHPF19": "G", "DFHPF20": "H",
+    "DFHPF21": "I", "DFHPF22": "\xa2", "DFHPF23": ".", "DFHPF24": "<",
+}
+
 
 def norm(text: str) -> str:
     """Conditions arrive folded across source lines; flatten them first."""
@@ -245,6 +275,8 @@ def parse_term(text: str) -> Term:
     upper = text.upper()
     if upper in FIGURATIVE:
         return Term("const", value=FIGURATIVE[upper])
+    if upper in AID_VALUES:
+        return Term("const", value=AID_VALUES[upper])
     m = _SUBSCRIPTED.match(text)
     if m:
         head = m.group(1).upper()

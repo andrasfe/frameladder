@@ -70,7 +70,8 @@ people name things; it is opt-in (`--conventions`), ships as
 `packs/en-US.json`, and measured at 1% of values and zero targets.
 
 **Platform vocabulary is not a naming guess.** File status codes, SQLCODE,
-CICS `DFHRESP` are fixed the way HTTP status codes are fixed. They are
+CICS `DFHRESP` and the `DFHAID` attention keys are fixed the way HTTP status
+codes are fixed. They are
 allowed. A field is only offered one when the *source* puts it in that
 channel — `FILE STATUS IS` in the SELECT, a `RESP` operand — never because
 its name looks status-ish.
@@ -233,7 +234,10 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 82.4%, range 6.4-100%, pooled 1639/3200 = 51.2%.**
+**28 programs, median 88.8%, range 53.3-100%, pooled 2313/3256 = 71.0%**
+with `coverage --branches --lift 600`. Without `--lift`, median 82.4% and
+pooled 51.2% - the frontier search is most of the difference and all of it
+on the deep programs.
 
 That is a third lower than this file claimed a day earlier, and the drop is
 the point. The old figure was measuring an artefact: every variable in the
