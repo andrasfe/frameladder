@@ -161,6 +161,10 @@ class GuardEvent:
     # Position of the decision within its paragraph. This, not `line`, is
     # what identifies it - COPY expansion gives many decisions one line.
     ordinal: int = -1
+    # term key -> `origins.Origin`, when the run was asked to track them.
+    # This is what says *which entry-state bytes* would have to change to
+    # send this decision the other way, after the program's own writes.
+    origins: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -191,7 +195,7 @@ class Interpreter:
     def __init__(self, program, state: dict | None = None, *,
                  stubs: dict | None = None, terminals: dict | None = None,
                  defaults: dict | None = None, repeat: int = 1,
-                 sequential: bool = True):
+                 sequential: bool = True, track_origins: bool = False):
         self.program = program
         self.model = program.model
         self.state = {k.upper(): v for k, v in (state or {}).items()}
@@ -237,6 +241,13 @@ class Interpreter:
         # ALTER rewrites another paragraph's GO TO at run time. A dispatcher
         # built on it - and CardDemo's is - cycles forever without this.
         self.altered: dict = {}
+        # Off by default and free when off: every other caller pays nothing,
+        # and the search that wants it is the only one that carries the cost.
+        # A name absent from this table has not been written on this run, so
+        # it still holds what the entry state gave it - which is why the
+        # table records `None` for an opaque write rather than deleting.
+        self.track_origins = track_origins
+        self._origin: dict = {}
 
     # -- values ------------------------------------------------------------
     def value_of(self, term) -> object:
@@ -341,8 +352,16 @@ class Interpreter:
         if not expression:
             return default
         try:
+            # `X(LENGTH OF A + 1:n)` is an expression, not an operand, and
+            # every commarea split in a CICS program is written that way.
+            # Parsing it as one term reads a field nobody declared and starts
+            # the slice at byte 1, so the second half of the record is
+            # overlaid on the first.
+            from .ir import is_arithmetic
+            if is_arithmetic(expression):
+                return int(self.number_of(expression))
             return int(float(str(self.value_of(parse_term(expression))).strip()))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, ZeroDivisionError):
             return default
 
     def _slice(self, term, value) -> str:
@@ -400,6 +419,13 @@ class Interpreter:
                 width = self._width(args[0].name)
                 if width:
                     return width
+                # A group has no PIC of its own; its length is where its last
+                # field ends. Falling back to the length of the *value* makes
+                # `LENGTH OF <commarea>` mean "however much happens to be in
+                # it", which is a different number on every run.
+                fields = self._elementary(args[0].name)
+                if fields:
+                    return max(offset + size for _n, offset, size in fields)
             return len(text(0))
         if name in ("NUMVAL", "NUMVAL-C"):
             return _numval(text(0))
@@ -535,7 +561,71 @@ class Interpreter:
         kept = abs(number) % limit
         return -kept if number < 0 else kept
 
-    def assign(self, name: str, value) -> None:
+    # -- where a value came from -------------------------------------------
+    def _origin_of_name(self, name: str):
+        """The entry bytes this field still holds, or None for opaque."""
+        name = (name or "").upper()
+        if not name:
+            return None
+        if name in self._origin:
+            return self._origin[name]
+        kids = self.model.descendants(name)
+        if kids and any(child in self._origin for child in kids):
+            # The group was never written but a child was, so reading it
+            # assembles bytes the entry state no longer decides. Claiming the
+            # whole group is still an input would send the search after a
+            # value that cannot arrive.
+            return None
+        from .origins import Origin
+        return Origin(name, 0, None)
+
+    def origin_of(self, term):
+        """The entry bytes a *term* evaluates to, reference modification and
+        all. A function of its arguments is opaque: nothing about the entry
+        state survives `FUNCTION TRIM`, and pretending otherwise proposes a
+        value that the intrinsic will not reproduce."""
+        if not self.track_origins:
+            return None
+        if term.kind == "const" or term.func or term.index:
+            return None
+        origin = self._origin_of_name(term.name)
+        if origin is None or not term.refmod:
+            return origin
+        start = self._as_int(term.refmod[0], 1) - 1
+        if start < 0:
+            return None
+        if term.refmod[1]:
+            length = self._as_int(term.refmod[1], -1)
+            # An unevaluable length reads to the end of the text, which is
+            # what `_slice` does; the origin has to agree with it or the
+            # bytes the search writes are not the bytes the run reads.
+            if length >= 0:
+                return origin.slice(start, start + length)
+        return origin.slice(start, None)
+
+    def _origins(self, condition: str) -> dict:
+        if not self.track_origins:
+            return {}
+        out: dict = {}
+        for alternative in condition_atoms(condition):
+            for atom in alternative:
+                for term in (atom.lhs, atom.rhs):
+                    if term.kind != "var":
+                        continue
+                    out[term.key] = self.origin_of(term)
+                    # A bare 88-level names its parent's value, so the byte
+                    # range that matters belongs to the parent and the atom
+                    # carries only the condition-name.
+                    entry = self.model.condition_names.get(term.name)
+                    if entry:
+                        out[entry[0]] = self._origin_of_name(entry[0])
+        return out
+
+    def _note(self, name: str, origin) -> None:
+        if self.track_origins:
+            self._origin[name.upper()] = origin
+
+    def assign(self, name: str, value, origin=None) -> None:
         name = name.upper()
         # Values the plan pins are the stub returns and program inputs; the
         # program overwriting them mid-run would undo the very thing being
@@ -543,11 +633,13 @@ class Interpreter:
         if name in self._pinned:
             return
         self.state[name] = self._fit(name, value)
+        self._note(name, origin)
         fields = self._elementary(name)
         if not fields:
             for child in self.model.descendants(name):
                 if child not in self._pinned:
                     self.state[child] = value
+                    self._note(child, origin)
             return
         # A group move copies *bytes*, so each child gets the piece of the
         # source that lands on it. Handing every child the whole value makes
@@ -561,6 +653,12 @@ class Interpreter:
             if child in self._pinned:
                 continue
             piece = text[offset:offset + length]
+            # A group move hands each child a different piece of the source,
+            # so each child inherits a different piece of the source's
+            # origin. This is the step that carries an obligation on a field
+            # inside a commarea back to a byte range of the commarea itself.
+            self._note(child, origin.slice(offset, offset + length)
+                       if origin is not None else None)
             spec = (self.model.pic_of(child) or "").upper()
             if spec and "9" in spec and "X" not in spec:
                 try:
@@ -590,10 +688,13 @@ class Interpreter:
                 value = self._stored(saved)
                 if value is not None:
                     self.state["DFHCOMMAREA"] = value
+                    self._note("DFHCOMMAREA", None)
                 if "EIBCALEN" not in self._pinned:
                     self.state["EIBCALEN"] = self._width(saved) or 100
+                    self._note("EIBCALEN", None)
             elif "EIBCALEN" not in self._pinned:
                 self.state["EIBCALEN"] = 100
+                self._note("EIBCALEN", None)
         index = start
         while 0 <= index < len(self._names):
             para = self.program.paragraphs[index]
@@ -699,7 +800,8 @@ class Interpreter:
             condition = attrs.get("condition", "")
             result = self.evaluate(condition)
             self.trace.guards.append(GuardEvent(para, line, "IF", condition, result,
-                                                self._snapshot(condition), ordinal))
+                                                self._snapshot(condition), ordinal,
+                                                self._origins(condition)))
             branch = [c for c in children if c.get("type") != "ELSE"]
             other = [c for c in children if c.get("type") == "ELSE"]
             if result:
@@ -723,7 +825,7 @@ class Interpreter:
                 self.trace.guards.append(
                     GuardEvent(para, arm.get("line_start", line), "WHEN",
                                condition, result, self._snapshot(condition),
-                               arm.get("ordinal", -1)))
+                               arm.get("ordinal", -1), self._origins(condition)))
                 if result:
                     # An earlier arm matching is exactly how WHEN OTHER goes
                     # the other way. Without recording it, OTHER only ever
@@ -761,7 +863,8 @@ class Interpreter:
                     count += 1
                 self.trace.guards.append(GuardEvent(para, line, "PERFORM_UNTIL",
                                                     condition, count > 0, {},
-                                                    ordinal))
+                                                    ordinal,
+                                                    self._origins(condition)))
                 return
             if target:
                 self.perform(target, depth + 1)
@@ -828,11 +931,13 @@ class Interpreter:
                     for child, value in self._carried.items():
                         if child not in self._pinned:
                             self.state[child] = value
+                            self._note(child, None)
                     del name
                 return
             value = self.value_of(source)
+            origin = self.origin_of(source)
             for name in move_targets(attrs.get("targets", "")):
-                self.assign(name, value)
+                self.assign(name, value, origin)
             return
 
         if kind == "SET":
@@ -928,8 +1033,10 @@ class Interpreter:
     def _force(self, name: str, value) -> None:
         name = name.upper()
         self.state[name] = value
+        self._note(name, None)
         for child in self.model.descendants(name):
             self.state[child] = value
+            self._note(child, None)
 
     def _snapshot(self, condition: str) -> dict:
         out = {}
@@ -955,7 +1062,7 @@ class Interpreter:
             count += 1
         self.trace.guards.append(GuardEvent(para, line, "PERFORM_UNTIL", condition,
                                             count > 0, self._snapshot(condition),
-                                            ordinal))
+                                            ordinal, self._origins(condition)))
 
     def _varying(self, clause: str, children, para: str, depth: int, line: int,
                  ordinal: int = -1):
@@ -997,7 +1104,8 @@ class Interpreter:
         self.trace.guards.append(GuardEvent(para, line, "PERFORM_VARYING",
                                             phrases[0][3], entered[0],
                                             self._snapshot(phrases[0][3]),
-                                            ordinal))
+                                            ordinal,
+                                            self._origins(phrases[0][3])))
 
     # -- arithmetic --------------------------------------------------------
     def number_of(self, text: str) -> float:
@@ -1238,10 +1346,12 @@ class Interpreter:
                 blank = 0 if spec and "9" in spec and "X" not in spec else " "
                 if field not in self._pinned:
                     self.state[field.upper()] = blank
+                    self._note(field, None)
             if not children and name not in self._pinned:
                 spec = (self.model.pic_of(name) or "").upper()
                 self.state[name] = (0 if spec and "9" in spec and "X" not in spec
                                     else " ")
+                self._note(name, None)
 
 
 def verify(program, plan, entry: str, *, terminals: dict | None = None,

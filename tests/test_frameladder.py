@@ -1701,3 +1701,190 @@ class TestPerVariableSolving(unittest.TestCase):
         plan = build_plan(p, "AX-DEEP", entry="AX-MAIN")
         self.assertNotIn(plan.flat_state().get("WS-F"), ("0", " "))
         self.assertTrue(verify(p, plan, "AX-MAIN")["reached"])
+
+
+class TestDisjunctiveNormalForm(unittest.TestCase):
+    """`(A OR B) AND C` is two alternatives, not one.
+
+    Keeping only the first disjunct of each conjunct is a different
+    condition, and GnuCOBOL takes the branch the interpreter refused.
+    """
+
+    def test_or_inside_and_keeps_both_alternatives(self):
+        atoms = conditions.condition_atoms("(A = 1 OR B = 2) AND C = 3")
+        self.assertEqual([sorted(str(x) for x in alt) for alt in atoms],
+                         [["A = 1", "C = 3"], ["B = 2", "C = 3"]])
+
+    def test_the_interpreter_takes_the_second_disjunct(self):
+        p = program(HEADER + """       01  WS-A PIC X VALUE 'N'.
+       01  WS-B PIC X VALUE 'Y'.
+       01  WS-C PIC X VALUE 'Y'.
+       PROCEDURE DIVISION.
+       DN-MAIN.
+           IF (WS-A = 'Y' OR WS-B = 'Y') AND WS-C = 'Y'
+              PERFORM DN-DEEP
+           END-IF
+           GOBACK
+           .
+       DN-DEEP.
+           EXIT
+           .
+""")
+        trace = Interpreter(p, {}).run("DN-MAIN")
+        self.assertTrue(trace.guards[0].result)
+        self.assertIn("DN-DEEP", trace.entered_set)
+
+    def test_cross_product_is_capped(self):
+        # Six two-way conjuncts is 64 alternatives; seven would be 128 and
+        # the extra ones are dropped rather than allowed to dominate a run.
+        wide = " AND ".join("(A%d = 1 OR B%d = 2)" % (i, i) for i in range(8))
+        self.assertLessEqual(len(conditions.condition_atoms(wide)),
+                             conditions.MAX_ALTERNATIVES)
+
+
+class TestOrigins(unittest.TestCase):
+    def test_slice_composes(self):
+        from frameladder.origins import Origin
+        whole = Origin("REC", 0, None)
+        self.assertEqual(whole.slice(4, 24), Origin("REC", 4, 24))
+        self.assertEqual(whole.slice(4, 24).slice(2, 4), Origin("REC", 6, 8))
+
+    def test_slice_past_the_end_is_nothing(self):
+        from frameladder.origins import Origin
+        self.assertIsNone(Origin("REC", 0, 8).slice(9, 12))
+
+    def test_splice_grows_a_short_base(self):
+        from frameladder.origins import splice
+        self.assertEqual(splice("", 4, 6, "AB"), "    AB")
+        self.assertEqual(splice("XXXXXXXX", 2, 4, "ab"), "XXabXXXX")
+
+    def test_a_group_move_relocates_the_obligation(self):
+        # The shape that loses every deep target: the entry value of a field
+        # is destroyed by a move over the group it lives in. The obligation
+        # is not gone, it has moved to a byte range of the source.
+        p = program(HEADER + """       01  WS-IN  PIC X(8).
+       01  WS-REC.
+           05  WS-ONE PIC X(4).
+           05  WS-TWO PIC X(4).
+       PROCEDURE DIVISION.
+       OG-MAIN.
+           MOVE WS-IN TO WS-REC
+           IF WS-TWO = 'ZZZZ'
+              PERFORM OG-DEEP
+           END-IF
+           GOBACK
+           .
+       OG-DEEP.
+           EXIT
+           .
+""")
+        from frameladder.origins import Origin
+        trace = Interpreter(p, {"WS-IN": "AAAAAAAA"}, track_origins=True).run("OG-MAIN")
+        self.assertEqual(trace.guards[0].origins["WS-TWO"], Origin("WS-IN", 4, 8))
+
+    def test_a_computed_value_is_opaque(self):
+        p = program(HEADER + """       01  WS-N PIC 9(4).
+       PROCEDURE DIVISION.
+       OP-MAIN.
+           ADD 1 TO WS-N
+           IF WS-N = 7
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        trace = Interpreter(p, {"WS-N": 1}, track_origins=True).run("OP-MAIN")
+        self.assertIsNone(trace.guards[0].origins["WS-N"])
+
+
+class TestLift(unittest.TestCase):
+    def _run(self, source, entry, budget=60):
+        from frameladder.conformance_defaults import io_defaults, WORLDS
+        from frameladder.coverage import accumulate
+        from frameladder.lift import lift
+        p = program(source)
+        result = lift(p, entry, seeds=[({}, w) for w in WORLDS],
+                      defaults_for=lambda w: io_defaults(p, w), budget=budget)
+        return p, result, accumulate(p, result["traces"])
+
+    def test_it_solves_through_the_write_that_destroyed_the_plan(self):
+        source = HEADER + """       01  WS-IN  PIC X(8).
+       01  WS-REC.
+           05  WS-ONE PIC X(4).
+           05  WS-TWO PIC X(4).
+       PROCEDURE DIVISION.
+       LF-MAIN.
+           MOVE WS-IN TO WS-REC
+           IF WS-TWO = 'ZZZZ'
+              PERFORM LF-DEEP
+           END-IF
+           GOBACK
+           .
+       LF-DEEP.
+           EXIT
+           .
+"""
+        p, _result, cov = self._run(source, "LF-MAIN")
+        self.assertIn("LF-DEEP", cov.paragraphs_hit)
+        self.assertEqual(cov.direction_pct, 100.0)
+
+    def test_it_walks_a_chain_of_guards(self):
+        # Three gates in a row, each on a different field. Derivation from
+        # the entry point has to satisfy all three at once; the frontier
+        # search solves one per run and keeps what it had.
+        source = HEADER + """       01  WS-A PIC X.
+       01  WS-B PIC X.
+       01  WS-C PIC X.
+       PROCEDURE DIVISION.
+       CH-MAIN.
+           IF WS-A = 'A'
+              IF WS-B = 'B'
+                 IF WS-C = 'C'
+                    PERFORM CH-DEEP
+                 END-IF
+              END-IF
+           END-IF
+           GOBACK
+           .
+       CH-DEEP.
+           EXIT
+           .
+"""
+        _p, _result, cov = self._run(source, "CH-MAIN")
+        self.assertIn("CH-DEEP", cov.paragraphs_hit)
+
+    def test_an_input_independent_guard_is_reported_not_retried(self):
+        source = HEADER + """       01  WS-N PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       IN-MAIN.
+           MOVE 5 TO WS-N
+           IF WS-N = 7
+              PERFORM IN-DEEP
+           END-IF
+           GOBACK
+           .
+       IN-DEEP.
+           EXIT
+           .
+"""
+        _p, result, cov = self._run(source, "IN-MAIN")
+        self.assertNotIn("IN-DEEP", cov.paragraphs_hit)
+        self.assertEqual(result["stats"]["unliftable"], 1)
+
+    def test_the_same_command_gives_the_same_runs(self):
+        source = HEADER + """       01  WS-A PIC X.
+       01  WS-B PIC X.
+       PROCEDURE DIVISION.
+       DT-MAIN.
+           IF WS-A = 'A'
+              IF WS-B = 'B'
+                 CONTINUE
+              END-IF
+           END-IF
+           GOBACK
+           .
+"""
+        first = self._run(source, "DT-MAIN")[2]
+        second = self._run(source, "DT-MAIN")[2]
+        self.assertEqual(sorted(map(str, first.directions_hit)),
+                         sorted(map(str, second.directions_hit)))

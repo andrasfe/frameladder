@@ -189,6 +189,49 @@ CASES = {
            GOBACK.
 """),
 
+# `(A OR B) AND C` is two ways to be true, not one. Read as `A AND C` the
+# second disjunct is unreachable, and every arm guarded that way is scored on
+# the wrong side - which is a whole paragraph of COACTUPC.
+"or_inside_and": prog(
+"""       01 WS-A PIC X VALUE 'N'.
+       01 WS-B PIC X VALUE 'Y'.
+       01 WS-C PIC X VALUE 'Y'.
+""",
+"""           IF (WS-A = 'Y' OR WS-B = 'Y') AND WS-C = 'Y'
+               PERFORM YES-P
+           ELSE
+               PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"and_inside_or": prog(
+"""       01 WS-A PIC X VALUE 'N'.
+       01 WS-B PIC X VALUE 'Y'.
+       01 WS-C PIC X VALUE 'N'.
+""",
+"""           IF WS-A = 'Y' OR (WS-B = 'Y' AND WS-C = 'Y')
+               PERFORM YES-P
+           ELSE
+               PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"length_of_in_refmod": prog(
+"""       01 WS-SRC PIC X(8) VALUE 'ABCDEFGH'.
+       01 WS-KEY PIC X(4) VALUE 'ABCD'.
+       01 WS-OUT PIC X(4).
+""",
+"""           MOVE WS-SRC(LENGTH OF WS-KEY + 1:4) TO WS-OUT
+           IF WS-OUT = 'EFGH'
+               PERFORM YES-P
+           ELSE
+               PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
 "when_relational": prog(
 """       01 WS-C PIC 9(2) VALUE 15.
 """,

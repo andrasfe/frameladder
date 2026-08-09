@@ -380,6 +380,19 @@ def cmd_coverage(args):
         pool[name] = ordered
 
     traces = []
+    lift_stats = None
+    # Every derived plan is a place the frontier search can start from, and
+    # the two reach different things: derivation gets past a guard the search
+    # would have to arrive at first, and the search extends a plan past the
+    # point where the program overwrites it. Seeding one with the other is
+    # cheap - the plans are being built anyway - and it is the only way the
+    # search can begin inside a world where a file has already ended.
+    lift_seeds = [({}, w, None, None) for w in WORLDS]
+
+    if args.lift_only:
+        args.branches = False
+        args.sample = 0
+
     if args.branches:
         # One plan per decision *direction*, which is what the metric counts.
         from .coverage import branches_of
@@ -401,6 +414,9 @@ def cmd_coverage(args):
                     trace = run_plan(plan, world)
                     if trace is not None:
                         traces.append(trace)
+                if args.lift:
+                    lift_seeds.append((plan.input_state(), "bare",
+                                       plan.stub_plan(), plan.terminals))
                 # A plan pins only the slots its obligations reached; the rest
                 # keep whatever the defaults give, identically on every run.
                 # Overlaying the free slots costs nothing the plan cares about
@@ -435,7 +451,7 @@ def cmd_coverage(args):
             except Exception:                                # noqa: BLE001
                 continue
 
-    for target in program.paragraph_names[1:]:
+    for target in ([] if args.lift_only else program.paragraph_names[1:]):
         plans = []
         if args.families:
             plans = [m["plan"] for m in
@@ -451,6 +467,17 @@ def cmd_coverage(args):
                 if trace is not None:
                     traces.append(trace)
 
+    if args.lift:
+        from .lift import lift as _lift
+        result = _lift(program, entry, seeds=lift_seeds,
+                       defaults_for=lambda w: io_defaults(program, w),
+                       budget=args.lift, fanout=args.lift_fanout)
+        traces.extend(result["traces"])
+        lift_stats = result["stats"]
+        for trace in result["traces"]:
+            seen_directions.update((g.paragraph, g.ordinal, g.kind,
+                                    bool(g.result)) for g in trace.guards)
+
     if args.learn:
         learned.save()
     cov = accumulate(program, traces)
@@ -459,6 +486,7 @@ def cmd_coverage(args):
     payload.update({
         "program": program.name, "entry": entry,
         "learned": learned.summary() if args.learn else None,
+        "lift": lift_stats,
         "unreached_paragraphs": gaps["paragraphs"],
         "untouched_branches": [{"paragraph": b.paragraph, "line": b.line,
                                 "kind": b.kind, "condition": b.condition}
@@ -475,6 +503,8 @@ def cmd_coverage(args):
         print("  directions %-12s %5.1f%%" % (p["directions"], p["direction_pct"]))
         if p.get("learned"):
             print("  dictionary %s" % json.dumps(p["learned"]))
+        if p.get("lift"):
+            print("  frontier   %s" % json.dumps(p["lift"]))
         if p["unreached_paragraphs"]:
             print("\nnever entered (%d): %s"
                   % (len(p["unreached_paragraphs"]),
@@ -945,6 +975,15 @@ def build_parser():
                     help="also aim a plan at each decision direction")
     cv.add_argument("--families", type=int, default=0,
                     help="also run N divergence-family members per target")
+    cv.add_argument("--lift", type=int, default=0, metavar="N",
+                    help="up to N runs of the frontier search: solve for the "
+                         "next decision from a state that already reached it, "
+                         "then re-run the whole program to check. Reaches deep "
+                         "targets a plan placed at entry cannot survive to")
+    cv.add_argument("--lift-fanout", type=int, default=2,
+                    help="candidate states offered per unreached direction")
+    cv.add_argument("--lift-only", action="store_true",
+                    help="run only the frontier search, for measuring it")
     cv.add_argument("--limit", type=int, default=12)
     cv.set_defaults(func=cmd_coverage)
 

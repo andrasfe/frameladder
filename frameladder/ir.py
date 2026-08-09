@@ -135,6 +135,7 @@ def base_name(text: str) -> str:
 # `FUNCTION TEST-NUMVAL-C(X) = 0` is false however X is set, and that
 # direction cannot be planned or sampled into.
 _FUNCTION = re.compile(r"^FUNCTION\s+([A-Z][A-Z0-9-]*)\s*(\(.*\))?$", re.I)
+_LENGTH_OF = re.compile(r"^LENGTH\s+OF\s+([A-Z0-9][A-Z0-9-]*(?:\s*\(.*\))?)$", re.I)
 
 
 def _split_args(text: str) -> list:
@@ -212,6 +213,16 @@ def parse_term(text: str) -> Term:
     if m:
         return Term("const",
                     value=m.group(1) if m.group(1) is not None else m.group(2))
+    # `LENGTH OF X` is the non-FUNCTION spelling of FUNCTION LENGTH(X) and is
+    # the one the language reserves; CardDemo writes it 127 times. Read as a
+    # name it becomes a field nobody declares, so every reference modification
+    # built on it starts at byte 1 and every group move lands on the wrong
+    # half of the record.
+    lo = _LENGTH_OF.match(text)
+    if lo:
+        inner = parse_term(lo.group(1))
+        if inner.kind == "var" and inner.name:
+            return Term("var", name=inner.name, func="LENGTH", args=(inner,))
     fn = _FUNCTION.match(text)
     if fn:
         raw = (fn.group(2) or "")[1:-1]
@@ -260,7 +271,22 @@ def arith_tokens(text: str) -> list:
     keeps `ACCT-CURR-BAL` one name instead of three subtractions.
     """
     spaced = norm(text).replace("(", " ( ").replace(")", " ) ")
-    return [t for t in spaced.split(" ") if t]
+    tokens = [t for t in spaced.split(" ") if t]
+    # `LENGTH OF X` is one operand written as three words. Left split it
+    # evaluates as a field called LENGTH followed by two tokens the grammar
+    # has no rule for, so the expression silently comes out as whatever the
+    # first operand was - and `X(LENGTH OF A + 1:n)` then slices from byte 1.
+    merged: list = []
+    index = 0
+    while index < len(tokens):
+        if (tokens[index].upper() == "LENGTH" and index + 2 < len(tokens)
+                and tokens[index + 1].upper() == "OF"):
+            merged.append(" ".join(tokens[index:index + 3]))
+            index += 3
+            continue
+        merged.append(tokens[index])
+        index += 1
+    return merged
 
 
 def is_arithmetic(text: str) -> bool:

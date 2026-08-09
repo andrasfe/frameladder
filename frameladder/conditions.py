@@ -204,6 +204,36 @@ def _atoms_cached(condition: str, negate: bool, origin: str) -> tuple:
     return tuple(tuple(alt) for alt in _condition_atoms(condition, negate, origin))
 
 
+# Disjunctive normal form of a conjunction is a cross product, and a
+# condition with eight parenthesised alternatives has 256 of them. The point
+# of the form is to be enumerable, so past this width the extra alternatives
+# are dropped rather than allowed to dominate the run.
+MAX_ALTERNATIVES = 64
+
+
+def _conjoin(groups: list) -> list[list[Atom]]:
+    """AND together several already-disjunctive conditions.
+
+    ``(A OR B) AND C`` is ``(A AND C) OR (B AND C)``. Keeping only the first
+    alternative of each conjunct - which is what this did - is not an
+    approximation, it is a different condition: with A false, B true and C
+    true the real answer is true and the kept one is false. GnuCOBOL takes
+    that branch and the interpreter did not, so every `IF (X OR Y) AND Z`
+    was scored on the wrong arm, and the planner was solving for `X AND Z`
+    while believing it had covered the condition. COACTUPC writes the shape
+    58 times in one paragraph.
+    """
+    product: list[list[Atom]] = [[]]
+    for alternatives in groups:
+        if not alternatives:
+            continue
+        if len(product) * len(alternatives) > MAX_ALTERNATIVES:
+            product = [conj + list(alternatives[0]) for conj in product]
+            continue
+        product = [conj + list(alt) for conj in product for alt in alternatives]
+    return product
+
+
 def _condition_atoms(condition: str, negate: bool = False,
                      origin: str = "") -> list[list[Atom]]:
     text = norm(condition)
@@ -231,11 +261,7 @@ def _condition_atoms(condition: str, negate: bool = False,
     ors = expand_abbreviated(split_top(text, "OR"))
     if len(ors) > 1:
         if negate:                                   # NOT(A OR B) = !A AND !B
-            merged: list[Atom] = []
-            for part in ors:
-                alts = _condition_atoms(part, True, origin)
-                merged.extend(alts[0] if alts else [])
-            return [merged]
+            return _conjoin([_condition_atoms(p, True, origin) for p in ors])
         out: list[list[Atom]] = []
         for part in ors:
             out.extend(_condition_atoms(part, False, origin))
@@ -253,11 +279,7 @@ def _condition_atoms(condition: str, negate: bool = False,
             for part in ands:
                 out.extend(_condition_atoms(part, True, origin))
             return out
-        merged = []
-        for part in ands:
-            alts = _condition_atoms(part, False, origin)
-            merged.extend(alts[0] if alts else [])
-        return [merged]
+        return _conjoin([_condition_atoms(p, False, origin) for p in ands])
 
     m = _COMPARE.match(text)
     if not m:
