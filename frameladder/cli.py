@@ -711,6 +711,98 @@ def cmd_family(args):
     return _emit(payload, args.json, render)
 
 
+def cmd_why(args):
+    """Where the attempts die, which is what says what to build next.
+
+    A coverage percentage tells you that something is wrong and nothing
+    about what. This classifies every branch-directed attempt by the point
+    at which it failed, and reports the distribution against chain length -
+    because on every program measured so far coverage has been a function of
+    how far a plan has to survive, not of how large the program is.
+    """
+    import collections
+    from .coverage import branches_of
+    from .ladder import plan_for_branch
+    from .interpreter import Interpreter
+    from .conformance_defaults import io_defaults, WORLDS
+
+    program = _program(args)
+    entry = _entry(program, args)
+    buckets = collections.Counter()
+    by_depth = collections.defaultdict(lambda: [0, 0])   # depth -> [covered, all]
+    stalls = collections.Counter()
+
+    for b in branches_of(program):
+        for direction in (True, False):
+            try:
+                plan = plan_for_branch(program, b.paragraph, b.line, direction,
+                                       entry=entry, max_routes=args.routes,
+                                       ordinal=b.ordinal)
+            except Exception:                            # noqa: BLE001
+                buckets["planner raised"] += 1
+                continue
+            if not plan.chain:
+                buckets["no call chain to the paragraph"] += 1
+                continue
+            depth = len(plan.chain)
+            by_depth[depth][1] += 1
+            if plan.open_obligations:
+                buckets["plan unsolved (open obligations)"] += 1
+                continue
+            arrived = decided = False
+            for world in WORLDS:
+                interp = Interpreter(program, plan.input_state(),
+                                     stubs=plan.stub_plan(),
+                                     terminals=plan.terminals,
+                                     defaults=io_defaults(program, world))
+                try:
+                    trace = interp.run(entry)
+                except Exception:                        # noqa: BLE001
+                    continue
+                if b.paragraph in trace.entered_set:
+                    arrived = True
+                    seen = trace.entered_set
+                    for step, frame in enumerate(plan.chain):
+                        if frame not in seen:
+                            stalls[step] += 1
+                            break
+                if any((g.paragraph, g.ordinal) == (b.paragraph, b.ordinal)
+                       and bool(g.result) == direction for g in trace.guards):
+                    decided = True
+                    break
+            if decided:
+                buckets["covered"] += 1
+                by_depth[depth][0] += 1
+            elif arrived:
+                buckets["arrived, decision went the other way"] += 1
+            else:
+                buckets["plan solved but paragraph never entered"] += 1
+
+    total = max(1, sum(buckets.values()))
+    depths = {d: {"covered": v[0], "attempts": v[1],
+                  "pct": round(100.0 * v[0] / max(1, v[1]), 1)}
+              for d, v in sorted(by_depth.items())}
+    payload = {"program": program.name, "attempts": sum(buckets.values()),
+               "outcomes": {k: v for k, v in buckets.most_common()},
+               "by_chain_length": depths,
+               "stalled_at_chain_step": dict(stalls.most_common(8))}
+    if args.json:
+        print(json.dumps(payload, indent=2, default=str))
+        return
+    print("%-10s %d attempts" % (program.name, sum(buckets.values())))
+    for name, count in buckets.most_common():
+        print("   %-46s %5d  %5.1f%%" % (name, count, 100.0 * count / total))
+    if depths:
+        print("\n   covered, by how far the plan has to survive:")
+        for d, row in depths.items():
+            print("      chain length %-3d %4d/%-4d %5.1f%%"
+                  % (d, row["covered"], row["attempts"], row["pct"]))
+    if stalls:
+        print("\n   where the ones that never arrived stalled:")
+        for step, count in stalls.most_common(8):
+            print("      chain step %-3d %5d" % (step, count))
+
+
 def cmd_sweep(args):
     """Plan and verify every reachable paragraph. The unsolved ones are the
     work list an agent should pick up."""
@@ -882,6 +974,12 @@ def build_parser():
     fm.add_argument("--no-verify", action="store_true",
                     help="skip re-verifying each member (faster, less safe)")
     fm.set_defaults(func=cmd_family)
+
+    wy = sub.add_parser("why", help="where the attempts die, and against what "
+                                    "chain length - run this before tuning "
+                                    "anything")
+    wy.add_argument("--routes", type=int, default=4)
+    wy.set_defaults(func=cmd_why)
 
     sw = sub.add_parser("sweep", help="plan and verify every reachable target")
     sw.set_defaults(func=cmd_sweep)
