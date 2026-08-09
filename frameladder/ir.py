@@ -392,6 +392,26 @@ def move_targets(text: str) -> list[str]:
     return [norm(m.group(1)).upper() for m in _TARGET.finditer(norm(text))]
 
 
+def move_target_terms(text: str) -> list:
+    """The same targets, as terms, so a slice survives.
+
+    ``move_targets`` deliberately returns base names: provenance asks *which
+    field is written*, and `B(3:2)` is a write to `B`. Execution needs the
+    other half of the answer. ``MOVE A TO B(n:m)`` replaces m bytes of B and
+    leaves the rest alone, and assigning the whole of B instead is how a
+    commarea assembled in two pieces ends up holding only the second one.
+    """
+    out = []
+    for m in _TARGET.finditer(norm(text)):
+        try:
+            term = parse_term(m.group(0))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if term.kind == "var" and term.name:
+            out.append(term)
+    return out
+
+
 def class_holds(value: Any, klass: str) -> bool:
     """A class condition asks about the *shape* of the bytes.
 

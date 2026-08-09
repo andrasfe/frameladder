@@ -347,6 +347,19 @@ class Interpreter:
         except Exception:                                        # noqa: BLE001
             return 0
 
+    def declared_length(self, name: str) -> int:
+        """Byte size of a field or of a whole group.
+
+        A group has no PIC, so `_width` returns 0 for it; its size is where
+        its last elementary field ends. Every commarea in a pseudo-
+        conversational program is sliced at group boundaries computed this
+        way, so getting it wrong misplaces the whole saved state.
+        """
+        fields = self._elementary(name)
+        if fields:
+            return max(o + n for _c, o, n in fields)
+        return self._width(name)
+
     def _text_of(self, name: str, value) -> str:
         text = "" if value is None else str(value)
         width = self._width(name)
@@ -357,18 +370,29 @@ class Interpreter:
     def _as_int(self, expression: str, default: int) -> int:
         if not expression:
             return default
-        try:
-            # `X(LENGTH OF A + 1:n)` is an expression, not an operand, and
-            # every commarea split in a CICS program is written that way.
-            # Parsing it as one term reads a field nobody declared and starts
-            # the slice at byte 1, so the second half of the record is
-            # overlaid on the first.
-            from .ir import is_arithmetic
-            if is_arithmetic(expression):
-                return int(self.number_of(expression))
-            return int(float(str(self.value_of(parse_term(expression))).strip()))
-        except (TypeError, ValueError, ZeroDivisionError):
-            return default
+        # A refmod offset is an arithmetic expression far more often than it
+        # is a bare name - `X(LENGTH OF A + 1 : LENGTH OF B)` is the standard
+        # way to append one group to another. Parsed as one identifier the
+        # whole thing is a variable nobody writes, and the slice silently
+        # starts at 1.
+        # Split only on a *spaced* operator: COBOL requires a space either
+        # side of one, and a hyphen without spaces is part of the name.
+        total, sign, ok = 0.0, 1, False
+        for piece in re.split(r"\s+([+-])\s+", expression):
+            piece = piece.strip()
+            if not piece:
+                continue
+            if piece in ("+", "-"):
+                sign = 1 if piece == "+" else -1
+                continue
+            try:
+                value = self.value_of(parse_term(piece))
+                total += sign * float(str(value).strip())
+                ok = True
+            except (TypeError, ValueError):
+                return default
+            sign = 1
+        return int(total) if ok else default
 
     def _slice(self, term, value) -> str:
         text = self._text_of(term.name, value)
@@ -594,6 +618,37 @@ class Interpreter:
                 continue
             return self._reinterpret(raw, name)
         return None
+
+    def assign_slice(self, term, value) -> None:
+        """``MOVE A TO B(start:length)`` - replace those bytes of B, keep the rest.
+
+        The receiving item is the *slice*, so the move is alphanumeric and
+        left-aligned within it, and everything outside it is untouched. This
+        is how a pseudo-conversational commarea is built: the shared header
+        goes to `WS-COMMAREA`, then the program's own area is appended at
+        `LENGTH OF header + 1`. Writing the whole of B for the second MOVE
+        throws the header away, which is precisely the state the next task
+        branches on.
+        """
+        name = term.name.upper()
+        if name in self._pinned:
+            return
+        width = self.declared_length(name)
+        current = self._text_of(name, self._stored(name))
+        if width and len(current) < width:
+            current = current.ljust(width)
+        start = max(1, self._as_int(term.refmod[0], 1))
+        text = "" if value is None else str(value)
+        length = self._as_int(term.refmod[1], len(text)) if term.refmod[1] \
+            else len(text)
+        if length <= 0:
+            return
+        piece = text[:length].ljust(length)
+        end = start - 1 + length
+        if len(current) < end:
+            current = current.ljust(end)
+        updated = current[:start - 1] + piece + current[end:]
+        self.assign(name, updated)
 
     def _fit(self, name: str, value):
         """Store a value the way the receiving field actually holds it.
@@ -1006,6 +1061,19 @@ class Interpreter:
                 return
             value = self.value_of(source)
             origin = self.origin_of(source)
+            # `MOVE A TO B(n:m)` replaces m bytes of B and leaves the rest
+            # alone. Assigning the whole of B is how a commarea assembled in
+            # two pieces - header, then the program's own area at
+            # `LENGTH OF header + 1` - ends up holding only the second one.
+            from .ir import move_target_terms
+            terms = move_target_terms(attrs.get("targets", ""))
+            if any(t.refmod for t in terms):
+                for term in terms:
+                    if term.refmod:
+                        self.assign_slice(term, value)
+                    else:
+                        self.assign(term.name, value, origin)
+                return
             for name in move_targets(attrs.get("targets", "")):
                 self.assign(name, value, origin)
             return

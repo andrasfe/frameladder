@@ -83,6 +83,35 @@ _LEVEL88 = re.compile(r"^\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(?:ARE\s+|IS\s
 _88_VALUE = re.compile(r"'[^']*'|\"[^\"]*\"|[^\s,]+")
 
 
+def _split_sentences(text: str) -> list:
+    """Split a data-division buffer on periods that are not inside a literal.
+
+    `01 WS-EDIT-MASK PIC X(8) VALUE '........'.` is one declaration whose
+    VALUE happens to be eight periods. Splitting on every period cuts it into
+    nine fragments, none of which parses, so the field silently loses its
+    VALUE - it keeps its PIC, which is what makes the loss hard to notice.
+    A filler or mask made of dots is ordinary in report and edit layouts.
+    """
+    out, buf, quote = [], [], ""
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == ".":
+            out.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    out.append("".join(buf))
+    return out
+
+
 def _split_88_values(text: str) -> list:
     """The values of a condition-name, without breaking quoted literals.
 
@@ -287,7 +316,7 @@ def parse_data_division(path: str) -> DataModel:
         buffer += " " + line.text.strip()
         if "." not in line.text:
             continue
-        for chunk in buffer.split("."):
+        for chunk in _split_sentences(buffer):
             if not chunk.strip():
                 continue
             m88 = _LEVEL88.match(chunk)
