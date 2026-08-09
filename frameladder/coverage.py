@@ -55,6 +55,13 @@ def branches_of(program) -> list:
                     out.append(Branch(para, arm.get("line_start", line), "WHEN",
                                       arm.get("attributes", {}).get("value", ""),
                                       arm.get("ordinal", -1)))
+        elif kind == "PHRASE":
+            # `AT END` / `INVALID KEY` and their negations are decisions: the
+            # handler runs or it does not, and which way it went is exactly
+            # the thing a read loop turns on. Leaving them out of the
+            # denominator scored their directions for free.
+            out.append(Branch(para, line, "PHRASE",
+                              attrs.get("phrase", ""), stmt.get("ordinal", -1)))
         elif kind.startswith("PERFORM") and (attrs.get("condition")
                                              or attrs.get("varying")):
             out.append(Branch(para, line, "LOOP",

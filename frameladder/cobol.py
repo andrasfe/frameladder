@@ -392,6 +392,31 @@ _SCOPE_ENDS = {
 }
 _BOUNDARY = VERBS | _SCOPE_ENDS | {"ELSE", "WHEN", "."}
 
+# The conditional phrases an I/O or arithmetic statement can carry. Each is a
+# *decision*: `READ ... AT END <stmts>` runs those statements only when the
+# read hit end-of-file. Parsed as plain siblings - which is what happens when
+# the keywords are not scope boundaries - the handler runs unconditionally, so
+#
+#     READ TR-RECORD ... AT END MOVE 'Y' TO LASTREC END-READ
+#     PERFORM UNTIL LASTREC = 'Y' ... END-PERFORM
+#
+# sets the end-of-file flag on the first pass and the whole loop body becomes
+# unreachable. Every COBOL read loop is written this way, so this is not an
+# edge case; it is the shape of batch COBOL.
+_PHRASES = {
+    ("AT", "END"): "at_end",
+    ("NOT", "AT", "END"): "not_at_end",
+    ("INVALID", "KEY"): "invalid_key",
+    ("NOT", "INVALID", "KEY"): "not_invalid_key",
+    ("ON", "SIZE", "ERROR"): "on_size_error",
+    ("NOT", "ON", "SIZE", "ERROR"): "not_on_size_error",
+    ("ON", "OVERFLOW"): "on_overflow",
+    ("NOT", "ON", "OVERFLOW"): "not_on_overflow",
+    ("ON", "EXCEPTION"): "on_exception",
+    ("NOT", "ON", "EXCEPTION"): "not_on_exception",
+}
+_PHRASE_HEADS = {"AT", "NOT", "ON", "INVALID"}
+
 _WORD = re.compile(r"'[^']*'|\"[^\"]*\"|[^\s]+")
 
 
@@ -685,8 +710,25 @@ class _Parser:
                     "attributes": {"body": body}, "children": []}
 
         words = self.take_until_boundary()
+        # A trailing conditional phrase turns the rest into a guarded handler
+        # rather than the next statement. `take_until_boundary` stops at the
+        # verb that begins the handler, so the phrase keywords are the tail of
+        # what it collected.
+        phrase, words = _split_phrase(words)
         text = verb + (" " + " ".join(w.word for w in words) if words else "")
         attrs: dict[str, Any] = {}
+        children: list = []
+        while phrase:
+            body = self.statements(_SCOPE_ENDS | {"."} | _PHRASE_HEADS)
+            children.append({"type": "PHRASE", "text": phrase,
+                             "line_start": head.line, "line_end": head.line,
+                             "attributes": {"phrase": phrase},
+                             "children": body})
+            nxt, _ = _split_phrase(self.take_until_boundary()) \
+                if self.peek() in _PHRASE_HEADS else (None, [])
+            phrase = nxt
+        if children:
+            attrs["phrases"] = [c["attributes"]["phrase"] for c in children]
         if verb == "MOVE":
             joined = " ".join(w.word for w in words)
             m = re.split(r"\s+TO\s+", joined, maxsplit=1, flags=re.I)
@@ -707,6 +749,10 @@ class _Parser:
             if m:
                 attrs["name"], attrs["value"] = m.group(1).upper(), m.group(2).upper()
         kind = {"GOBACK": "GOBACK", "STOP": "STOP", "EXIT": "EXIT"}.get(verb, verb)
+        if children:
+            return {"type": kind, "text": text, "line_start": head.line,
+                    "line_end": words[-1].line if words else head.line,
+                    "attributes": attrs, "children": children}
         if kind == "EXIT" and words:
             # A bare `EXIT` is a no-op landing pad. `EXIT PARAGRAPH` and
             # `EXIT SECTION` are control flow - they leave the paragraph the
@@ -794,6 +840,15 @@ def _replacements(clause: str) -> list:
     body = re.sub(r"^\s*REPLACING\s+", "", clause, flags=re.I)
     return [(m.group(1).strip(), m.group(2).strip())
             for m in _PLAIN_REPL.finditer(body)]
+
+
+def _split_phrase(words: list):
+    """(phrase, remaining words) when a conditional phrase closes the list."""
+    upper = [w.word.upper() for w in words]
+    for length in (4, 3, 2):
+        if len(upper) >= length and tuple(upper[-length:]) in _PHRASES:
+            return _PHRASES[tuple(upper[-length:])], words[:-length]
+    return None, words
 
 
 def _stamp_ordinals(statements: list) -> None:

@@ -967,12 +967,59 @@ class Interpreter:
         from .provenance import STUB_KINDS, op_key
         if kind in STUB_KINDS:
             self._external(stmt, para, line)
-            if children:
+            if children and any(c.get("type") == "PHRASE" for c in children):
+                self._phrases(stmt, children, para, depth, line, ordinal)
+            elif children:
                 self.block(children, para, depth)
             return
 
         if children:
             self.block(children, para, depth)
+
+    # File status values that mean "no record": end-of-file for a sequential
+    # read, not-found for a keyed one. These are the codes the standard fixes,
+    # not a guess.
+    _AT_END = {"10", "46", 10, 46}
+    _INVALID_KEY = {"21", "22", "23", "24", 21, 22, 23, 24}
+
+    def _phrases(self, stmt, children, para: str, depth: int, line: int,
+                 ordinal: int) -> None:
+        """Run the handler the operation's outcome selects, and only that one.
+
+        `AT END` is a decision, and running its body unconditionally is how a
+        read loop sets end-of-file on its first pass and skips everything it
+        was written to do. It is recorded as a guard so it counts as a branch
+        direction like any other - it is one.
+        """
+        from .provenance import op_key
+        key = op_key(norm(stmt.get("text", "")))
+        status = ""
+        if ":" in key:
+            status = self.model.file_status.get(key.rsplit(":", 1)[-1], "")
+        value = self._stored(status) if status else None
+        at_end = value in self._AT_END
+        invalid = value in self._INVALID_KEY
+        for arm in children:
+            if arm.get("type") != "PHRASE":
+                continue
+            phrase = arm.get("attributes", {}).get("phrase", "")
+            if phrase in ("at_end", "not_at_end"):
+                taken = at_end if phrase == "at_end" else not at_end
+            elif phrase in ("invalid_key", "not_invalid_key"):
+                taken = invalid if phrase == "invalid_key" else not invalid
+            else:
+                # ON SIZE ERROR / OVERFLOW / EXCEPTION: the interpreter has no
+                # model of the failure, so the non-error arm is the one taken
+                # and the error arm is reported as unmodelled rather than
+                # quietly run.
+                taken = phrase.startswith("not_")
+                if not taken and "%s:%s" % (para, phrase) not in self.trace.approximations:
+                    self.trace.approximations.append("%s:%s" % (para, phrase))
+            self.trace.guards.append(
+                GuardEvent(para, arm.get("line_start", line), "PHRASE",
+                           phrase, taken, {}, arm.get("ordinal", -1)))
+            if taken:
+                self.block(arm.get("children") or [], para, depth)
 
     def _external(self, stmt, para: str, line: int) -> None:
         """Deliver the planned outcome for one external operation."""

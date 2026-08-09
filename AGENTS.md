@@ -161,6 +161,12 @@ leaves the corpus figure flat, say so and say why it cannot show up there.
   null-terminated, `N'..'` is national. Parsed as names they become
   variables nobody writes, so every condition testing one is permanently
   false - which is exactly how CSUTLDTC sat at 50% with ten dead arms.
+- **A conditional phrase is a decision, not a suffix.** `READ ... AT END
+  <stmts>`, `INVALID KEY`, `ON SIZE ERROR` and their `NOT` forms run their
+  body only on that outcome. Parsed as plain siblings the body runs
+  unconditionally, so a read loop sets end-of-file on its first pass and
+  everything it was written to do is unreachable. That is the shape of
+  batch COBOL, not an edge case - it took one program from 12.5% to 100%.
 - **Copybooks: read what is `COPY`ed.** Loading the directory gave CBACT04C
   2,640 fields instead of 129, inflating the `declared` set that live-in
   filtering and record association depend on.
