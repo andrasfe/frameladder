@@ -241,6 +241,9 @@ class Interpreter:
         # ALTER rewrites another paragraph's GO TO at run time. A dispatcher
         # built on it - and CardDemo's is - cycles forever without this.
         self.altered: dict = {}
+        # Two names over one set of bytes. Built once because it is a
+        # property of the data division, not of the run.
+        self._overlays = self._overlay_map()
         # Off by default and free when off: every other caller pays nothing,
         # and the search that wants it is the only one that carries the cost.
         # A name absent from this table has not been written on this run, so
@@ -278,6 +281,9 @@ class Interpreter:
         found = self.model.look(self.model.initial, name)
         if found is not None:
             return found
+        overlaid = self._read_overlay(name)
+        if overlaid is not None:
+            return overlaid
         spec = (self.model.pic_of(name) or "").upper()
         return 0 if spec and "9" in spec and "X" not in spec else ""
 
@@ -524,6 +530,70 @@ class Interpreter:
                 fields = []
         self._layouts[group] = fields
         return fields
+
+    def _overlay_map(self) -> dict:
+        """field -> the fields that share its bytes, both directions."""
+        pairs: dict = {}
+        for name, over in (self.model.redefines or {}).items():
+            pairs.setdefault(name.upper(), set()).add(over.upper())
+            pairs.setdefault(over.upper(), set()).add(name.upper())
+        return {k: sorted(v) for k, v in pairs.items()}
+
+    def _reinterpret(self, value, target: str):
+        """One field's value read through another field's PIC.
+
+        Only the same-width elementary case, and only DISPLAY. A packed or
+        binary overlay is a different byte pattern entirely and guessing at
+        it would be worse than leaving it alone - which is the whole reason
+        the complete fix wants a byte-level store rather than this.
+        """
+        spec = (self.model.pic_of(target) or "").upper()
+        if not spec:
+            return None
+        text = "" if value is None else str(value)
+        if "9" in spec and "X" not in spec and "A" not in spec:
+            stripped = text.strip()
+            if stripped and stripped.lstrip("+-").isdigit():
+                return int(stripped)
+            return 0
+        return text
+
+    def _alias(self, name: str, value) -> None:
+        """Writing one name writes every name over the same bytes.
+
+        `IF CC-ACCT-ID IS NUMERIC` passes on '11111111111' while
+        `CC-ACCT-ID-N REDEFINES CC-ACCT-ID` reads 0, because the two names
+        were separate cells. That is the CICS validation idiom, and without
+        aliasing every check built on it decides on a value the program
+        never had.
+        """
+        for other in self._overlays.get(name, ()):
+            if other == name:
+                continue
+            if self._width(name) != self._width(other):
+                continue           # a partial overlay needs real bytes
+            fresh = self._reinterpret(value, other)
+            if fresh is not None:
+                self.state[other] = fresh
+
+    def _read_overlay(self, name: str):
+        """Read through the overlay when this name has no value of its own.
+
+        The write side alone is not enough: `01 WS-A PIC X(4) VALUE '1234'`
+        with `01 WS-B REDEFINES WS-A PIC 9(4)` never assigns anything, and
+        WS-B still has to read 1234 - the bytes were laid down by the VALUE
+        clause.
+        """
+        for other in self._overlays.get(name, ()):
+            if self._width(name) != self._width(other):
+                continue
+            raw = self.state.get(other)
+            if raw is None:
+                raw = self.model.look(self.model.initial, other)
+            if raw is None:
+                continue
+            return self._reinterpret(raw, name)
+        return None
 
     def _fit(self, name: str, value):
         """Store a value the way the receiving field actually holds it.
