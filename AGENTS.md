@@ -281,10 +281,25 @@ coverage is the number that measures anything, and it is the one to quote.
 ## Where coverage stands
 
 Branch directions, whole CardDemo corpus, `coverage --branches --sample 150`:
-**28 programs, median 88.8%, range 53.3-100%, pooled 2313/3256 = 71.0%**
-with `coverage --branches --lift 600`. Without `--lift`, median 82.4% and
-pooled 51.2% - the frontier search is most of the difference and all of it
-on the deep programs.
+`coverage --branches --lift 600`, two corpora measured separately because
+one of them is the corpus this was built against:
+
+| | programs | median | range | pooled |
+|---|---|---|---|---|
+| CardDemo | 28 | 88.1% | 53.5-100% | 2349/3288 = 71.4% |
+| everything else | 17 | 83.6% | 40.8-100% | 1649/1990 = **82.9%** |
+
+"Everything else" is IBM's Global Auto Mart sample, CardDemo's own `app-*`
+applications, and a synthetic AML screener - 17 programs by three
+unrelated authors.
+
+**The pooled figure is higher off-corpus than on it**, which is the result
+to check after any change here. It has not always been true: before the
+`LENGTH OF` and `AT END` fixes the same set pooled 76.2% with a floor of
+1.9%. Both defects were invisible on CardDemo.
+
+Without `--lift`, CardDemo pools 51.2% - the frontier search is most of the
+difference and all of it on the deep programs.
 
 That is a third lower than this file claimed a day earlier, and the drop is
 the point. The old figure was measuring an artefact: every variable in the
