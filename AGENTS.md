@@ -229,6 +229,26 @@ listed together because the interaction is the point:
   them. That is the strongest interaction measured here and the reason to
   distrust any of these numbers taken alone.
 
+**Search bought almost nothing; diagnosis bought everything.** Three
+mechanisms were designed, built and measured against this problem, and the
+result was consistent enough to be worth writing down:
+
+| mechanism | measured | what it was actually worth |
+|---|---|---|
+| frontier lifting from a reached state | large | the one search idea that paid |
+| branch-distance fitness + conflict learning | +2 directions | localised REDEFINES aliasing |
+| CICS transaction state-machine search | +5 directions | localised six semantic defects |
+
+Both near-zero results paid for themselves by pointing at a defect. The
+transaction search failed for a reason worth keeping: **distinct commarea
+states discovered were 1, 1, 1, 2, 5, 9, 13** across the screen programs,
+because the screen data is re-received from the map on every task, so
+history does not decide the path. Sequences are a real mechanism and this
+corpus barely uses them.
+
+Before building a search, check whether the thing it would search for is
+actually being computed correctly. It usually is not.
+
 **Raw budget buys nothing.** 33x the samples and 6x the routes moved the
 corpus by 0.16 points for 8x the runtime. When coverage is stuck the answer
 is a missing mechanism, not a bigger number.
