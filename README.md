@@ -65,14 +65,21 @@ they are consecutive outcomes of one operation, and the plan emits them in
 order. Recognising this needs the `FILE STATUS IS` clause and the `FD` record
 to be attributed to the I/O that writes them, so both are parsed.
 
-**Infeasibility proofs.** When a variable the program *never writes* is
-required to hold two different values, that is not a gap in the search — it is
-a proof that the chain is dead, delivered in O(1). On COACTVWC the tool reports
-`WS-INPUT-FLAG must be '0' and also '1', and nothing in the program writes it`;
-the field is declared on line 50 and never mentioned again.
+**A specific reason, scoped to the chain.** When a variable the program
+*never writes* is required to hold two different values, that is not a gap in
+the search — the chain cannot be taken, and the tool says so in O(1) rather
+than reporting a vague failure. On COACTVWC: `WS-INPUT-FLAG must be '0' and
+also '1', and nothing on the chain writes it`.
 
-Together these took the corpus from 197 unresolved obligations to 41 — of which
-40 *are* infeasibility proofs.
+**Read the scope, because an earlier version of this section did not have
+one.** It called these *infeasibility proofs* and claimed 40 of 41 unresolved
+obligations were proofs of dead code. That was wrong, and measurably so: on
+GAM0VII, 7 of the 24 directions declared infeasible were afterwards observed
+executing. The obligations come from **one route**. A contradiction between
+them rules out that route and says nothing about the program — another way in
+may carry no opinion about the field at all. For a tool whose output decides
+what gets tested, "this code is dead" is the most expensive sentence to get
+wrong, so it is no longer said.
 
 ## Free values are not free
 

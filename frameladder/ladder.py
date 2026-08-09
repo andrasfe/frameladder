@@ -593,13 +593,23 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                     settled = True
                     break
                 if not program_advanced(var_term.name):
-                    # Nothing writes it, so it holds one value for the whole
-                    # run. Two obligations wanting different values is not a
-                    # gap in the search - it is a proof that this chain
-                    # cannot be taken, and saying so is the useful answer.
+                    # Nothing writes it, so along *this* chain it holds one
+                    # value and two obligations wanting different ones cannot
+                    # both hold.
+                    #
+                    # Scoped to the chain, and deliberately no longer called a
+                    # proof. It was, and it was wrong: on GAM0VII 7 of the 24
+                    # directions declared infeasible were then observed
+                    # executing. The obligations come from one route, so a
+                    # contradiction between them rules out that route and says
+                    # nothing about the program - another way in may carry no
+                    # opinion about the field at all. For a tool whose output
+                    # decides what gets tested, "this code is dead" is the
+                    # most expensive sentence to get wrong.
                     open_obs.append((candidate,
-                                     "INFEASIBLE: %s must be %r and also %s %r, "
-                                     "and nothing in the program writes it"
+                                     "no plan on this chain: %s must be %r and "
+                                     "also %s %r, and nothing on the chain "
+                                     "writes it"
                                      % (var_term.name, existing.value, op,
                                         const_term.value)))
                     settled = True

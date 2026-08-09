@@ -460,10 +460,13 @@ class TestSynergies(unittest.TestCase):
                                 "expected an ordered outcome sequence")
         self.assertEqual([o["seq"] for o in outcomes], sorted(o["seq"] for o in outcomes))
 
-    def test_unwritable_variable_gives_an_infeasibility_proof(self):
+    def test_unwritable_variable_reports_the_chain_as_unplannable(self):
         # WS-NEVER is declared and never assigned, so demanding two values of
-        # it is not a search problem - the chain is dead, and saying so is
-        # the useful answer.
+        # it is not a search problem on this chain. Note the scope: the claim
+        # is about the chain, not the program. Stated globally it was wrong -
+        # on GAM0VII 7 of 24 directions called infeasible were then observed
+        # executing, because the obligations came from one route and another
+        # route had no opinion about the field.
         p = program(HEADER + """       01  WS-NEVER PIC X.
        PROCEDURE DIVISION.
        R-MAIN.
@@ -479,9 +482,9 @@ class TestSynergies(unittest.TestCase):
            .
 """)
         plan = build_plan(p, "R-DEEP", entry="R-MAIN")
-        self.assertTrue(any("INFEASIBLE" in why
+        self.assertTrue(any("no plan on this chain" in why
                             for _atom, why in plan.open_obligations),
-                        "expected a proof, not a vague failure")
+                        "expected a specific reason, not a vague failure")
 
     def test_declared_constant_is_not_a_knob(self):
         p = program(HEADER + """       01  WS-VAL PIC X(4).
