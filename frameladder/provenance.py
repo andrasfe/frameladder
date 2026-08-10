@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 from .conditions import condition_atoms
 from .graph import walk_guarded
-from .ir import Producer, move_targets, norm, parse_term
+from .ir import Producer, base_name, move_targets, norm, parse_term
 
 STUB_KINDS = {"CALL", "READ", "OPEN", "CLOSE", "WRITE", "REWRITE", "START",
               "DELETE", "EXEC", "RETURN", "ACCEPT"}
@@ -522,6 +522,20 @@ class Provenance:
 
     def visible(self, var: str, at: tuple | None) -> list:
         writers = self.writers.get(var.upper(), [])
+        if not writers:
+            # A qualified reference names a declaration recorded under its
+            # base name, so the *lookup* has to see through the qualifier
+            # even though the identity keeps it - the same split `model.look`
+            # already makes. Without this a qualified map field finds no
+            # writer at all, falls through to the record-association guess,
+            # and is attributed to whichever stub shares the most name
+            # tokens: `ACTIDINI OF COTRN2AI` came back as a field of a file
+            # READ rather than of the terminal RECEIVE that fills it. The
+            # plan then binds an outcome for the wrong operation and the
+            # field the condition tests is never set by anything.
+            base = base_name(var)
+            if base != var.upper():
+                writers = self.writers.get(base, [])
         if not at or not self.order:
             return writers
         para, line = at
@@ -607,7 +621,8 @@ class Provenance:
         return Producer("unknown", var=var, site=writers[0].para)
 
     def _from_record(self, var: str, depth: int, seen: frozenset) -> Producer:
-        if self.model.knows(var) or not self.stub_fills:
+        if (self.model.knows(var) or self.model.knows(base_name(var))
+                or not self.stub_fills):
             return Producer("input", var=var)
         group = associate_field(var, self.stub_fills)
         if not group:

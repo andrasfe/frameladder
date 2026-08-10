@@ -328,8 +328,24 @@ one of them is the corpus this was built against:
 
 | | programs | median | range | pooled |
 |---|---|---|---|---|
-| CardDemo | 28 | 88.1% | 53.5-100% | 2349/3288 = 71.4% |
-| everything else | 17 | 83.6% | 40.8-100% | 1649/1990 = **82.9%** |
+| CardDemo | 28 | **90.7%** | 29.8-100% | 2005/3288 = **61.0%** |
+| everything else | 17 | 83.6% | 43.9-100% | 1647/1992 = **82.7%** |
+
+The two CardDemo numbers moved in opposite directions when the byte-level
+store landed, and both are right. The **median rose** (88.1 -> 90.7) because
+most programs got more accurate. The **pooled figure fell** (71.4 -> 61.0)
+because seven large CICS screen programs lost heavily, for one reason,
+verified rather than assumed: a BMS output map REDEFINES its input map, the
+program clears the output map before sending, and that clear lands on the
+bytes the operator's input will occupy. The old field map kept the two
+descriptions as separate cells so the input survived a clear that had
+already discarded it. `redefines_cleared_through_alias` fails on the old
+store and passes now.
+
+Delivering terminal input at `EXEC CICS RECEIVE ... INTO(a)` recovers this
+where the harness supplies the field - COUSR01C went 44.4% -> 97.2%. Where
+it does not, the direction is honestly unreachable rather than falsely
+covered, and **that is the largest single piece of open work in the repo.**
 
 "Everything else" is IBM's Global Auto Mart sample, CardDemo's own `app-*`
 applications, and a synthetic AML screener - 17 programs by three
