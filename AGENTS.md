@@ -69,6 +69,20 @@ against is a fact about this source. A name table is a guess about how other
 people name things; it is opt-in (`--conventions`), ships as
 `packs/en-US.json`, and measured at 1% of values and zero targets.
 
+**Outcome sequences pay on the fault axis, not the payload axis.** Rotating
+record *contents* across a read sequence measured at exactly zero on both
+corpora, for two measured reasons: `MAX_LOOP` already breaks an endless read
+loop, and only 0-2 fields per program under a record area are ever compared
+against a literal, so there is almost no evidence about what a record should
+contain. What pays is one operation returning a non-zero status at *one
+point* in the series and succeeding either side - a fixed world can only
+fail the lookup on every record, and then the record that would have been
+rejected was never read successfully.
+
+Stated plainly: the mechanism needs `FILE STATUS IS`, which is 10 of 29
+CardDemo programs and **1 of 17** elsewhere, and that one was already at
+100%. **It is unproven off-corpus rather than shown to generalise.**
+
 **A budget spent depth-first is a budget spent on one field.** `divergence.
 family` took every candidate of the first free slot before looking at the
 second, so a twelve-member family covered two slots out of thirteen - the

@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from frameladder import cobol, conditions, graph, ir
+from frameladder import cobol, conditions, graph, interpreter, ir
 from frameladder.interpreter import Interpreter, verify
 from frameladder.ladder import build_plan
 
@@ -1897,3 +1897,659 @@ class TestLift(unittest.TestCase):
         second = self._run(source, "DT-MAIN")[2]
         self.assertEqual(sorted(map(str, first.directions_hit)),
                          sorted(map(str, second.directions_hit)))
+
+
+class TestInspect(unittest.TestCase):
+    """INSPECT, against the standard's own rules rather than one corpus."""
+
+    def test_all_counts_every_occurrence(self):
+        items = [{"kind": "ALL", "arg": "A", "lo": 0, "hi": 6}]
+        self.assertEqual(interpreter.inspect_tally("AABAAB", items), [4])
+
+    def test_all_consumes_what_it_matched(self):
+        # 'AA' occurs once in 'AAA': the scan resumes past the match.
+        items = [{"kind": "ALL", "arg": "AA", "lo": 0, "hi": 3}]
+        self.assertEqual(interpreter.inspect_tally("AAA", items), [1])
+
+    def test_leading_stops_at_the_first_miss(self):
+        items = [{"kind": "LEADING", "arg": "A", "lo": 0, "hi": 6}]
+        self.assertEqual(interpreter.inspect_tally("AABAAB", items), [2])
+
+    def test_characters_counts_the_region(self):
+        items = [{"kind": "CHARACTERS", "arg": "", "lo": 2, "hi": 5}]
+        self.assertEqual(interpreter.inspect_tally("ABCDEF", items), [3])
+
+    def test_items_share_one_pass_and_first_match_wins(self):
+        items = [{"kind": "ALL", "arg": "AB", "lo": 0, "hi": 6},
+                 {"kind": "ALL", "arg": "B", "lo": 0, "hi": 6}]
+        # 'ABABBB': AB at 0 and 2, then B at 4 and 5.
+        self.assertEqual(interpreter.inspect_tally("ABABBB", items), [2, 2])
+
+    def test_region_after_missing_delimiter_is_empty(self):
+        self.assertEqual(interpreter._inspect_region("ABCDEF", None, "/"),
+                         (6, 6))
+        self.assertEqual(interpreter._inspect_region("AB/DEF", None, "/"),
+                         (3, 6))
+        self.assertEqual(interpreter._inspect_region("AB/DEF", "/", None),
+                         (0, 2))
+
+    def test_replacing_first_retires_and_leading_stops(self):
+        first = [{"kind": "FIRST", "arg": "B", "to": "Z", "lo": 0, "hi": 6}]
+        self.assertEqual(interpreter.inspect_replace("ABABAB", first), "AZABAB")
+        leading = [{"kind": "LEADING", "arg": "0", "to": " ", "lo": 0, "hi": 6}]
+        self.assertEqual(interpreter.inspect_replace("00A00B", leading),
+                         "  A00B")
+
+    def test_replacement_is_not_rescanned(self):
+        items = [{"kind": "ALL", "arg": "A", "to": "B", "lo": 0, "hi": 3}]
+        self.assertEqual(interpreter.inspect_replace("AAA", items), "BBB")
+
+    def test_converting_maps_by_position(self):
+        self.assertEqual(
+            interpreter.inspect_convert("abcde", "abc", "ABC", 0, 5), "ABCde")
+        # A one-character target - what a figurative constant gives - applies
+        # to every source character.
+        self.assertEqual(
+            interpreter.inspect_convert("abcde", "abc", " ", 0, 5), "   de")
+
+    def test_parse_picks_up_all_three_formats(self):
+        plan = interpreter.parse_inspect(
+            "WS-A TALLYING WS-N FOR LEADING 'A' AFTER INITIAL '/' "
+            "REPLACING FIRST 'B' BY 'Z' BEFORE INITIAL '#'")
+        self.assertEqual(plan["subject"], "WS-A")
+        self.assertEqual(plan["tallying"],
+                         [{"counter": "WS-N", "kind": "LEADING", "arg": "'A'",
+                           "before": None, "after": "'/'"}])
+        self.assertEqual(plan["replacing"],
+                         [{"kind": "FIRST", "arg": "'B'", "to": "'Z'",
+                           "before": "'#'", "after": None}])
+
+    def test_parse_two_counters(self):
+        plan = interpreter.parse_inspect(
+            "WS-A TALLYING N1 FOR ALL 'A' N2 FOR ALL 'B'")
+        self.assertEqual([t["counter"] for t in plan["tallying"]],
+                         ["N1", "N2"])
+
+    def test_counter_is_added_to_not_set(self):
+        source = HEADER + """       01  WS-A PIC X(4) VALUE 'ABAB'.
+       01  WS-N PIC 9(2) VALUE 5.
+       PROCEDURE DIVISION.
+       IN-MAIN.
+           INSPECT WS-A TALLYING WS-N FOR ALL 'A'
+           GOBACK
+           .
+"""
+        prog = program(source)
+        interp = Interpreter(prog, {})
+        interp.run("IN-MAIN")
+        self.assertEqual(interp.state["WS-N"], 7)
+
+    def test_numeric_subject_is_scanned_as_its_bytes(self):
+        source = HEADER + """       01  WS-V PIC 9(5) VALUE 102.
+       01  WS-N PIC 9(2) VALUE 0.
+       PROCEDURE DIVISION.
+       IN-MAIN.
+           INSPECT WS-V TALLYING WS-N FOR ALL '0'
+           GOBACK
+           .
+"""
+        prog = program(source)
+        interp = Interpreter(prog, {})
+        interp.run("IN-MAIN")
+        self.assertEqual(interp.state["WS-N"], 3)
+
+
+class TestSearch(unittest.TestCase):
+    """SEARCH and SEARCH ALL. One site in the corpora and the reason to have
+    a micro-fixture harness: this measures the language."""
+
+    TABLE = HEADER + """       01  WS-T.
+           05  WS-E OCCURS 4 TIMES ASCENDING KEY IS WS-K
+               INDEXED BY IX.
+               10  WS-K PIC 9(2).
+               10  WS-V PIC X(3).
+       01  J PIC 9(2) VALUE 0.
+       PROCEDURE DIVISION.
+       SE-MAIN.
+"""
+
+    def test_key_and_index_clauses_are_read(self):
+        prog = program(self.TABLE + "           GOBACK\n           .\n")
+        self.assertEqual(prog.model.occurs["WS-E"], 4)
+        self.assertEqual(prog.model.keys["WS-E"], [("ASCENDING", "WS-K")])
+        self.assertEqual(prog.model.indexes["WS-E"], ["IX"])
+
+    def test_descending_and_compound_keys_keep_their_order(self):
+        self.assertEqual(
+            cobol.occurs_keys("OCCURS 3 ASCENDING KEY IS K1 K2 "
+                              "DESCENDING KEY IS K3 INDEXED BY IX"),
+            [("ASCENDING", "K1"), ("ASCENDING", "K2"),
+             ("DESCENDING", "K3")])
+        self.assertEqual(
+            cobol.indexed_by("OCCURS 3 INDEXED BY IX IY"), ["IX", "IY"])
+
+    def test_arms_are_parsed_as_decisions(self):
+        prog = program(self.TABLE + """           SEARCH WS-E VARYING J
+              AT END PERFORM SE-NO
+              WHEN WS-K (IX) = 5
+                 PERFORM SE-YES
+              WHEN WS-K (IX) = 9
+                 PERFORM SE-YES
+           END-SEARCH
+           GOBACK
+           .
+       SE-YES.
+           EXIT
+           .
+       SE-NO.
+           EXIT
+           .
+""")
+        stmt = prog.paragraph("SE-MAIN")["statements"][0]
+        self.assertEqual(stmt["type"], "SEARCH")
+        self.assertEqual(stmt["attributes"]["table"], "WS-E")
+        self.assertEqual(stmt["attributes"]["varying"], "J")
+        self.assertFalse(stmt["attributes"]["all"])
+        kinds = [c["type"] for c in stmt["children"]]
+        self.assertEqual(kinds, ["PHRASE", "WHEN", "WHEN"])
+        # Every one of them is a direction a test can go.
+        from frameladder.coverage import branches_of
+        found = [(b.kind, b.condition) for b in branches_of(prog)
+                 if b.paragraph == "SE-MAIN"]
+        self.assertEqual(sorted(found), sorted([("PHRASE", "at_end"),
+                                                ("WHEN", "WS-K (IX) = 5"),
+                                                ("WHEN", "WS-K (IX) = 9")]))
+
+    def _serial(self, start, arm):
+        source = self.TABLE + ("""           SET IX TO %d
+           SEARCH WS-E VARYING J
+              AT END PERFORM SE-NO
+              WHEN %s
+                 PERFORM SE-YES
+           END-SEARCH
+           GOBACK
+           .
+       SE-YES.
+           EXIT
+           .
+       SE-NO.
+           EXIT
+           .
+""" % (start, arm))
+        prog = program(source)
+        interp = Interpreter(prog, {})
+        trace = interp.run("SE-MAIN")
+        return trace.entered_set, interp.state
+
+    def test_serial_advances_the_index(self):
+        entered, state = self._serial(1, "IX = 3")
+        self.assertIn("SE-YES", entered)
+        self.assertEqual(state["IX"], 3)
+        self.assertEqual(state["J"], 3)
+
+    def test_serial_resumes_from_where_the_index_is(self):
+        entered, _state = self._serial(3, "IX = 2")
+        self.assertIn("SE-NO", entered)
+
+    def test_at_end_leaves_the_index_past_the_table(self):
+        entered, state = self._serial(1, "IX = 9")
+        self.assertIn("SE-NO", entered)
+        self.assertNotIn("SE-YES", entered)
+        self.assertEqual(state["IX"], 5)
+
+    def test_search_all_bisects_and_the_key_decides_the_step(self):
+        """The bisection itself, with element reads standing in.
+
+        `SEARCH ALL` has to read the key of the occurrence it is probing, and
+        subscripted element access belongs to the storage model rather than to
+        this verb. The probe is substituted here so the *search* is what is
+        being tested: given a table ordered 2, 4, 6, 8 it must find 6 in two
+        probes and report AT END for 5.
+        """
+        prog = program(self.TABLE + """           SEARCH ALL WS-E
+              AT END PERFORM SE-NO
+              WHEN WS-K (IX) = %d
+                 PERFORM SE-YES
+           END-SEARCH
+           GOBACK
+           .
+       SE-YES.
+           EXIT
+           .
+       SE-NO.
+           EXIT
+           .
+""")
+        del prog
+
+        table = {1: 2, 2: 4, 3: 6, 4: 8}
+
+        def run_for(wanted):
+            fresh = program(self.TABLE + ("""           SEARCH ALL WS-E
+              AT END PERFORM SE-NO
+              WHEN WS-K (IX) = %d
+                 PERFORM SE-YES
+           END-SEARCH
+           GOBACK
+           .
+       SE-YES.
+           EXIT
+           .
+       SE-NO.
+           EXIT
+           .
+""" % wanted))
+            interp = Interpreter(fresh, {})
+            original = interp.value_of
+
+            def value_of(term):
+                if term.kind == "var" and term.name == "WS-K" and term.index:
+                    return table.get(int(interp.state.get("IX", 1)), 0)
+                return original(term)
+
+            interp.value_of = value_of
+            trace = interp.run("SE-MAIN")
+            return trace.entered_set, interp.state, trace
+
+        entered, state, _t = run_for(6)
+        self.assertIn("SE-YES", entered)
+        self.assertEqual(state["IX"], 3)
+        entered, _state, _t = run_for(2)
+        self.assertIn("SE-YES", entered)
+        entered, _state, _t = run_for(5)
+        self.assertIn("SE-NO", entered)
+        self.assertNotIn("SE-YES", entered)
+
+    def test_a_key_step_uses_the_declared_direction(self):
+        prog = program(self.TABLE + "           GOBACK\n           .\n")
+        interp = Interpreter(prog, {"WS-K": 4})
+        self.assertEqual(interp._key_step("WS-K = 9", ["WS-K"],
+                                          {"WS-K": "ASCENDING"}), 1)
+        self.assertEqual(interp._key_step("WS-K = 1", ["WS-K"],
+                                          {"WS-K": "ASCENDING"}), -1)
+        self.assertEqual(interp._key_step("WS-K = 9", ["WS-K"],
+                                          {"WS-K": "DESCENDING"}), -1)
+        # Nothing to bisect on is reported, not guessed at.
+        self.assertEqual(interp._key_step("WS-V = 'X'", ["WS-K"],
+                                          {"WS-K": "ASCENDING"}), 0)
+
+    def test_a_compound_key_steps_on_the_most_significant_difference(self):
+        prog = program(self.TABLE + "           GOBACK\n           .\n")
+        keys, way = ["K1", "K2"], {"K1": "ASCENDING", "K2": "ASCENDING"}
+        interp = Interpreter(prog, {"K1": 4, "K2": 9})
+        # K1 already matches, so K2 decides.
+        self.assertEqual(interp._key_step("K1 = 4 AND K2 = 2", keys, way), -1)
+        # K1 does not, so K2 is not consulted however it compares.
+        self.assertEqual(interp._key_step("K1 = 7 AND K2 = 2", keys, way), 1)
+        # The order is the declaration's, not the condition's.
+        self.assertEqual(interp._key_step("K2 = 2 AND K1 = 7", keys, way), 1)
+
+    def test_the_side_the_key_is_on_does_not_change_the_step(self):
+        prog = program(self.TABLE + "           GOBACK\n           .\n")
+        interp = Interpreter(prog, {"WS-K": 4})
+        self.assertEqual(interp._key_step("9 = WS-K", ["WS-K"],
+                                          {"WS-K": "ASCENDING"}), 1)
+
+
+class TestOutcomeSequences(unittest.TestCase):
+    """An operation returns a sequence, and the sequence is derived."""
+
+    SOURCE = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INF
+           ORGANIZATION IS SEQUENTIAL
+           FILE STATUS IS IN-STATUS.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-AREA PIC X(12).
+       WORKING-STORAGE SECTION.
+       01  IN-STATUS PIC X(2) VALUE '00'.
+       01  WS-REC.
+           05  WS-KEY  PIC 9(4).
+           05  WS-KIND PIC X(1).
+           05  WS-REST PIC X(7).
+       01  WS-PREV PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       SQ-MAIN.
+           OPEN INPUT IN-FILE
+           PERFORM UNTIL IN-STATUS = '10'
+              READ IN-FILE INTO WS-REC
+              IF IN-STATUS = '00'
+                 IF WS-KIND = 'X'
+                    PERFORM SQ-SPECIAL
+                 END-IF
+                 IF WS-KEY NOT = WS-PREV
+                    PERFORM SQ-BREAK
+                 END-IF
+                 MOVE WS-KEY TO WS-PREV
+              END-IF
+           END-PERFORM
+           CLOSE IN-FILE
+           GOBACK
+           .
+       SQ-SPECIAL.
+           EXIT
+           .
+       SQ-BREAK.
+           EXIT
+           .
+"""
+
+    def _worlds(self, **kw):
+        from frameladder.ladder import analyse
+        from frameladder import sequences
+        prog = program(self.SOURCE)
+        _g, prov = analyse(prog)
+        return prog, prov, sequences.sequence_worlds(prog, prov,
+                                                     prov.literals, **kw)
+
+    def test_the_read_target_is_the_area_named_in_the_statement(self):
+        from frameladder import sequences
+        prog, prov, _w = self._worlds()
+        self.assertEqual(sequences.read_targets(prog, "IN-FILE"), ["WS-REC"])
+        self.assertIn(("WS-REC", "WS-REC"),
+                      sequences.fill_layouts(prog, prov, "IN-FILE"))
+
+    def test_a_sequence_ends_in_end_of_file(self):
+        _p, _prov, worlds = self._worlds(lengths=(3,))
+        self.assertEqual(len(worlds), 1)
+        entries = worlds[0]["stubs"]["READ:IN-FILE"]
+        self.assertEqual(len(entries), 3)
+        self.assertTrue(all(e["set"]["IN-STATUS"] == "00" for e in entries))
+        self.assertEqual(worlds[0]["terminals"]["READ:IN-FILE"],
+                         {"IN-STATUS": "10"})
+
+    def test_consecutive_records_differ(self):
+        _p, _prov, worlds = self._worlds(lengths=(3,))
+        images = [e["set"]["WS-REC"]
+                  for e in worlds[0]["stubs"]["READ:IN-FILE"]]
+        self.assertEqual(len(set(images)), 3)
+
+    def test_the_program_sees_a_control_break_and_an_end(self):
+        prog, _prov, worlds = self._worlds(lengths=(3,))
+        interp = Interpreter(prog, {}, stubs=worlds[0]["stubs"],
+                             terminals=worlds[0]["terminals"],
+                             defaults={"OPEN-INPUT:IN-FILE":
+                                       {"IN-STATUS": "00"}})
+        trace = interp.run("SQ-MAIN")
+        self.assertEqual(interp.calls["READ:IN-FILE"], 4)
+        self.assertIn("SQ-BREAK", trace.entered_set)
+        results = {}
+        for event in trace.guards:
+            results.setdefault(event.condition, set()).add(bool(event.result))
+        # Records, then end of file, in one run: a world that names one status
+        # per operation can produce either direction but never both.
+        self.assertEqual(results["IN-STATUS = '00'"], {True, False})
+        # The payload reached a decision: 'X' is a value the program names, so
+        # the rotation puts it on a record and the special path is entered.
+        self.assertIn("SQ-SPECIAL", trace.entered_set)
+
+    def test_a_fault_lands_on_the_call_it_names(self):
+        from frameladder.ladder import analyse
+        from frameladder import sequences
+        prog = program(self.SOURCE)
+        _g, prov = analyse(prog)
+        worlds = sequences.fault_worlds(prog, prov, prov.literals, length=3,
+                                        codes=2)
+        named = {w["name"]: w for w in worlds}
+        self.assertIn("READ:IN-FILE=23@2", named)
+        entries = named["READ:IN-FILE=23@2"]["stubs"]["READ:IN-FILE"]
+        self.assertEqual([e["set"]["IN-STATUS"] for e in entries],
+                         ["00", "23", "00"])
+        # The fault is transient: the operation succeeds again afterwards, so
+        # what the program does with the later records stays reachable.
+        self.assertEqual(named["READ:IN-FILE=23@2"]["terminals"]
+                         ["READ:IN-FILE"], {"IN-STATUS": "10"})
+
+    def test_an_operation_issued_once_gets_no_second_position(self):
+        from frameladder.ladder import analyse
+        from frameladder import sequences
+        prog = program(self.SOURCE)
+        _g, prov = analyse(prog)
+        names = {w["name"] for w in
+                 sequences.fault_worlds(prog, prov, prov.literals, codes=1)}
+        self.assertTrue(any(n.startswith("OPEN-INPUT:IN-FILE") for n in names))
+        self.assertFalse(any(n.startswith("OPEN-INPUT:IN-FILE=") and
+                             n.endswith("@2") for n in names))
+
+    def test_an_operation_named_after_its_record_is_still_that_file(self):
+        """`WRITE ws-record` names the record, which the standard requires.
+
+        The operation's key is therefore `WRITE:<record>` while the status
+        field belongs to the file, and nothing joined the two: the fixed
+        worlds build `WRITE:<file>` keys that match no statement, so no world
+        could make a WRITE fail and every `IF status NOT = '00'` after one
+        had a single reachable direction.
+        """
+        from frameladder.ladder import analyse
+        from frameladder import sequences
+        source = self.SOURCE.replace(
+            "           CLOSE IN-FILE",
+            "           WRITE IN-AREA\n           CLOSE IN-FILE")
+        prog = program(source)
+        _g, prov = analyse(prog)
+        self.assertIn("WRITE:IN-AREA",
+                      sequences.file_operations(prog).get("IN-FILE", []))
+        names = {w["name"] for w in
+                 sequences.fault_worlds(prog, prov, prov.literals, codes=1)}
+        self.assertTrue(any(n.startswith("WRITE:IN-AREA=") for n in names))
+
+    def test_sequences_are_the_same_on_every_run(self):
+        first = self._worlds(lengths=(1, 2, 3))[2]
+        second = self._worlds(lengths=(1, 2, 3))[2]
+        self.assertEqual(repr(first), repr(second))
+
+    def test_a_program_with_no_files_gets_no_sequences(self):
+        from frameladder.ladder import analyse
+        from frameladder import sequences
+        prog = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       NF-MAIN.
+           GOBACK
+           .
+""")
+        _g, prov = analyse(prog)
+        self.assertEqual(sequences.sequence_worlds(prog, prov, prov.literals),
+                         [])
+        self.assertEqual(sequences.fault_worlds(prog, prov, prov.literals), [])
+
+
+class TestSequencesOffCorpus(unittest.TestCase):
+    """The sequence mechanism on a program neither corpus author wrote.
+
+    It has to be checked somewhere other than where it was built, and the
+    unrelated corpus cannot do it: only one of its seventeen programs declares
+    a `FILE STATUS` at all and that one was already at 100%. So the check is
+    a program written here, in a shape the batch corpus does not use - an
+    indexed file read by key with `INVALID KEY`, a `REWRITE` that can be
+    rejected, and a counter that only a second record can move.
+    """
+
+    SOURCE = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT MASTER-FILE ASSIGN TO MSTR
+           ORGANIZATION IS INDEXED
+           ACCESS MODE IS RANDOM
+           RECORD KEY IS MST-KEY
+           FILE STATUS IS MST-STATUS.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  MASTER-FILE.
+       01  MST-AREA.
+           05  MST-KEY  PIC 9(4).
+           05  MST-BODY PIC X(6).
+       WORKING-STORAGE SECTION.
+       01  MST-STATUS PIC X(2) VALUE '00'.
+       01  WS-SEEN    PIC 9(3) VALUE 0.
+       01  WS-DONE    PIC X    VALUE 'N'.
+           88  ALL-DONE VALUE 'Y'.
+       PROCEDURE DIVISION.
+       OC-MAIN.
+           OPEN I-O MASTER-FILE
+           IF MST-STATUS NOT = '00'
+              PERFORM OC-OPEN-FAILED
+              GOBACK
+           END-IF
+           PERFORM UNTIL ALL-DONE
+              READ MASTER-FILE
+                 INVALID KEY PERFORM OC-NOT-FOUND
+                 NOT INVALID KEY PERFORM OC-GOT-ONE
+              END-READ
+              IF MST-STATUS = '10'
+                 SET ALL-DONE TO TRUE
+              END-IF
+           END-PERFORM
+           IF WS-SEEN = 2
+              PERFORM OC-EXACTLY-TWO
+           END-IF
+           CLOSE MASTER-FILE
+           GOBACK
+           .
+       OC-GOT-ONE.
+           ADD 1 TO WS-SEEN
+           REWRITE MST-AREA
+           IF MST-STATUS NOT = '00'
+              PERFORM OC-REWRITE-FAILED
+           END-IF
+           .
+       OC-NOT-FOUND.
+           EXIT
+           .
+       OC-OPEN-FAILED.
+           EXIT
+           .
+       OC-REWRITE-FAILED.
+           EXIT
+           .
+       OC-EXACTLY-TWO.
+           EXIT
+           .
+"""
+
+    def _cover(self, sequences_on):
+        from frameladder.conformance_defaults import io_defaults, WORLDS
+        from frameladder.coverage import accumulate
+        from frameladder.ladder import analyse
+        from frameladder import sequences as seq
+        prog = program(self.SOURCE)
+        _g, prov = analyse(prog)
+        worlds = []
+        if sequences_on:
+            worlds = (seq.sequence_worlds(prog, prov, prov.literals)
+                      + seq.fault_worlds(prog, prov, prov.literals))
+        traces = []
+        for world in WORLDS:
+            interp = Interpreter(prog, {}, defaults=io_defaults(prog, world))
+            traces.append(interp.run("OC-MAIN"))
+        for world in worlds:
+            interp = Interpreter(prog, {}, stubs=world["stubs"],
+                                 terminals=world["terminals"],
+                                 defaults=io_defaults(prog, world["world"]))
+            traces.append(interp.run("OC-MAIN"))
+        return prog, accumulate(prog, traces)
+
+    def test_the_fixed_worlds_leave_the_error_paths_dark(self):
+        _prog, cov = self._cover(False)
+        # "exactly two records" is not a world a fixed outcome can describe -
+        # one status per operation gives none, one, or as many as the loop
+        # budget allows - and no fixed world names a record-not-found status.
+        for dark in ("OC-EXACTLY-TWO", "OC-NOT-FOUND"):
+            self.assertNotIn(dark, cov.paragraphs_hit)
+
+    def test_sequences_reach_them(self):
+        _prog, cov = self._cover(True)
+        # A record, another, then end of file: only a sequence can say "two".
+        self.assertIn("OC-EXACTLY-TWO", cov.paragraphs_hit)
+        # A failure on one call of an operation that succeeds on the others.
+        self.assertIn("OC-REWRITE-FAILED", cov.paragraphs_hit)
+        # INVALID KEY is a status the platform fixes, not a name we guessed.
+        self.assertIn("OC-NOT-FOUND", cov.paragraphs_hit)
+        self.assertIn("OC-OPEN-FAILED", cov.paragraphs_hit)
+
+    def test_sequences_strictly_add(self):
+        _p, without = self._cover(False)
+        _q, with_them = self._cover(True)
+        self.assertTrue(without.directions_hit < with_them.directions_hit)
+
+
+class TestConditionalPhrases(unittest.TestCase):
+    """A phrase is found where it begins, not peeled off the end.
+
+    Peeling works for the first phrase of a statement and silently loses the
+    second, because the statement inside the first handler runs to the next
+    verb and swallows the keywords on its way.
+    """
+
+    def _statement(self, body: str):
+        prog = program(HEADER + """       01  A PIC 9(3) VALUE 1.
+       PROCEDURE DIVISION.
+       CP-MAIN.
+""" + body + """           GOBACK
+           .
+       CP-YES.
+           EXIT
+           .
+       CP-NO.
+           EXIT
+           .
+""")
+        return prog, prog.paragraph("CP-MAIN")["statements"][0]
+
+    def test_the_second_phrase_survives_a_perform(self):
+        _p, stmt = self._statement("""           ADD 1 TO A
+              ON SIZE ERROR PERFORM CP-NO
+              NOT ON SIZE ERROR PERFORM CP-YES
+           END-ADD
+""")
+        arms = [(c["attributes"]["phrase"],
+                 [g["attributes"].get("target") for g in c["children"]])
+                for c in stmt["children"] if c["type"] == "PHRASE"]
+        self.assertEqual(arms, [("on_size_error", ["CP-NO"]),
+                                ("not_on_size_error", ["CP-YES"])])
+
+    def test_a_condition_keeps_its_own_not(self):
+        # `IF A NOT = 1` must not be cut at the NOT: conditions are read with
+        # the phrase scan off, and this is what makes that safe.
+        _p, stmt = self._statement("""           IF A NOT = 1
+              PERFORM CP-NO
+           END-IF
+""")
+        self.assertEqual(stmt["attributes"]["condition"], "A NOT = 1")
+
+    def test_the_handler_the_outcome_selects_is_the_one_that_runs(self):
+        prog, _s = self._statement("""           ADD 1 TO A
+              ON SIZE ERROR PERFORM CP-NO
+              NOT ON SIZE ERROR PERFORM CP-YES
+           END-ADD
+""")
+        interp = Interpreter(prog, {})
+        trace = interp.run("CP-MAIN")
+        self.assertIn("CP-YES", trace.entered_set)
+        self.assertNotIn("CP-NO", trace.entered_set)
+        # Both directions are in the denominator, so the arm that did not run
+        # has to be recorded as a decision that went the other way.
+        phrases = {(g.condition, g.result) for g in trace.guards
+                   if g.kind == "PHRASE"}
+        self.assertEqual(phrases, {("on_size_error", False),
+                                   ("not_on_size_error", True)})
+
+    def test_a_statement_that_ends_the_source_does_not_crash(self):
+        # The phrase scan looks one token past the statement; at the end of a
+        # paragraph there is no such token. Parsing must not raise - a parse
+        # that raises drops the whole program out of every measurement, which
+        # is worse than any wrong answer because it looks like a smaller
+        # corpus rather than like a bug.
+        prog = program(HEADER + """       01  A PIC 9 VALUE 1.
+       PROCEDURE DIVISION.
+       CP-TAIL.
+           DISPLAY A
+""")
+        self.assertEqual(prog.paragraph("CP-TAIL")["statements"][0]["type"],
+                         "DISPLAY")

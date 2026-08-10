@@ -291,6 +291,185 @@ CASES = {
            GOBACK.
 """),
 
+# The rest of INSPECT. TALLYING is only one of three formats and `ALL` only
+# one of three arguments; a program that counts blanks with CHARACTERS, strips
+# a prefix with LEADING or blanks a field with CONVERTING is doing something a
+# later condition turns on, and each of those is a separate way to get it
+# wrong. BEFORE/AFTER INITIAL is where the standard is least obvious: the
+# region is *empty* when an AFTER delimiter is absent, rather than the whole
+# item.
+"inspect_tallying_leading": prog(
+"""       01 WS-A PIC X(6) VALUE 'AABAAB'.
+       01 WS-N PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-A TALLYING WS-N FOR LEADING 'A'
+           IF WS-N = 2
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_tallying_characters": prog(
+"""       01 WS-A PIC X(6) VALUE 'AB    '.
+       01 WS-N PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-A TALLYING WS-N FOR CHARACTERS
+           IF WS-N = 6
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_tallying_after": prog(
+"""       01 WS-A PIC X(7) VALUE 'AA/AAAB'.
+       01 WS-N PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-A TALLYING WS-N FOR ALL 'A' AFTER INITIAL '/'
+           IF WS-N = 3
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_tallying_before": prog(
+"""       01 WS-A PIC X(7) VALUE 'AA/AAAB'.
+       01 WS-N PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-A TALLYING WS-N FOR ALL 'A' BEFORE INITIAL '/'
+           IF WS-N = 2
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# The counter is not initialised by INSPECT: two statements accumulate.
+"inspect_tallying_accumulates": prog(
+"""       01 WS-A PIC X(4) VALUE 'ABAB'.
+       01 WS-N PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-A TALLYING WS-N FOR ALL 'A'
+           INSPECT WS-A TALLYING WS-N FOR ALL 'B'
+           IF WS-N = 4
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# Overlapping arguments are consumed, not re-examined: 'AA' occurs once in
+# 'AAA', because the scan resumes past what it matched.
+"inspect_tallying_overlap": prog(
+"""       01 WS-A PIC X(3) VALUE 'AAA'.
+       01 WS-N PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-A TALLYING WS-N FOR ALL 'AA'
+           IF WS-N = 1
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_replacing_all": prog(
+"""       01 WS-A PIC X(6) VALUE 'AABAAB'.
+""",
+"""           INSPECT WS-A REPLACING ALL 'A' BY 'X'
+           IF WS-A = 'XXBXXB'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_replacing_leading": prog(
+"""       01 WS-A PIC X(6) VALUE '00A00B'.
+""",
+"""           INSPECT WS-A REPLACING LEADING '0' BY ' '
+           IF WS-A = '  A00B'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_replacing_first": prog(
+"""       01 WS-A PIC X(6) VALUE 'ABABAB'.
+""",
+"""           INSPECT WS-A REPLACING FIRST 'B' BY 'Z'
+           IF WS-A = 'AZABAB'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_replacing_characters_after": prog(
+"""       01 WS-A PIC X(6) VALUE 'AB/CDE'.
+""",
+"""           INSPECT WS-A REPLACING CHARACTERS BY '*' AFTER INITIAL '/'
+           IF WS-A = 'AB/***'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"inspect_converting": prog(
+"""       01 WS-A PIC X(5) VALUE 'abcde'.
+""",
+"""           INSPECT WS-A CONVERTING 'abc' TO 'ABC'
+           IF WS-A = 'ABCde'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A numeric item is scanned as its bytes, zero-filled on the left. Reading it
+# as the decimal text of its value counts a different number of zeros.
+"inspect_numeric_subject": prog(
+"""       01 WS-N PIC 9(5) VALUE 102.
+       01 WS-C PIC 9(2) VALUE 0.
+""",
+"""           INSPECT WS-N TALLYING WS-C FOR ALL '0'
+           IF WS-C = 3
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A statement inside a conditional handler must not run on past the phrase
+# that ends the handler. `PERFORM NO-P NOT ON SIZE ERROR` is one PERFORM and
+# one phrase; read as a PERFORM of five words the second phrase disappears and
+# everything it guarded moves into the first arm, so both handlers fire on the
+# same outcome. Every `READ ... AT END ... NOT AT END ...` has this shape.
+"two_phrases_after_a_statement": prog(
+"""       01 A PIC 9(3) VALUE 1.
+""",
+"""           ADD 1 TO A
+              ON SIZE ERROR PERFORM NO-P
+              NOT ON SIZE ERROR PERFORM YES-P
+           END-ADD
+           GOBACK.
+"""),
+
 "alnum_pad_compare": prog(
 """       01 WS-A PIC X(5) VALUE 'AB'.
 """,
@@ -585,6 +764,126 @@ CASES = {
               WHEN WS-K(IX) = 05
                  PERFORM YES-P
            END-SEARCH
+           GOBACK.
+"""),
+
+# SEARCH has one site in these corpora and will measure at zero on them. The
+# fixtures are the point: they measure the language rather than the sample,
+# and an estate that uses table lookups uses this verb heavily. Each of these
+# isolates one rule - where the scan starts, that it advances, that AT END is
+# the arm taken when nothing matched, that VARYING steps with the index, that
+# arms are tried in order - so a failure names which rule is wrong.
+"search_serial_advances": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 4 TIMES INDEXED BY IX.
+""",
+"""           SET IX TO 1
+           SEARCH WS-E
+              AT END PERFORM NO-P
+              WHEN IX = 3
+                 PERFORM YES-P
+           END-SEARCH
+           GOBACK.
+"""),
+
+# The scan starts where the index is, not at one. A program that has already
+# consumed the first two entries resumes; restarting would loop for ever.
+"search_serial_resumes": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 4 TIMES INDEXED BY IX.
+""",
+"""           SET IX TO 3
+           SEARCH WS-E
+              AT END PERFORM NO-P
+              WHEN IX = 2
+                 PERFORM NO-P
+              WHEN IX = 4
+                 PERFORM YES-P
+           END-SEARCH
+           GOBACK.
+"""),
+
+"search_serial_at_end": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 3 TIMES INDEXED BY IX.
+""",
+"""           SET IX TO 1
+           SEARCH WS-E
+              AT END PERFORM YES-P
+              WHEN IX = 9
+                 PERFORM NO-P
+           END-SEARCH
+           GOBACK.
+"""),
+
+# Arms are compared in the order written and the first match wins.
+"search_serial_arm_order": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 4 TIMES INDEXED BY IX.
+""",
+"""           SET IX TO 1
+           SEARCH WS-E
+              AT END PERFORM NO-P
+              WHEN IX = 2
+                 PERFORM YES-P
+              WHEN IX = 2
+                 PERFORM NO-P
+           END-SEARCH
+           GOBACK.
+"""),
+
+# AT END is optional. Without it a search that matches nothing simply falls
+# through to the next statement.
+"search_no_at_end": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 3 TIMES INDEXED BY IX.
+""",
+"""           SET IX TO 1
+           SEARCH WS-E
+              WHEN IX = 9
+                 PERFORM NO-P
+           END-SEARCH
+           PERFORM YES-P
+           GOBACK.
+"""),
+
+"search_varying": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 4 TIMES INDEXED BY IX.
+       01 J PIC 9(2) VALUE 0.
+""",
+"""           SET IX TO 1
+           SEARCH WS-E VARYING J
+              AT END PERFORM NO-P
+              WHEN IX = 3
+                 CONTINUE
+           END-SEARCH
+           IF J = 3
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# After a search that found nothing the index sits one past the table, which
+# is what a program testing it afterwards relies on.
+"search_index_after_at_end": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 3 TIMES INDEXED BY IX.
+       01 J PIC 9(2) VALUE 0.
+""",
+"""           SET IX TO 1
+           SEARCH WS-E VARYING J
+              AT END CONTINUE
+              WHEN IX = 9
+                 CONTINUE
+           END-SEARCH
+           IF J = 4
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
            GOBACK.
 """),
 

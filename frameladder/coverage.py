@@ -49,7 +49,11 @@ def branches_of(program) -> list:
         if kind == "IF":
             out.append(Branch(para, line, "IF", attrs.get("condition", ""),
                               stmt.get("ordinal", -1)))
-        elif kind == "EVALUATE":
+        elif kind in ("EVALUATE", "SEARCH"):
+            # A SEARCH arm is a decision in exactly the sense an EVALUATE arm
+            # is: it was compared, and it either matched or it did not. Its
+            # AT END is picked up by the PHRASE case below, since the parser
+            # gives it the same shape a READ's does.
             for arm in stmt.get("children") or []:
                 if arm.get("type") == "WHEN":
                     out.append(Branch(para, arm.get("line_start", line), "WHEN",

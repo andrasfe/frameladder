@@ -379,6 +379,25 @@ def cmd_coverage(args):
             ordered = ordered + [other]
         pool[name] = ordered
 
+    # An operation returns a sequence, and until now no world could say so:
+    # every READ got one status for the whole run, so every iteration of a
+    # read loop processed the same record. These worlds deliver N records with
+    # rotating payloads and then end-of-file, which is the shape a batch
+    # program is written against.
+    from .sequences import sequence_worlds, fault_worlds
+    sequences = []
+    if getattr(args, "sequences", 0):
+        sequences = sequence_worlds(
+            program, prov, prov.literals,
+            lengths=tuple(range(1, args.sequences + 1)))
+        # "The third record is the one that fails" is an outcome list and
+        # nothing else can express it: a world that names one status per
+        # operation can only make the lookup fail on every record, which is a
+        # different route through the program.
+        sequences += fault_worlds(program, prov, prov.literals,
+                                  length=args.sequences,
+                                  codes=args.fault_codes)
+
     traces = []
     lift_stats = None
     # Every derived plan is a place the frontier search can start from, and
@@ -388,6 +407,13 @@ def cmd_coverage(args):
     # cheap - the plans are being built anyway - and it is the only way the
     # search can begin inside a world where a file has already ended.
     lift_seeds = [({}, w, None, None) for w in WORLDS]
+    # A sequence is a seed as much as a plan is: it puts the run somewhere no
+    # entry state can reach on its own - past the end of a file that returned
+    # three records first - and the frontier search then solves the guards it
+    # finds there.
+    for world in sequences:
+        lift_seeds.append(({}, world["world"], world["stubs"],
+                           world["terminals"]))
 
     if args.lift_only:
         args.branches = False
@@ -446,6 +472,21 @@ def cmd_coverage(args):
             interp = Interpreter(program, state,
                                  defaults=io_defaults(program,
                                                       WORLDS[_ % len(WORLDS)]))
+            try:
+                traces.append(interp.run(entry))
+            except Exception:                                # noqa: BLE001
+                continue
+
+    # The sequences, run on their own. A seed only pays off if the frontier
+    # search is on; these runs are what makes the mechanism measurable
+    # without it, and they are the whole of what a plain `coverage` gains.
+    for world in sequences:
+        states = [{}] + [{n: _rng.choice(v) for n, v in pool.items()}
+                         for _ in range(max(0, args.overlays))]
+        for state in states:
+            interp = Interpreter(program, state, stubs=world["stubs"],
+                                 terminals=world["terminals"],
+                                 defaults=io_defaults(program, world["world"]))
             try:
                 traces.append(interp.run(entry))
             except Exception:                                # noqa: BLE001
@@ -984,6 +1025,16 @@ def build_parser():
                     help="candidate states offered per unreached direction")
     cv.add_argument("--lift-only", action="store_true",
                     help="run only the frontier search, for measuring it")
+    cv.add_argument("--sequences", type=int, default=3, metavar="N",
+                    help="derive outcome sequences up to N records long for "
+                         "every file the program gives a FILE STATUS: N "
+                         "records with rotating payloads, then end-of-file. "
+                         "0 disables, and the fixed-outcome worlds remain")
+    cv.add_argument("--fault-codes", type=int, default=3, metavar="N",
+                    help="within a sequence, also fail each operation at one "
+                         "point with each of its N most-likely statuses - the "
+                         "ones the program tests for first, then the "
+                         "platform's own. 0 keeps the sequences clean")
     cv.add_argument("--limit", type=int, default=12)
     cv.set_defaults(func=cmd_coverage)
 

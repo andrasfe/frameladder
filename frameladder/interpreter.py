@@ -133,6 +133,267 @@ def _date_of_integer(days: int) -> int:
     return d.year * 10000 + d.month * 100 + d.day
 
 
+# --------------------------------------------------------------------------
+# INSPECT
+# --------------------------------------------------------------------------
+#
+# INSPECT is the language's only string-scanning verb, and all three of its
+# formats produce a value some later condition turns on: TALLYING writes a
+# count, REPLACING and CONVERTING rewrite the item in place.  Skipped, the
+# counter keeps whatever it held - usually zero, because the program has just
+# initialised it - so `IF WS-N > 0` is false however the data is shaped and
+# that direction cannot be reached by any input.
+#
+# The three functions below are the scan itself, kept free of the interpreter
+# so they can be tested against the standard's own examples.  All of them work
+# on the *bytes of the item*, which is why the caller pads to the declared
+# width first: `INSPECT WS-A TALLYING N FOR ALL SPACE` on a PIC X(6) holding
+# 'AB' counts four, and counts nothing at all if the trailing spaces were
+# dropped on the way in.
+
+_INSPECT_SECTIONS = ("TALLYING", "REPLACING", "CONVERTING")
+
+
+def _inspect_region(text: str, before, after) -> tuple:
+    """The span of ``text`` one item is allowed to examine.
+
+    ``AFTER INITIAL d`` starts the span just past the first ``d``; ``BEFORE
+    INITIAL d`` ends it at the first ``d`` from there on.  A delimiter that
+    does not occur makes an AFTER span empty and leaves a BEFORE span whole,
+    which is what the standard says and is the opposite of what "ignore the
+    phrase" would do.
+    """
+    lo, hi = 0, len(text)
+    if after is not None:
+        found = text.find(after) if after else -1
+        lo = found + len(after) if found >= 0 else len(text)
+    if before is not None:
+        found = text.find(before, lo) if before else -1
+        hi = found if found >= 0 else hi
+    return lo, max(lo, min(hi, len(text)))
+
+
+def inspect_tally(text: str, items: list) -> list:
+    """Counts for each TALLYING item, in one left-to-right pass.
+
+    The items share the pass: at every position they are compared in the
+    order written and the *first* match wins, then the cursor advances past
+    what it matched.  Counting each item independently would double-count
+    overlapping arguments, and `ALL 'AA'` over 'AAA' is one occurrence rather
+    than two for exactly this reason.
+
+    ``LEADING`` stops for good at the first position in its region where it
+    does not match, which is what makes it different from ``ALL``.
+    """
+    counts = [0] * len(items)
+    alive = [True] * len(items)
+    position, size = 0, len(text)
+    while position < size:
+        matched = False
+        for index, item in enumerate(items):
+            lo, hi = item["lo"], item["hi"]
+            if not lo <= position < hi:
+                continue
+            if item["kind"] == "CHARACTERS":
+                counts[index] += 1
+                position += 1
+                matched = True
+                break
+            if not alive[index]:
+                continue
+            arg = item["arg"]
+            if arg and position + len(arg) <= hi \
+                    and text[position:position + len(arg)] == arg:
+                counts[index] += 1
+                position += len(arg)
+                matched = True
+                break
+            if item["kind"] == "LEADING":
+                alive[index] = False
+        if not matched:
+            position += 1
+    return counts
+
+
+def inspect_replace(text: str, items: list) -> str:
+    """The item after REPLACING has run.
+
+    Matching is against the original bytes and writing is to a copy: a
+    replacement never becomes part of a later comparison, because the cursor
+    has already moved past it.  ``FIRST`` retires after one hit and
+    ``LEADING`` at its first miss.
+    """
+    out = list(text)
+    alive = [True] * len(items)
+    position, size = 0, len(text)
+    while position < size:
+        matched = False
+        for index, item in enumerate(items):
+            lo, hi = item["lo"], item["hi"]
+            if not lo <= position < hi:
+                continue
+            if item["kind"] == "CHARACTERS":
+                replacement = item["to"] or " "
+                out[position] = replacement[0]
+                position += 1
+                matched = True
+                break
+            if not alive[index]:
+                continue
+            arg = item["arg"]
+            if arg and position + len(arg) <= hi \
+                    and text[position:position + len(arg)] == arg:
+                replacement = (item["to"] or "")
+                # The standard requires the two to be the same size; a source
+                # that disagrees is padded rather than allowed to shift every
+                # byte after it.
+                replacement = replacement.ljust(len(arg))[:len(arg)]
+                out[position:position + len(arg)] = list(replacement)
+                if item["kind"] == "FIRST":
+                    alive[index] = False
+                position += len(arg)
+                matched = True
+                break
+            if item["kind"] == "LEADING":
+                alive[index] = False
+        if not matched:
+            position += 1
+    return "".join(out)
+
+
+def inspect_convert(text: str, source: str, target: str, lo: int, hi: int) -> str:
+    """CONVERTING is a character translation over the region.
+
+    A single-character target - which is what a figurative constant gives -
+    stands for every position, so ``CONVERTING 'ABC' TO SPACES`` blanks all
+    three.
+    """
+    if not source:
+        return text
+    table = {}
+    for index, ch in enumerate(source):
+        if index < len(target):
+            table.setdefault(ch, target[index])
+        elif target:
+            table.setdefault(ch, target[-1])
+    out = list(text)
+    for position in range(max(0, lo), min(hi, len(text))):
+        if out[position] in table:
+            out[position] = table[out[position]]
+    return "".join(out)
+
+
+def _inspect_words(body: str) -> list:
+    """Split an INSPECT body into words, keeping quoted literals whole."""
+    return re.findall(r"'[^']*'|\"[^\"]*\"|[^\s]+", body or "")
+
+
+def _inspect_region_words(words: list, at: int) -> tuple:
+    """Read any BEFORE/AFTER phrases starting at ``at``.
+
+    Returns ``(before, after, next-index)`` with the delimiters as raw
+    operand text.
+    """
+    before = after = None
+    while at < len(words) and words[at].upper() in ("BEFORE", "AFTER"):
+        sense = words[at].upper()
+        at += 1
+        if at < len(words) and words[at].upper() == "INITIAL":
+            at += 1
+        if at >= len(words):
+            break
+        if sense == "BEFORE":
+            before = words[at]
+        else:
+            after = words[at]
+        at += 1
+    return before, after, at
+
+
+def parse_inspect(body: str):
+    """The clauses of one INSPECT, as raw operand text.
+
+    Values are left unresolved because an operand may be an identifier, and
+    what it holds is a question for the run rather than for the parse.
+    """
+    words = _inspect_words(body)
+    if not words:
+        return None
+    at, subject = 0, []
+    while at < len(words) and words[at].upper() not in _INSPECT_SECTIONS:
+        subject.append(words[at])
+        at += 1
+    if not subject:
+        return None
+    plan = {"subject": " ".join(subject), "tallying": [], "replacing": [],
+            "converting": None}
+    while at < len(words):
+        section = words[at].upper()
+        at += 1
+        if section == "TALLYING":
+            counter = None
+            while at < len(words) and words[at].upper() not in _INSPECT_SECTIONS:
+                word = words[at].upper()
+                if word in ("ALL", "LEADING", "CHARACTERS"):
+                    arg = None
+                    at += 1
+                    if word != "CHARACTERS":
+                        if at >= len(words):
+                            break
+                        arg = words[at]
+                        at += 1
+                    before, after, at = _inspect_region_words(words, at)
+                    if counter is not None:
+                        plan["tallying"].append(
+                            {"counter": counter, "kind": word, "arg": arg,
+                             "before": before, "after": after})
+                    continue
+                if word == "FOR":
+                    at += 1
+                    continue
+                counter = words[at]
+                at += 1
+        elif section == "REPLACING":
+            while at < len(words) and words[at].upper() not in _INSPECT_SECTIONS:
+                word = words[at].upper()
+                if word not in ("ALL", "LEADING", "FIRST", "CHARACTERS"):
+                    at += 1
+                    continue
+                at += 1
+                arg = None
+                if word != "CHARACTERS":
+                    if at >= len(words):
+                        break
+                    arg = words[at]
+                    at += 1
+                if at < len(words) and words[at].upper() == "BY":
+                    at += 1
+                if at >= len(words):
+                    break
+                to = words[at]
+                at += 1
+                before, after, at = _inspect_region_words(words, at)
+                plan["replacing"].append({"kind": word, "arg": arg, "to": to,
+                                          "before": before, "after": after})
+        elif section == "CONVERTING":
+            if at >= len(words):
+                break
+            source = words[at]
+            at += 1
+            if at < len(words) and words[at].upper() == "TO":
+                at += 1
+            if at >= len(words):
+                break
+            target = words[at]
+            at += 1
+            before, after, at = _inspect_region_words(words, at)
+            plan["converting"] = {"from": source, "to": target,
+                                  "before": before, "after": after}
+        else:
+            at += 1
+    return plan
+
+
 class _Goto(Exception):
     def __init__(self, target: str):
         self.target = target
@@ -366,6 +627,26 @@ class Interpreter:
         if width and len(text) < width:
             text = text.ljust(width)
         return text
+
+    def _field_bytes(self, name: str, value) -> str:
+        """The bytes a DISPLAY field holds, padded the way its category pads.
+
+        A numeric item is right-justified and zero-filled and an alphanumeric
+        one left-justified and space-filled.  Anything that scans a field
+        character by character - INSPECT, and any port that serialises a
+        record - has to agree with that or it counts the padding of the wrong
+        end.
+        """
+        spec = (self.model.pic_of(name) or "").upper()
+        width = self._width(name)
+        text = "" if value is None else str(value)
+        if spec and "9" in spec and "X" not in spec and "A" not in spec:
+            body = text.strip().lstrip("+-")
+            body = body.split(".")[0] if "." in body else body
+            if not width:
+                return body
+            return body.rjust(width, "0")[-width:]
+        return text.ljust(width)[:width] if width else text
 
     def _as_int(self, expression: str, default: int) -> int:
         if not expression:
@@ -1090,8 +1371,13 @@ class Interpreter:
                     self.assign(name, parse_term(raw).value)
             return
 
+        # A conditional phrase belongs to more than the I/O verbs: `ADD ... ON
+        # SIZE ERROR` and `STRING ... ON OVERFLOW` are decisions in the same
+        # sense, they are already counted as branch directions, and running
+        # the statement without them left both directions uncoverable.
         if kind in ("ADD", "SUBTRACT", "COMPUTE", "MULTIPLY", "DIVIDE"):
             self._arithmetic(kind, stmt)
+            self._maybe_phrases(stmt, children, para, depth, line, ordinal)
             return
 
         if kind == "INITIALIZE":
@@ -1100,6 +1386,19 @@ class Interpreter:
 
         if kind == "STRING":
             self._string(stmt)
+            self._maybe_phrases(stmt, children, para, depth, line, ordinal)
+            return
+
+        if kind == "UNSTRING":
+            self._maybe_phrases(stmt, children, para, depth, line, ordinal)
+            return
+
+        if kind == "INSPECT":
+            self._inspect(stmt)
+            return
+
+        if kind == "SEARCH":
+            self._search(stmt, para, depth, line)
             return
 
         from .provenance import STUB_KINDS, op_key
@@ -1119,6 +1418,11 @@ class Interpreter:
     # not a guess.
     _AT_END = {"10", "46", 10, 46}
     _INVALID_KEY = {"21", "22", "23", "24", 21, 22, 23, 24}
+
+    def _maybe_phrases(self, stmt, children, para: str, depth: int, line: int,
+                       ordinal: int) -> None:
+        if children and any(c.get("type") == "PHRASE" for c in children):
+            self._phrases(stmt, children, para, depth, line, ordinal)
 
     def _phrases(self, stmt, children, para: str, depth: int, line: int,
                  ordinal: int) -> None:
@@ -1216,10 +1520,42 @@ class Interpreter:
             self._force(name, value)
 
     def _force(self, name: str, value) -> None:
+        """Deliver a stub's outcome, bypassing everything that would refuse it.
+
+        A record area filled by an operation is filled with *bytes*, and each
+        field under it gets the piece of the record that lands on it - the
+        same rule a group MOVE follows. Handing every child the whole record
+        instead makes a one-character flag hold the entire 350-byte image, so
+        every comparison against it is false and the payload reaches no
+        decision at all. That is not a corner case: it is how a batch program
+        reads a record, and it is why an outcome that names a record area
+        could not previously move a branch.
+
+        A value too short to be a record image, or a group whose layout is not
+        known, keeps the old behaviour, because there are no bytes to divide.
+        """
         name = name.upper()
         self.state[name] = value
         self._note(name, None)
-        for child in self.model.descendants(name):
+        children = self.model.descendants(name)
+        if not children:
+            return
+        fields = self._elementary(name)
+        width = max((offset + size for _n, offset, size in fields), default=0)
+        if fields and isinstance(value, str) and len(value) >= width > 0:
+            for child, offset, size in fields:
+                piece = value[offset:offset + size]
+                spec = (self.model.pic_of(child) or "").upper()
+                if spec and "9" in spec and "X" not in spec:
+                    try:
+                        self.state[child] = int(piece)
+                    except (TypeError, ValueError):
+                        self.state[child] = piece
+                else:
+                    self.state[child] = piece
+                self._note(child, None)
+            return
+        for child in children:
             self.state[child] = value
             self._note(child, None)
 
@@ -1506,6 +1842,287 @@ class Interpreter:
         name = target.split("(")[0].strip().upper()
         width = self._width(name)
         self.assign(name, joined[:width] if width else joined)
+
+    # -- SEARCH ------------------------------------------------------------
+    def _table_of(self, name: str) -> str:
+        """The OCCURS item a SEARCH operand names, or the one above it.
+
+        ``SEARCH WS-ENTRY`` names the repeating item itself, but a program
+        may also name a group that contains it. Walking up is what lets the
+        verb find the occurrence count and the KEY clause wherever the
+        declaration put them.
+        """
+        current = (name or "").upper()
+        seen = 0
+        while current and seen < 8:
+            if self.model.occurs.get(current):
+                return current
+            current = self.model.parent.get(current, "")
+            seen += 1
+        return (name or "").upper()
+
+    def _index_name(self, table: str) -> str:
+        names = self.model.indexes.get(table) or []
+        return names[0] if names else ""
+
+    def _set_index(self, table: str, index: str, varying: str,
+                   occurrence: int) -> None:
+        if index:
+            self.state[index] = occurrence
+            self._note(index, None)
+        # `VARYING identifier` steps in lockstep with the index; VARYING a
+        # *second index* of the same table does too. Either way the program
+        # reads it after the SEARCH to find out which occurrence matched.
+        if varying and varying != index:
+            self.assign(varying, occurrence)
+        del table
+
+    def _search(self, stmt, para: str, depth: int, line: int) -> None:
+        """SEARCH scans a table; SEARCH ALL bisects an ordered one.
+
+        Both are decisions and both are recorded as such: an arm that was
+        evaluated and did not match is a direction, and so is AT END.
+        """
+        attrs = stmt.get("attributes", {})
+        children = stmt.get("children") or []
+        arms = [c for c in children if c.get("type") == "WHEN"]
+        ends = [c for c in children if c.get("type") == "PHRASE"]
+        table = self._table_of(attrs.get("table", ""))
+        occurrences = self.model.occurs.get(table, 0)
+        index = self._index_name(table)
+        varying = (attrs.get("varying") or "").upper()
+
+        def take(arm, occurrence) -> None:
+            self._set_index(table, index, varying, occurrence)
+            self.block(arm.get("children") or [], para, depth)
+
+        def at_end() -> None:
+            for arm in ends:
+                self.trace.guards.append(
+                    GuardEvent(para, arm.get("line_start", line), "PHRASE",
+                               "at_end", True, {}, arm.get("ordinal", -1)))
+                self.block(arm.get("children") or [], para, depth)
+
+        def not_at_end() -> None:
+            for arm in ends:
+                self.trace.guards.append(
+                    GuardEvent(para, arm.get("line_start", line), "PHRASE",
+                               "at_end", False, {}, arm.get("ordinal", -1)))
+
+        if not occurrences or not arms:
+            # A table with no OCCURS is not a table. Reporting it rather than
+            # guessing keeps a parse failure from being scored as coverage.
+            note = "%s:SEARCH %s" % (para, attrs.get("table", ""))
+            if note not in self.trace.approximations:
+                self.trace.approximations.append(note)
+            at_end()
+            return
+
+        if attrs.get("all"):
+            found = self._search_all(table, index, varying, arms, occurrences,
+                                     para, line)
+            if found is not None:
+                not_at_end()
+                take(arms[found[0]], found[1])
+                return
+            at_end()
+            return
+
+        # Serial SEARCH begins at whatever the index holds, which the program
+        # is required to have set. Starting at 1 regardless would make a
+        # resumed search - `SET IX UP BY 1` then SEARCH again - find the same
+        # occurrence for ever.
+        start = self._occurrence(index)
+        for occurrence in range(start, occurrences + 1):
+            self._set_index(table, index, varying, occurrence)
+            for position, arm in enumerate(arms):
+                condition = norm(arm.get("attributes", {}).get("value", ""))
+                result = self.evaluate(condition)
+                self.trace.guards.append(
+                    GuardEvent(para, arm.get("line_start", line), "WHEN",
+                               condition, result, self._snapshot(condition),
+                               arm.get("ordinal", -1), self._origins(condition)))
+                if result:
+                    not_at_end()
+                    take(arm, occurrence)
+                    return
+                del position
+        # The index is left one past the end, which is what the compiler does
+        # and what a program testing it afterwards expects.
+        self._set_index(table, index, varying, occurrences + 1)
+        at_end()
+
+    def _occurrence(self, index: str) -> int:
+        if not index:
+            return 1
+        try:
+            value = int(float(str(self._stored(index)).strip()))
+        except (TypeError, ValueError):
+            return 1
+        return value if value >= 1 else 1
+
+    def _search_all(self, table: str, index: str, varying: str, arms: list,
+                    occurrences: int, para: str, line: int):
+        """Bisect an ordered table. Returns ``(arm, occurrence)`` or None.
+
+        The KEY clause decides which way to step, so the condition is taken
+        apart into its equality conjuncts and matched against the declared
+        keys, most significant first. A key the condition does not mention
+        contributes nothing, which is the standard's own rule; a condition
+        that mentions no key at all leaves nothing to bisect on, and that is
+        reported rather than turned into a linear scan wearing the wrong name.
+        """
+        keys = [name for _direction, name in self.model.keys.get(table, [])]
+        direction = {name: way for way, name
+                     in self.model.keys.get(table, [])}
+        low, high = 1, occurrences
+        probes = 0
+        # A bisection over n occurrences takes ceil(log2(n)) + 1 probes; the
+        # ceiling is generous and only bounds a table whose declaration lies.
+        while low <= high and probes <= occurrences + 2:
+            probes += 1
+            middle = (low + high) // 2
+            self._set_index(table, index, varying, middle)
+            step = 0
+            for position, arm in enumerate(arms):
+                condition = norm(arm.get("attributes", {}).get("value", ""))
+                result = self.evaluate(condition)
+                self.trace.guards.append(
+                    GuardEvent(para, arm.get("line_start", line), "WHEN",
+                               condition, result, self._snapshot(condition),
+                               arm.get("ordinal", -1), self._origins(condition)))
+                if result:
+                    return position, middle
+                if not step:
+                    step = self._key_step(condition, keys, direction)
+            if step > 0:
+                low = middle + 1
+            elif step < 0:
+                high = middle - 1
+            else:
+                note = "%s:SEARCH ALL without a key comparison" % para
+                if note not in self.trace.approximations:
+                    self.trace.approximations.append(note)
+                return None
+        return None
+
+    def _key_step(self, condition: str, keys: list, direction: dict) -> int:
+        """+1 to look higher up the table, -1 lower, 0 when undecidable."""
+        from .ir import base_name
+        alternatives = condition_atoms(condition)
+        if not alternatives:
+            return 0
+        ranked: list = []
+        for atom in alternatives[0]:
+            for side, other in ((atom.lhs, atom.rhs), (atom.rhs, atom.lhs)):
+                if side.kind != "var":
+                    continue
+                name = base_name(side.name)
+                if name not in keys:
+                    continue
+                ranked.append((keys.index(name), name, side, other))
+                break
+        # Which side of the `=` the key sits on does not change the step: the
+        # comparison that decides the half is always the *key* against the
+        # value, and `WHEN 5 = WS-K (IX)` is the same search as
+        # `WHEN WS-K (IX) = 5`.
+        for _rank, name, side, other in sorted(ranked, key=lambda r: r[0]):
+            actual, wanted = self.value_of(side), self.value_of(other)
+            if holds(actual, "=", wanted):
+                continue
+            below = holds(actual, "<", wanted)
+            ascending = direction.get(name, "ASCENDING") == "ASCENDING"
+            return 1 if below == ascending else -1
+        return 0
+
+    def _operand_text(self, raw: str) -> str:
+        """An INSPECT operand as the bytes it stands for.
+
+        A literal is itself; an identifier is its contents padded to its own
+        declared width, because that is what the comparison uses.
+        """
+        term = parse_term(raw)
+        value = self.value_of(term)
+        if term.kind == "var" and not term.refmod and not term.func:
+            return self._field_bytes(term.name, value)
+        return "" if value is None else str(value)
+
+    def _inspect(self, stmt) -> None:
+        """INSPECT: count occurrences, replace them, or translate characters.
+
+        The receiving counter is *added to*, not set - the standard is
+        explicit that INSPECT does not initialise it, and a program that
+        tallies twice into one counter is relying on that.
+        """
+        text = norm(stmt.get("text", ""))
+        plan = parse_inspect(re.sub(r"^INSPECT\s+", "", text, flags=re.I))
+        if not plan:
+            return
+        subject = parse_term(plan["subject"])
+        if subject.kind != "var" or not subject.name:
+            return
+        raw = self.value_of(subject)
+        body = (self._slice(subject, self._stored(subject.name))
+                if subject.refmod else self._field_bytes(subject.name, raw))
+
+        def span(entry):
+            before = (self._operand_text(entry["before"])
+                      if entry.get("before") else None)
+            after = (self._operand_text(entry["after"])
+                     if entry.get("after") else None)
+            # A delimiter is compared as written rather than padded to the
+            # width of whatever holds it: `AFTER INITIAL WS-D` where WS-D is
+            # PIC X(10) holding '/' looks for a slash, not for a slash and
+            # nine spaces.
+            if before is not None:
+                before = before.rstrip() or before
+            if after is not None:
+                after = after.rstrip() or after
+            return _inspect_region(body, before, after)
+
+        if plan["tallying"]:
+            items = []
+            for entry in plan["tallying"]:
+                lo, hi = span(entry)
+                items.append({"kind": entry["kind"],
+                              "arg": (self._operand_text(entry["arg"])
+                                      if entry["arg"] else ""),
+                              "lo": lo, "hi": hi})
+            counts = inspect_tally(body, items)
+            totals: dict = {}
+            for entry, count in zip(plan["tallying"], counts):
+                name = parse_term(entry["counter"]).name
+                if name:
+                    totals[name] = totals.get(name, 0) + count
+            for name, count in totals.items():
+                try:
+                    current = float(str(self.value_of(parse_term(name))).strip())
+                except (TypeError, ValueError):
+                    current = 0.0
+                self.assign(name, int(current + count))
+
+        if plan["replacing"]:
+            items = []
+            for entry in plan["replacing"]:
+                lo, hi = span(entry)
+                items.append({"kind": entry["kind"],
+                              "arg": (self._operand_text(entry["arg"])
+                                      if entry["arg"] else ""),
+                              "to": self._operand_text(entry["to"]),
+                              "lo": lo, "hi": hi})
+            body = inspect_replace(body, items)
+
+        if plan["converting"]:
+            entry = plan["converting"]
+            lo, hi = span(entry)
+            body = inspect_convert(body, self._operand_text(entry["from"]),
+                                   self._operand_text(entry["to"]), lo, hi)
+
+        if plan["replacing"] or plan["converting"]:
+            if subject.refmod:
+                self.assign_slice(subject, body)
+            else:
+                self.assign(subject.name, body)
 
     def _initialize(self, stmt) -> None:
         """INITIALIZE sets every elementary item under an operand to its

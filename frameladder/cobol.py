@@ -63,6 +63,21 @@ _DECL = re.compile(r"^\s*(\d\d)\s+([A-Z0-9][A-Z0-9-]*)\b(.*)$", re.I)
 _PIC_IN = re.compile(r"\bPIC(?:TURE)?\s+(?:IS\s+)?(\S+)", re.I)
 _VALUE_IN = re.compile(r"\bVALUE\s+(?:IS\s+)?('[^']*'|\"[^\"]*\"|[A-Z0-9+-]+)", re.I)
 _OCCURS = re.compile(r"\bOCCURS\s+(\d+)", re.I)
+# A table's KEY clause is what makes `SEARCH ALL` a binary search rather than
+# a scan: it names the fields the occurrences are ordered on and which way.
+# Without it the verb has nothing to bisect on, so every SEARCH ALL either
+# falls out at AT END or matches by accident, and both are wrong in a way that
+# looks like a coverage result rather than like a missing feature.
+_KEY_CLAUSE = re.compile(r"\b(ASCENDING|DESCENDING)(?:\s+KEY)?(?:\s+IS)?\s+", re.I)
+_INDEXED_BY = re.compile(r"\bINDEXED\s+BY\s+", re.I)
+_NAME_RUN = re.compile(r"[A-Z0-9][A-Z0-9-]*", re.I)
+# Words that end a run of names inside an OCCURS clause.
+_OCCURS_STOP = {"ASCENDING", "DESCENDING", "INDEXED", "KEY", "IS", "BY",
+                "OCCURS", "TIMES", "DEPENDING", "ON", "PIC", "PICTURE",
+                "VALUE", "USAGE", "REDEFINES", "SIGN", "COMP", "COMP-3",
+                "DISPLAY", "BINARY", "PACKED-DECIMAL", "SYNCHRONIZED",
+                "SYNC", "JUSTIFIED", "JUST", "BLANK", "WHEN", "ZERO"}
+
 # USAGE decides the *representation*, which PIC does not. S9(4) COMP is two
 # binary bytes truncated to four decimal digits; S9(4) COMP-3 is three packed
 # bytes with a sign nibble; S9(4) DISPLAY is four characters with an
@@ -81,6 +96,36 @@ _USAGE_CANON = {"COMPUTATIONAL": "COMP", "COMPUTATIONAL-1": "COMP-1",
                 "PACKED-DECIMAL": "COMP-3"}
 _LEVEL88 = re.compile(r"^\s*88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(?:ARE\s+|IS\s+)?(.*)$", re.I)
 _88_VALUE = re.compile(r"'[^']*'|\"[^\"]*\"|[^\s,]+")
+
+
+def _names_after(rest: str, start: int) -> list:
+    """Identifiers following an OCCURS sub-clause, up to the next keyword."""
+    out = []
+    for m in _NAME_RUN.finditer(rest, start):
+        word = m.group(0).upper()
+        if word in _OCCURS_STOP:
+            break
+        out.append(word)
+    return out
+
+
+def occurs_keys(rest: str) -> list:
+    """``[(ASCENDING|DESCENDING, field), ...]`` in the order written.
+
+    Order is meaning here: a compound key is compared most-significant first,
+    so a set would silently re-sort it and the bisection would step the wrong
+    way on every table with more than one key.
+    """
+    out = []
+    for m in _KEY_CLAUSE.finditer(rest):
+        for name in _names_after(rest, m.end()):
+            out.append((m.group(1).upper(), name))
+    return out
+
+
+def indexed_by(rest: str) -> list:
+    m = _INDEXED_BY.search(rest)
+    return _names_after(rest, m.end()) if m else []
 
 
 def _split_sentences(text: str) -> list:
@@ -238,6 +283,8 @@ class DataModel:
     pic: dict = field(default_factory=dict)
     initial: dict = field(default_factory=dict)
     occurs: dict = field(default_factory=dict)
+    keys: dict = field(default_factory=dict)      # table -> [(direction, field)]
+    indexes: dict = field(default_factory=dict)   # table -> [index-name]
     children: dict = field(default_factory=dict)     # group -> all descendants
     parent: dict = field(default_factory=dict)
     declared: set = field(default_factory=set)
@@ -284,6 +331,8 @@ class DataModel:
         self.pic.update(other.pic)
         self.initial.update(other.initial)
         self.occurs.update(other.occurs)
+        self.keys.update(other.keys)
+        self.indexes.update(other.indexes)
         self.parent.update(other.parent)
         self.declared |= other.declared
         self.usage.update(other.usage)
@@ -363,6 +412,15 @@ def parse_data_division(path: str) -> DataModel:
             o = _OCCURS.search(rest)
             if o:
                 model.occurs[name] = int(o.group(1))
+                found = occurs_keys(rest)
+                if found:
+                    model.keys[name] = found
+                names = indexed_by(rest)
+                if names:
+                    # An index-name is not a data item and must not join
+                    # `declared`: nothing may bind it as a program input, and
+                    # the only thing that moves it is SET or a SEARCH.
+                    model.indexes[name] = names
             u = _USAGE.search(rest)
             if u:
                 raw = u.group(1).upper()
@@ -556,11 +614,54 @@ class _Parser:
     def done(self) -> bool:
         return self.i >= len(self.t)
 
-    def take_until_boundary(self) -> list[Token]:
+    def take_until_boundary(self, stop_at_phrase: bool = False) -> list[Token]:
         start = self.i
         while not self.done() and self.peek() not in _BOUNDARY:
+            if stop_at_phrase and self.phrase_at(self.i):
+                break
             self.i += 1
         return self.t[start:self.i]
+
+    def phrase_at(self, index: int):
+        """``(phrase, word count)`` if a conditional phrase starts here.
+
+        A phrase can only *begin* a clause, so recognising it by position is
+        safe where recognising it by keyword would not be: `IF A NOT = B` has
+        a NOT that belongs to the condition, and conditions are never read
+        with this on.
+        """
+        if index >= len(self.t):
+            return None
+        if self.t[index].word.upper() not in _PHRASE_HEADS:
+            return None
+        words = [t.word.upper() for t in self.t[index:index + 4]]
+        for length in (4, 3, 2):
+            if tuple(words[:length]) in _PHRASES:
+                return _PHRASES[tuple(words[:length])], length
+        return None
+
+    def take_phrase(self):
+        """Consume a conditional phrase at the cursor, and name it.
+
+        The phrase has to be found *before* the statement it guards is parsed,
+        not peeled off the end afterwards. Peeling works for the first phrase
+        of a statement and fails for the second: in
+
+            READ F INVALID KEY PERFORM A NOT INVALID KEY PERFORM B
+
+        the inner `PERFORM A` runs to the next verb, so it swallows
+        `NOT INVALID KEY` as part of its own operand list, the second phrase
+        disappears, and `PERFORM B` ends up inside the *first* arm - running
+        on the outcome it was written to exclude. Both arms then fire on the
+        same outcome and neither direction of the decision is what the
+        compiler produces.
+        """
+        found = self.phrase_at(self.i)
+        if not found:
+            return None
+        phrase, length = found
+        self.i += length
+        return phrase
 
     def statements(self, stop: set) -> list[dict]:
         out: list[dict] = []
@@ -591,6 +692,8 @@ class _Parser:
             return self.perform_statement()
         if word == "GO":
             return self.go_statement()
+        if word == "SEARCH":
+            return self.search_statement()
         return self.simple_statement()
 
     # -- individual forms --------------------------------------------------
@@ -656,7 +759,10 @@ class _Parser:
     def perform_statement(self) -> dict:
         head = self.t[self.i]
         self.i += 1
-        words = self.take_until_boundary()
+        # A PERFORM inside a conditional handler must not run on past the
+        # phrase that ends the handler: `PERFORM A NOT INVALID KEY` is one
+        # statement and one phrase, not a PERFORM of four words.
+        words = self.take_until_boundary(stop_at_phrase=True)
         upper = [w.word.upper() for w in words]
         text = "PERFORM " + " ".join(w.word for w in words)
 
@@ -705,6 +811,58 @@ class _Parser:
         return {"type": "PERFORM_INLINE", "text": text, "line_start": head.line,
                 "line_end": head.line, "attributes": attrs, "children": body}
 
+    def search_statement(self) -> dict:
+        """``SEARCH`` and ``SEARCH ALL``: an n-way decision, not a call.
+
+        Both formats carry an optional ``AT END`` and one or more ``WHEN``
+        arms, and every one of those is a direction a test can go.  Read as
+        an opaque statement - which is what happens when the verb has no rule
+        of its own - the arms parse as free-standing statements that run
+        unconditionally, so the body of every WHEN executes on every pass and
+        AT END executes as well.  That is not a partial model of SEARCH; it
+        is a different program.
+        """
+        head = self.t[self.i]
+        self.i += 1
+        binary = self.peek() == "ALL"
+        if binary:
+            self.i += 1
+        words = self.take_until_boundary(stop_at_phrase=True)
+        phrase = self.take_phrase()
+        joined = " ".join(w.word for w in words)
+        m = re.search(r"\bVARYING\s+([A-Z0-9][A-Z0-9-]*)", joined, re.I)
+        attrs: dict[str, Any] = {
+            "table": words[0].word.upper() if words else "",
+            "all": binary,
+            "varying": m.group(1).upper() if m else "",
+        }
+        children: list = []
+        stop = {"WHEN", "END-SEARCH", "."}
+        if phrase == "at_end":
+            body = self.statements(stop)
+            children.append({"type": "PHRASE", "text": "AT END",
+                             "line_start": head.line, "line_end": head.line,
+                             "attributes": {"phrase": "at_end"},
+                             "children": body})
+        while self.peek() == "WHEN":
+            when_head = self.t[self.i]
+            self.i += 1
+            value = self.take_until_boundary()
+            body = self.statements(stop)
+            children.append({"type": "WHEN",
+                             "text": "WHEN " + " ".join(t.word for t in value),
+                             "line_start": when_head.line,
+                             "line_end": when_head.line,
+                             "attributes": {"value":
+                                            " ".join(t.word for t in value)},
+                             "children": body})
+        if self.peek() == "END-SEARCH":
+            self.i += 1
+        return {"type": "SEARCH",
+                "text": "SEARCH " + ("ALL " if binary else "") + joined,
+                "line_start": head.line, "line_end": head.line,
+                "attributes": attrs, "children": children}
+
     def go_statement(self) -> dict:
         head = self.t[self.i]
         self.i += 1
@@ -749,12 +907,11 @@ class _Parser:
                     "line_end": words[-1].line if words else head.line,
                     "attributes": {"body": body}, "children": []}
 
-        words = self.take_until_boundary()
-        # A trailing conditional phrase turns the rest into a guarded handler
-        # rather than the next statement. `take_until_boundary` stops at the
-        # verb that begins the handler, so the phrase keywords are the tail of
-        # what it collected.
-        phrase, words = _split_phrase(words)
+        # A conditional phrase turns the rest into a guarded handler rather
+        # than the next statement, so the scan stops where the phrase begins
+        # and the keywords are consumed as a unit.
+        words = self.take_until_boundary(stop_at_phrase=True)
+        phrase = self.take_phrase()
         text = verb + (" " + " ".join(w.word for w in words) if words else "")
         attrs: dict[str, Any] = {}
         children: list = []
@@ -764,9 +921,7 @@ class _Parser:
                              "line_start": head.line, "line_end": head.line,
                              "attributes": {"phrase": phrase},
                              "children": body})
-            nxt, _ = _split_phrase(self.take_until_boundary()) \
-                if self.peek() in _PHRASE_HEADS else (None, [])
-            phrase = nxt
+            phrase = self.take_phrase()
         if children:
             attrs["phrases"] = [c["attributes"]["phrase"] for c in children]
         if verb == "MOVE":
@@ -880,15 +1035,6 @@ def _replacements(clause: str) -> list:
     body = re.sub(r"^\s*REPLACING\s+", "", clause, flags=re.I)
     return [(m.group(1).strip(), m.group(2).strip())
             for m in _PLAIN_REPL.finditer(body)]
-
-
-def _split_phrase(words: list):
-    """(phrase, remaining words) when a conditional phrase closes the list."""
-    upper = [w.word.upper() for w in words]
-    for length in (4, 3, 2):
-        if len(upper) >= length and tuple(upper[-length:]) in _PHRASES:
-            return _PHRASES[tuple(upper[-length:])], words[:-length]
-    return None, words
 
 
 def _stamp_ordinals(statements: list) -> None:
