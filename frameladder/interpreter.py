@@ -6,10 +6,19 @@ only way to know is to run it.  When a plan does fail, the useful output
 is not "false" but *which guard on the chain went the wrong way*, because
 that is the single question worth handing to an agent.
 
-Subscripts are flattened: ``WS-TAB(I)`` and ``WS-TAB`` are the same cell.
-That mirrors how the rest of the toolchain models tables and keeps the
-interpreter small; it means array-indexed plans are verified loosely, and
-:attr:`Trace.approximations` says so rather than hiding it.
+State is bytes where the data division says how, and a field map where it
+does not.  ``storage.FieldMap`` keeps the ``{FIELD: value}`` interface every
+caller uses, but a name with a known layout is a *window* onto a record
+rather than a cell of its own - which is what COBOL storage is, and what
+makes subscripts, REDEFINES of any shape, MOVE truncation and USAGE one
+mechanism instead of four approximations of one.  A name with no layout - a
+table index, a harness slot, a value a plan supplies for something the
+program never declared - stays an ordinary dictionary entry, which is what
+lets this be adopted a record at a time rather than all at once.
+
+An *unsubscripted* reference to a table reads occurrence 1, because there is
+nothing else to pick; :attr:`Trace.approximations` records that rather than
+hiding it.
 """
 
 from __future__ import annotations
@@ -70,6 +79,30 @@ FIXED_NOW = "20240101120000000+0000"
 CLOCK_SLOT = "FUNCTION CURRENT-DATE"
 CLOCK_VALUES = ("20240101120000000+0000", "20241231235959000+0000",
                 "20240229120000000+0000", "20240615000000000+0000")
+
+
+# A figurative constant is as wide as whatever receives it. `MOVE SPACES TO
+# <group>` blanks the whole group and `MOVE ZEROS` fills it with the
+# *character* zero - one byte of it padded out is a different record. The
+# term parser collapses these to a single Python value, correctly, because
+# every other consumer wants the value; execution wants the width too.
+_FILL = {"ZERO": "0", "ZEROS": "0", "ZEROES": "0",
+         "SPACE": " ", "SPACES": " ",
+         "LOW-VALUE": "\x00", "LOW-VALUES": "\x00",
+         "HIGH-VALUE": "\xff", "HIGH-VALUES": "\xff",
+         "QUOTE": "\"", "QUOTES": "\""}
+_ALL_LITERAL = re.compile(r"^ALL\s+(?:'(.)'|\"(.)\")$", re.I)
+
+
+def _fill_char(source: str) -> str:
+    """The repeating byte a figurative source stands for, or ''."""
+    text = norm(source or "").upper()
+    if text in _FILL:
+        return _FILL[text]
+    m = _ALL_LITERAL.match(text)
+    if m:
+        return m.group(1) or m.group(2) or ""
+    return ""
 
 
 def _numval(text: str) -> float:
@@ -459,7 +492,13 @@ class Interpreter:
                  sequential: bool = True, track_origins: bool = False):
         self.program = program
         self.model = program.model
-        self.state = {k.upper(): v for k, v in (state or {}).items()}
+        # The layout is a property of the data division, so it is computed
+        # once per program and shared; only the bytes belong to this run.
+        from .storage import ByteMemory, FieldMap, layout_of
+        self.memory = ByteMemory(layout_of(self.model))
+        self._slots: dict = {}
+        self.state = FieldMap(self.memory,
+                              {k.upper(): v for k, v in (state or {}).items()})
         self.stubs = stubs or {}
         self.terminals = {k.upper(): {n.upper(): v for n, v in vals.items()}
                           for k, vals in (terminals or {}).items()}
@@ -502,6 +541,9 @@ class Interpreter:
         # ALTER rewrites another paragraph's GO TO at run time. A dispatcher
         # built on it - and CardDemo's is - cycles forever without this.
         self.altered: dict = {}
+        # What the harness supplied at entry. A terminal read re-delivers it,
+        # so it has to survive the program clearing the area first.
+        self._supplied = dict(self.state)
         # Two names over one set of bytes. Built once because it is a
         # property of the data division, not of the run.
         self._overlays = self._overlay_map()
@@ -514,17 +556,48 @@ class Interpreter:
         self._origin: dict = {}
 
     # -- values ------------------------------------------------------------
+    def slot_of(self, name: str):
+        """The byte window a name describes, or None when there is no layout."""
+        key = (name or "").upper()
+        if key in self._slots:
+            return self._slots[key]
+        found = self.memory.layout.slot_for(key)
+        self._slots[key] = found
+        return found
+
+    def _indices(self, term) -> tuple:
+        """A term's subscripts as numbers.
+
+        ``WS-TAB(I)`` and ``WS-TAB(I + 1)`` both occur, so a subscript goes
+        through the same expression evaluator a refmod offset does.
+        """
+        if not term.index:
+            return ()
+        return tuple(self._as_int(str(part), 1) for part in term.index)
+
     def value_of(self, term) -> object:
         if term.kind == "const":
             return term.value
         if term.func:
             return self._intrinsic(term)
-        value = self._stored(term.name)
+        value = self._stored(term.name, self._indices(term))
         if term.refmod:
             value = self._slice(term, value)
         return value
 
-    def _stored(self, name: str) -> object:
+    def _stored(self, name: str, index: tuple = ()) -> object:
+        slot = self.slot_of(name)
+        if slot is not None:
+            if slot.dims and not index:
+                # A table read with no subscript takes occurrence 1, because
+                # there is nothing else to take. That is an approximation and
+                # it is now reported as one, where before every occurrence of
+                # every table was silently one cell.
+                note = "unsubscripted table read: %s" % name
+                if note not in self.trace.approximations:
+                    self.trace.approximations.append(note)
+            return self.memory.read(slot, index)
+        # No layout for this name: the field map is the store, as before.
         # A value written to the group itself outranks one assembled from its
         # children: the plan pinned it, or a record area was filled whole.
         if name in self.state:
@@ -599,6 +672,9 @@ class Interpreter:
         comparison against SPACES or LOW-VALUES goes the wrong way.
         """
         from .layout import byte_length
+        slot = self.slot_of(name)
+        if slot is not None:
+            return slot.length
         pic = self.model.pic_of(name)
         if not pic:
             return 0
@@ -616,6 +692,9 @@ class Interpreter:
         conversational program is sliced at group boundaries computed this
         way, so getting it wrong misplaces the whole saved state.
         """
+        slot = self.slot_of(name)
+        if slot is not None:
+            return slot.length
         fields = self._elementary(name)
         if fields:
             return max(o + n for _c, o, n in fields)
@@ -914,6 +993,29 @@ class Interpreter:
         name = term.name.upper()
         if name in self._pinned:
             return
+        index = self._indices(term)
+        slot = self.slot_of(name)
+        if slot is not None:
+            # The receiving item is the slice, so this is a byte splice and
+            # nothing outside it moves - including the bytes of a packed or
+            # binary neighbour that happens to share the group.
+            start = max(1, self._as_int(term.refmod[0], 1))
+            text = "" if value is None else str(value)
+            length = (self._as_int(term.refmod[1], len(text))
+                      if term.refmod[1] else len(text))
+            if length <= 0:
+                return
+            from .storage import CODEC
+            piece = text[:length].ljust(length).encode(CODEC, "replace")
+            raw = bytearray(self.memory.raw(slot, index))
+            end = start - 1 + length
+            if end > len(raw):
+                piece = piece[:max(0, len(raw) - (start - 1))]
+                end = len(raw)
+            raw[start - 1:end] = piece
+            self.memory.write_raw(slot, bytes(raw), index)
+            self._note(name, None)
+            return
         width = self.declared_length(name)
         current = self._text_of(name, self._stored(name))
         if width and len(current) < width:
@@ -1031,12 +1133,28 @@ class Interpreter:
         if self.track_origins:
             self._origin[name.upper()] = origin
 
-    def assign(self, name: str, value, origin=None) -> None:
+    def assign(self, name: str, value, origin=None, index: tuple = (),
+               fill: str = "") -> None:
         name = name.upper()
         # Values the plan pins are the stub returns and program inputs; the
         # program overwriting them mid-run would undo the very thing being
         # tested, so they hold.
         if name in self._pinned:
+            return
+        slot = self.slot_of(name)
+        if slot is not None:
+            # One write, into the bytes the name describes. Truncation, the
+            # sign, the packed or binary representation and every overlapping
+            # name fall out of the layout instead of being reproduced here.
+            self.memory.write(slot, value, index, fill)
+            self._note(name, origin)
+            if self.track_origins and slot.category == "group":
+                # A group move hands each child a different piece of the
+                # source, so each child inherits a different piece of the
+                # source's origin.
+                for child, offset, length in self._elementary(name):
+                    self._note(child, origin.slice(offset, offset + length)
+                               if origin is not None else None)
             return
         self.state[name] = self._fit(name, value)
         self._note(name, origin)
@@ -1342,21 +1460,23 @@ class Interpreter:
                 return
             value = self.value_of(source)
             origin = self.origin_of(source)
+            fill = _fill_char(attrs.get("source", ""))
             # `MOVE A TO B(n:m)` replaces m bytes of B and leaves the rest
             # alone. Assigning the whole of B is how a commarea assembled in
             # two pieces - header, then the program's own area at
             # `LENGTH OF header + 1` - ends up holding only the second one.
             from .ir import move_target_terms
             terms = move_target_terms(attrs.get("targets", ""))
-            if any(t.refmod for t in terms):
-                for term in terms:
-                    if term.refmod:
-                        self.assign_slice(term, value)
-                    else:
-                        self.assign(term.name, value, origin)
+            if not terms:
+                for name in move_targets(attrs.get("targets", "")):
+                    self.assign(name, value, origin, fill=fill)
                 return
-            for name in move_targets(attrs.get("targets", "")):
-                self.assign(name, value, origin)
+            for term in terms:
+                if term.refmod:
+                    self.assign_slice(term, value)
+                else:
+                    self.assign(term.name, value, origin,
+                                self._indices(term), fill)
             return
 
         if kind == "SET":
@@ -1463,6 +1583,32 @@ class Interpreter:
             if taken:
                 self.block(arm.get("children") or [], para, depth)
 
+    # A terminal read is an INPUT channel, and the source says so: the
+    # command names the area it fills. `EXEC CICS RECEIVE MAP(m) INTO(a)`
+    # puts the operator's keystrokes into `a` - so a field under `a` is a
+    # program input that arrives *at the RECEIVE*, not at entry.
+    #
+    # This matters because a screen program clears its own map area before
+    # sending, and on a BMS layout the output map REDEFINES the input map, so
+    # the clear lands on the very bytes the operator's input will occupy.
+    # Deliver nothing here and every field the next screen validates reads as
+    # LOW-VALUES however the harness was set up, and every arm behind it is
+    # unreachable. It looked reachable before only because two names over one
+    # set of bytes were two separate cells, which the compiler says they are
+    # not.
+    _INPUT_OPS = ("EXEC:CICS:RECEIVE",)
+
+    def _deliver_terminal_input(self, key: str, stmt) -> None:
+        if not key.startswith(self._INPUT_OPS):
+            return
+        from .provenance import stub_outputs
+        for area in stub_outputs(norm(stmt.get("text", ""))):
+            names = [area] + list(self.model.descendants(area))
+            for name in names:
+                if name in self._supplied:
+                    self.state[name] = self._supplied[name]
+                    self._note(name, None)
+
     def _external(self, stmt, para: str, line: int) -> None:
         """Deliver the planned outcome for one external operation."""
         from .provenance import op_key
@@ -1493,6 +1639,7 @@ class Interpreter:
                 raise _NextTask()
             self.trace.stopped = "terminated by %s" % key
             raise _Stop()
+        self._deliver_terminal_input(key, stmt)
         entries = self.stubs.get(key, [])
         matched = False
         for index, entry in enumerate(entries):
@@ -1537,6 +1684,13 @@ class Interpreter:
         name = name.upper()
         self.state[name] = value
         self._note(name, None)
+        if self.slot_of(name) is not None:
+            # With a byte store the group's bytes *are* the children's bytes,
+            # so the write is already done and splitting it again would
+            # overwrite the record with a re-encoding of itself.
+            for child in self.model.descendants(name):
+                self._note(child, None)
+            return
         children = self.model.descendants(name)
         if not children:
             return
@@ -1658,7 +1812,10 @@ class Interpreter:
         an equality test turns into a wrong branch.
         """
         from .layout import digits_of
-        base = name.split("(")[0].strip()
+        term = parse_term(name.strip()) if name.strip() else None
+        base = (term.name if term is not None and term.kind == "var"
+                else name.split("(")[0].strip())
+        index = self._indices(term) if term is not None else ()
         pic = self.model.pic_of(base)
         try:
             _whole, decimals = digits_of(pic) if pic else (0, None)
@@ -1668,16 +1825,23 @@ class Interpreter:
             value = round(value) if rounded else float(int(value))
         elif rounded and decimals:
             value = round(value, decimals)
-        self.assign(base, value)
+        self.assign(base, value, index=index)
 
     _RECEIVER = None
 
     def _receivers(self, text: str) -> list:
         import re
         out = []
+        # `ADD 1 TO WS-TOTAL (I)` names one receiver, not two. Splitting on
+        # whitespace makes the subscript a second operand called "(I)" and
+        # sends the result to occurrence 1 whatever I holds.
         for word in re.split(r"\s+", norm(text)):
-            if not word or word.upper() in ("ROUNDED", "TO", "GIVING", "FROM",
-                                            "BY", "INTO"):
+            if not word:
+                continue
+            if word.startswith("(") and out:
+                out[-1] = out[-1] + word
+                continue
+            if word.upper() in ("ROUNDED", "TO", "GIVING", "FROM", "BY", "INTO"):
                 continue
             out.append(word.strip(".,"))
         return out
@@ -2144,16 +2308,37 @@ class Interpreter:
             children = [c for c in self.model.descendants(name)
                         if self.model.pic_of(c)]
             for field in (children or [name]):
+                if field in self._pinned:
+                    continue
+                if self._blank(field):
+                    self._note(field, None)
+                    continue
                 spec = (self.model.pic_of(field) or "").upper()
                 blank = 0 if spec and "9" in spec and "X" not in spec else " "
-                if field not in self._pinned:
-                    self.state[field.upper()] = blank
-                    self._note(field, None)
-            if not children and name not in self._pinned:
+                self.state[field.upper()] = blank
+                self._note(field, None)
+            if not children and name not in self._pinned \
+                    and self.slot_of(name) is None:
                 spec = (self.model.pic_of(name) or "").upper()
                 self.state[name] = (0 if spec and "9" in spec and "X" not in spec
                                     else " ")
                 self._note(name, None)
+
+    def _blank(self, name: str) -> bool:
+        """Clear one field to its category's zero, every occurrence of it.
+
+        INITIALIZE reaches the whole table, not its first element; writing
+        only occurrence 1 leaves the rest holding whatever the last record
+        put there, and a later scan of the table then finds it.
+        """
+        slot = self.slot_of(name)
+        if slot is None:
+            return False
+        from .storage import occurrence_count, occurrence_index
+        blank = 0 if slot.numeric or slot.category == "edited" else " "
+        for ordinal in range(occurrence_count(slot)):
+            self.memory.write(slot, blank, occurrence_index(slot, ordinal))
+        return True
 
 
 def verify(program, plan, entry: str, *, terminals: dict | None = None,

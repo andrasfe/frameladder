@@ -286,8 +286,13 @@ def parse_term(text: str) -> Term:
         if head in CICS_CONSTANTS:
             return Term("const", value=CICS_CONSTANTS[head].get(
                 m.group(2).strip().upper(), 0))
+        # Subscripts may be separated by a comma or by nothing but space:
+        # `WS-CELL(I, J)` and `WS-CELL(I J)` are the same reference. Split on
+        # the comma alone and a two-dimensional table collapses to its first
+        # row, because the whole "I J" evaluates to no number at all.
         return Term("var", name=head,
-                    index=tuple(s.strip() for s in m.group(2).split(",")))
+                    index=tuple(s for s in re.split(r"[,\s]+", m.group(2).strip())
+                                if s))
     return Term("var", name=upper)
 
 
@@ -315,6 +320,26 @@ def arith_tokens(text: str) -> list:
                 and tokens[index + 1].upper() == "OF"):
             merged.append(" ".join(tokens[index:index + 3]))
             index += 3
+            continue
+        # `WS-TOTAL (I) + 1` is a subscripted operand, not a name multiplied
+        # by a bracket: COBOL has no implicit multiplication, so a `(` that
+        # follows an operand belongs to that operand. Left split, the whole
+        # expression fails to parse and the COMPUTE writes nothing at all.
+        if (tokens[index] == "(" and merged
+                and merged[-1] not in _ARITH_OPS
+                and merged[-1] not in ("(", ")")):
+            depth, body, index = 0, [], index
+            while index < len(tokens):
+                token = tokens[index]
+                if token == "(":
+                    depth += 1
+                elif token == ")":
+                    depth -= 1
+                body.append(token)
+                index += 1
+                if depth == 0:
+                    break
+            merged[-1] = merged[-1] + "(" + " ".join(body[1:-1]) + ")"
             continue
         merged.append(tokens[index])
         index += 1
@@ -443,12 +468,30 @@ def class_holds(value: Any, klass: str) -> bool:
     return False
 
 
+# LOW-VALUE and HIGH-VALUE name a byte, and a figurative constant takes the
+# size of the item it is compared with. Trailing-space stripping cannot
+# reconcile them, because neither byte is a space - so a field holding twenty
+# NULs would come out unequal to LOW-VALUES, which is how a screen program
+# tests an empty input field. One rule, here, because the planner, the lift
+# and the interpreter all decide conditions through this function and a
+# second copy of it is how they come to disagree.
+_FIGURATIVE_BYTES = ("\x00", "\xff")
+
+
+def _widen(value: Any, other: Any) -> Any:
+    if (isinstance(value, str) and value in _FIGURATIVE_BYTES
+            and isinstance(other, str) and len(other) > 1):
+        return value * len(other)
+    return value
+
+
 def holds(left: Any, op: str, right: Any) -> bool:
     """Compare the way COBOL would: mixed alphanumeric and numeric operands
     are reconciled rather than raising."""
     if op in ("IS", "IS-NOT"):
         result = class_holds(left, str(right))
         return result if op == "IS" else not result
+    left, right = _widen(left, right), _widen(right, left)
     try:
         if isinstance(left, str) != isinstance(right, str):
             try:

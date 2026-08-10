@@ -957,6 +957,344 @@ CASES = {
            GOBACK.
 """),
 
+# --- storage: a name is a window onto bytes -------------------------------
+# These ask what a record *contains*, which a {name: value} store cannot
+# answer: two names over one area, a USAGE that is not characters, and a
+# subscript that has to pick a different set of bytes each time.
+
+# S9(4) COMP is two bytes of big-endian two's complement. Read as a decimal
+# cell it is indistinguishable from DISPLAY, and a migration that ports it as
+# an int diverges exactly where the record is written out.
+"usage_comp_bytes": prog(
+"""       01 WS-B PIC S9(4) COMP VALUE 0.
+       01 WS-X REDEFINES WS-B PIC X(2).
+""",
+"""           MOVE 258 TO WS-B
+           IF FUNCTION ORD(WS-X(1:1)) = 2
+              AND FUNCTION ORD(WS-X(2:1)) = 3
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# S9(4) COMP holds two bytes, so a value needing five digits comes back
+# truncated to the declared four. The width is a fact about the layout.
+"usage_comp_truncation": prog(
+"""       01 WS-B PIC S9(4) COMP VALUE 0.
+""",
+"""           MOVE 123456 TO WS-B
+           IF WS-B = 3456
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# COMP-3 is two digits to a byte with a sign nibble at the end: 12345 is
+# X'12345C' and -12345 is X'12345D'. Nothing about that is derivable from
+# the PIC clause alone.
+"usage_comp3_bytes": prog(
+"""       01 WS-P PIC S9(5) COMP-3 VALUE 0.
+       01 WS-X REDEFINES WS-P PIC X(3).
+""",
+"""           MOVE 12345 TO WS-P
+           IF FUNCTION ORD(WS-X(1:1)) = 19
+              AND FUNCTION ORD(WS-X(3:1)) = 93
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"usage_comp3_negative": prog(
+"""       01 WS-P PIC S9(5) COMP-3 VALUE 0.
+       01 WS-X REDEFINES WS-P PIC X(3).
+""",
+"""           MOVE -12345 TO WS-P
+           IF FUNCTION ORD(WS-X(3:1)) = 94 AND WS-P = -12345
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A DISPLAY sign is overpunched onto the last digit rather than costing a
+# byte, so a signed and an unsigned field of the same PIC are the same width
+# and different bytes.
+"display_sign_overpunch": prog(
+"""       01 WS-N PIC S9(3) VALUE 0.
+       01 WS-X REDEFINES WS-N PIC X(3).
+""",
+"""           MOVE -123 TO WS-N
+           IF WS-X(1:2) = '12' AND FUNCTION ORD(WS-X(3:1)) = 116
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A packed field ahead of a character field decides where the character
+# field starts. Three bytes, not five.
+"comp3_shifts_offsets": prog(
+"""       01 WS-G.
+          05 WS-P PIC 9(5) COMP-3 VALUE 0.
+          05 WS-T PIC X(4) VALUE SPACES.
+       01 WS-R REDEFINES WS-G PIC X(7).
+""",
+"""           MOVE 'XXXYYYY' TO WS-R
+           IF WS-T = 'YYYY'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A REDEFINES that is a different shape, not merely a different PIC of the
+# same width. This is the ordinary way a date is held as text and read as
+# parts, and value aliasing cannot express it.
+"redefines_partial_overlay": prog(
+"""       01 WS-DATE PIC X(8) VALUE '20240115'.
+       01 WS-PARTS REDEFINES WS-DATE.
+          05 WS-YY PIC X(4).
+          05 WS-MM PIC X(2).
+          05 WS-DD PIC X(2).
+""",
+"""           IF WS-MM = '01' AND WS-DD = '15'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# The same overlay written through the other name at run time.
+"redefines_partial_write": prog(
+"""       01 WS-A PIC X(6) VALUE SPACES.
+       01 WS-B REDEFINES WS-A.
+          05 WS-B1 PIC X(3).
+          05 WS-B2 PIC X(3).
+""",
+"""           MOVE 'ABCDEF' TO WS-A
+           IF WS-B2 = 'DEF' AND WS-B1 = 'ABC'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# Writing the narrow name changes only its own bytes of the wide one.
+"redefines_write_back": prog(
+"""       01 WS-A PIC X(6) VALUE 'ABCDEF'.
+       01 WS-B REDEFINES WS-A.
+          05 WS-B1 PIC X(3).
+          05 WS-B2 PIC X(3).
+""",
+"""           MOVE 'ZZZ' TO WS-B2
+           IF WS-A = 'ABCZZZ'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A table filled through a loop and read back at two subscripts. One cell per
+# name answers this with whatever was written last.
+"occurs_varying_fill": prog(
+"""       01 WS-T.
+          05 WS-E PIC 9(2) OCCURS 5 TIMES.
+       01 I PIC 9(2) VALUE 0.
+       01 N PIC 9(3) VALUE 0.
+""",
+"""           PERFORM VARYING I FROM 1 BY 1 UNTIL I > 5
+              MOVE I TO WS-E(I)
+           END-PERFORM
+           COMPUTE N = WS-E(1) + WS-E(5)
+           IF N = 6
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"occurs_add_subscript": prog(
+"""       01 WS-T.
+          05 WS-E PIC 9(3) OCCURS 3 TIMES.
+       01 I PIC 9 VALUE 2.
+""",
+"""           MOVE 0 TO WS-E(1)
+           MOVE 0 TO WS-E(2)
+           MOVE 0 TO WS-E(3)
+           ADD 5 TO WS-E(I)
+           IF WS-E(2) = 5 AND WS-E(1) = 0
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"occurs_two_dimensions": prog(
+"""       01 WS-T.
+          05 WS-ROW OCCURS 2 TIMES.
+             10 WS-CELL PIC 9(2) OCCURS 3 TIMES.
+""",
+"""           MOVE 11 TO WS-CELL(1 1)
+           MOVE 23 TO WS-CELL(2 3)
+           IF WS-CELL(1 1) = 11 AND WS-CELL(2 3) = 23
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A table sits inside the group's bytes, so the group sees every element.
+"occurs_group_read": prog(
+"""       01 WS-T.
+          05 WS-E PIC X(2) OCCURS 3 TIMES.
+""",
+"""           MOVE 'AB' TO WS-E(1)
+           MOVE 'CD' TO WS-E(2)
+           MOVE 'EF' TO WS-E(3)
+           IF WS-T = 'ABCDEF'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# INITIALIZE reaches every occurrence, not the first one.
+"initialize_table": prog(
+"""       01 WS-T.
+          05 WS-E PIC 9(2) OCCURS 3 TIMES.
+""",
+"""           MOVE 11 TO WS-E(1)
+           MOVE 22 TO WS-E(2)
+           MOVE 33 TO WS-E(3)
+           INITIALIZE WS-T
+           IF WS-E(3) = 0 AND WS-E(2) = 0
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A figurative constant is as wide as what receives it.
+"move_all_literal": prog(
+"""       01 WS-A PIC X(5) VALUE SPACES.
+""",
+"""           MOVE ALL 'Z' TO WS-A
+           IF WS-A = 'ZZZZZ'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"move_zeros_alnum": prog(
+"""       01 WS-A PIC X(3) VALUE SPACES.
+""",
+"""           MOVE ZEROS TO WS-A
+           IF WS-A = '000'
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A group MOVE is a byte copy, so each child takes the piece that lands on
+# it - including a numeric child that ends up holding characters.
+"group_move_splits_bytes": prog(
+"""       01 WS-G.
+          05 WS-1 PIC X(3) VALUE SPACES.
+          05 WS-2 PIC 9(2) VALUE 0.
+       01 WS-S PIC X(5) VALUE 'ABC49'.
+""",
+"""           MOVE WS-S TO WS-G
+           IF WS-1 = 'ABC' AND WS-2 = 49
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# A figurative constant is as wide as the item it meets, and LOW-VALUE is a
+# byte rather than whitespace - so a field full of them is equal to the
+# constant and not equal to SPACES. Both directions matter: the first is how
+# an uninitialised CICS field is tested, the second is how it is told apart
+# from a blank one.
+"low_values_compare": prog(
+"""       01 WS-A PIC X(3) VALUE LOW-VALUES.
+""",
+"""           IF WS-A = LOW-VALUES
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+"low_values_not_spaces": prog(
+"""       01 WS-A PIC X(3) VALUE LOW-VALUES.
+""",
+"""           IF WS-A = SPACES
+              PERFORM NO-P
+           ELSE
+              PERFORM YES-P
+           END-IF
+           GOBACK.
+"""),
+
+"move_low_values": prog(
+"""       01 WS-A PIC X(3) VALUE 'ABC'.
+""",
+"""           MOVE LOW-VALUES TO WS-A
+           IF WS-A = LOW-VALUES
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
+# Clearing a record through the name that redefines it clears the record.
+# This is the whole of what a screen program does before it sends a map, and
+# a store that keeps the two descriptions as separate values says the first
+# one still holds its old contents - so every field the screen would supply
+# looks like it survived, and conditions on it are scored on data the
+# program had already thrown away.
+"redefines_cleared_through_alias": prog(
+"""       01 WS-IN.
+          05 WS-F1 PIC X(3) VALUE 'ABC'.
+          05 WS-F2 PIC X(3) VALUE 'DEF'.
+       01 WS-OUT REDEFINES WS-IN.
+          05 WS-G1 PIC X(3).
+          05 WS-G2 PIC X(3).
+""",
+"""           MOVE LOW-VALUES TO WS-OUT
+           IF WS-F1 = LOW-VALUES AND WS-F2 = LOW-VALUES
+              PERFORM YES-P
+           ELSE
+              PERFORM NO-P
+           END-IF
+           GOBACK.
+"""),
+
 "if_arith_expr": prog(
 """       01 A PIC 9(3) VALUE 5.
        01 B PIC 9(3) VALUE 6.

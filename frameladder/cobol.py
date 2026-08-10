@@ -350,6 +350,16 @@ class DataModel:
         return self
 
 
+def _source_tag(path: str) -> str:
+    """A stable, upper-case, punctuation-free tag for one source file.
+
+    Every table in the model is keyed by an upper-case name and read back
+    with `.upper()`, so a tag carrying a lower-case extension would be
+    written under one key and looked up under another.
+    """
+    return re.sub(r"[^A-Z0-9]", "", os.path.basename(path).upper())
+
+
 def parse_data_division(path: str) -> DataModel:
     model = DataModel()
     control = parse_file_control(path)
@@ -388,7 +398,15 @@ def parse_data_division(path: str) -> DataModel:
                 # declared set so nothing can bind it, and give it a unique
                 # name so the record layout still adds up.
                 fillers += 1
-                name = "FILLER#%d" % fillers
+                # Unique across the whole program, not just this file. A
+                # model is merged from the program and every copybook it
+                # COPYs, and `merge` is a dict update - so a per-file counter
+                # makes the sixth copybook's FILLER#1 overwrite the first
+                # copybook's, reparenting those bytes into another record.
+                # The name is synthetic and unreferenceable either way; what
+                # matters is that it stays distinct after the merge, because
+                # everything after a lost FILLER sits at the wrong offset.
+                name = "FILLER#%s#%d" % (_source_tag(path), fillers)
             while stack and stack[-1][0] >= level:
                 stack.pop()
             if not name.startswith("FILLER#"):
