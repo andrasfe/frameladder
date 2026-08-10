@@ -146,6 +146,33 @@ def collation_pairs(width: int) -> list:
     return out
 
 
+# How likely a category is to expose a real difference between COBOL and a
+# port, best first. The list was previously in construction order - every
+# boundary value, then the program's literals, then the collation pair last -
+# and since a family has a fixed budget spread over every free slot, a slot
+# can usually afford one candidate. The last entry in the list was therefore
+# never reached, which is how the category README calls "the sharpest
+# instance" came to be generated and truncated away every time.
+#
+# The ranking is about what ports get wrong, not about any particular
+# program: collation changes control flow, truncation is asymmetric between
+# the two kinds of MOVE, the figurative constants are three states a port
+# usually collapses into one, and scale decides truncate-versus-round. A
+# value the program itself compares against tests the program's logic rather
+# than the port's fidelity, so it ranks last despite being the best evidence
+# for reachability.
+_DETECTION_RANK = {
+    "collation-crossover": 0,
+    "over-width": 1, "trailing-space": 2,
+    "low-values": 3, "high-values": 4,
+    "sub-scale": 5, "overflow": 6,
+    "negative-zero": 7, "negative-max": 8,
+    "width-exact": 9, "spaces": 10,
+    "all-nines": 11, "zero": 12,
+    "88-value": 20, "program-literal": 21,
+}
+
+
 def candidates_for(var: str, op: str, other, model, literals: set,
                    condition_names: dict) -> list:
     """Every value worth trying in a free slot, still satisfying its constraint.
@@ -188,6 +215,7 @@ def candidates_for(var: str, op: str, other, model, literals: set,
         if other is not None and not holds(cand.value, op, other):
             continue
         kept.append(cand)
+    kept.sort(key=lambda c: _DETECTION_RANK.get(c.category, 50))
     return kept
 
 
@@ -199,10 +227,27 @@ def family(free_slots: list, limit: int = 12) -> list:
     actionable. It is also linear rather than exponential in the number of
     slots, which matters when a plan has thirteen of them.
     """
-    out = []
-    for slot, cands in free_slots:
-        for cand in cands:
-            out.append((slot, cand))
+    # Round by round, not slot by slot. Taking every candidate of the first
+    # slot before looking at the second spends the whole budget on one field:
+    # a slot offers about ten boundary values, so a twelve-member family used
+    # to cover two slots out of thirteen and the rest were never varied at
+    # all - which is the opposite of what the paragraph above claims.
+    #
+    # It also decided *which categories exist*. Each slot lists its boundary
+    # values first and its collation pair last, so the one category that
+    # changes control flow rather than data was generated and then truncated
+    # away every single time. Breadth-first, every slot gets its first
+    # candidate before any slot gets its second, and the tail of each list
+    # is reachable.
+    out: list = []
+    depth = 0
+    deepest = max((len(c) for _s, c in free_slots), default=0)
+    while depth < deepest:
+        for slot, cands in free_slots:
+            if depth >= len(cands):
+                continue
+            out.append((slot, cands[depth]))
             if len(out) >= limit:
                 return out
+        depth += 1
     return out

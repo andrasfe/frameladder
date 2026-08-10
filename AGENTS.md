@@ -69,6 +69,17 @@ against is a fact about this source. A name table is a guess about how other
 people name things; it is opt-in (`--conventions`), ships as
 `packs/en-US.json`, and measured at 1% of values and zero targets.
 
+**A budget spent depth-first is a budget spent on one field.** `divergence.
+family` took every candidate of the first free slot before looking at the
+second, so a twelve-member family covered two slots out of thirteen - the
+opposite of the "one factor at a time, linear in the number of slots" its
+own docstring promised. Worse, it decided which *categories* existed: each
+slot lists boundary values first and its collation pair last, so the one
+category that changes control flow rather than data was generated and then
+truncated away every single time, on every program, in both corpora.
+Breadth-first plus a detection-value ranking fixed both. Check what a
+budget actually reaches, not what the code offers.
+
 **Audit this, do not assume it.** Every corpus name in the package is in a
 comment or a docstring, citing the program a defect was found in - none is
 in executable code, and that is checkable:
