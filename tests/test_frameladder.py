@@ -996,10 +996,16 @@ class TestFaultVocabulary(unittest.TestCase):
         model = self._model()
         self.assertEqual(channel_of("WS-ST", model), "file")
         self.assertEqual(channel_of("SQLCODE", model), "sql")
+        # A CICS response field is one the source put in a RESP operand.
+        model.cics_resp.add("WS-RESP")
         self.assertEqual(channel_of("WS-RESP", model), "cics")
         # A field that merely looks status-ish is not one; guessing would put
         # file-status codes into fields that are not file statuses.
         self.assertIsNone(channel_of("WS-STATUS-MESSAGE", model))
+        # ...and that includes one spelled like a response field. This test
+        # asserted the opposite until the suffix match was removed: it was
+        # named for the invariant and encoded its violation.
+        self.assertIsNone(channel_of("WS-SAVED-RESP", model))
 
     def test_useful_codes_come_before_obscure_ones(self):
         from frameladder.faults import codes_for

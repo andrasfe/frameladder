@@ -69,6 +69,23 @@ against is a fact about this source. A name table is a guess about how other
 people name things; it is opt-in (`--conventions`), ships as
 `packs/en-US.json`, and measured at 1% of values and zero targets.
 
+**Audit this, do not assume it.** Every corpus name in the package is in a
+comment or a docstring, citing the program a defect was found in - none is
+in executable code, and that is checkable:
+
+```bash
+grep -rniE "CARDDEMO|CDEMO-|COACTUPC|GAM0|CBACT01C" frameladder/*.py
+```
+
+The subtler failure is code that decides behaviour from a variable's
+*name*. There was exactly one, and its own docstring disowned it:
+`faults.channel_of` matched a `-RESP` suffix under a comment reading
+"deliberately not a naming heuristic", and the unit test asserting it was
+named `test_channel_comes_from_the_select_not_the_name`. A field is a CICS
+response field because the source wrote `RESP(WS-RC)`, which is evidence.
+Removing the heuristic also *found* a field it had missed - `WS-REAS-CD`
+does not end in `-RESP`.
+
 **Platform vocabulary is not a naming guess.** File status codes, SQLCODE,
 CICS `DFHRESP` and the `DFHAID` attention keys are fixed the way HTTP status
 codes are fixed. They are

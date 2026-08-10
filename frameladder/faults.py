@@ -53,7 +53,15 @@ def channel_of(var: str, model, op_key: str = "") -> str | None:
         return "sql"
     if op_key.startswith("EXEC:SQL"):
         return "sql"
-    if upper.endswith("-RESP") or upper.endswith("-RESP2") or "EIBRESP" in upper:
+    # The source names its own response channel in a `RESP(...)` operand.
+    # This used to match on a `-RESP` suffix, directly contradicting the
+    # docstring above it: a field is a status field because the program put
+    # it in that channel, never because of how it is spelled. EIBRESP and
+    # EIBRESP2 are exact platform names, which is a different thing from a
+    # name-shaped guess - and matched exactly, so `WS-EIBRESP-SAVE` is not
+    # swept up with them.
+    if upper in getattr(model, "cics_resp", ()) or upper in ("EIBRESP",
+                                                             "EIBRESP2"):
         return "cics"
     return None
 

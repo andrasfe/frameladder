@@ -250,6 +250,9 @@ class DataModel:
     file_status: dict = field(default_factory=dict)       # file -> status variable
     fd_records: dict = field(default_factory=dict)        # file -> record areas
     organization: dict = field(default_factory=dict)      # file -> SEQUENTIAL/INDEXED
+    # Fields the source itself put in a CICS RESP/RESP2 operand. Evidence,
+    # not inference: the program named them as its response channel.
+    cics_resp: set = field(default_factory=set)
 
     def look(self, table: dict, name: str, default=None):
         """Read a per-field table, seeing through qualification.
@@ -290,6 +293,7 @@ class DataModel:
         self.condition_names.update(other.condition_names)
         self.file_status.update(other.file_status)
         self.organization.update(other.organization)
+        self.cics_resp |= other.cics_resp
         for f, recs in other.fd_records.items():
             self.fd_records.setdefault(f, []).extend(recs)
         for group, kids in other.children.items():
@@ -384,6 +388,13 @@ def parse_data_division(path: str) -> DataModel:
             text = fh.read()
     except OSError:
         text = ""
+    # `EXEC CICS ... RESP(WS-RC)` is the program declaring its own response
+    # channel. That is source evidence, and it is the only thing that makes a
+    # field a RESP field - a name ending in -RESP is a guess about how someone
+    # writes COBOL, which this repository does not do.
+    for m in re.finditer(r"\bRESP2?\s*\(\s*([A-Z0-9][A-Z0-9-]*)\s*\)", text, re.I):
+        model.cics_resp.add(m.group(1).upper())
+
     supplied, usage = declarations_for(text)
     for name, spec in supplied.items():
         if name not in model.pic:
