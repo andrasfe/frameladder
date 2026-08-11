@@ -19,7 +19,7 @@ is a deliberate property, not an accident of youth — see *Invariants*.
 ## Commands
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q      # 210 unit tests, seconds
+python3 -m pytest tests/test_frameladder.py -q      # 232 unit tests, seconds
 python3 tests/parser_agreement.py                    # parser vs reference ASTs
 python3 -m conformance.differential  <programs>      # interpreter vs GnuCOBOL
 python3 -m conformance.plan_check    <programs>      # do plans reach, in GnuCOBOL?
@@ -514,6 +514,32 @@ whose VALUE was a hexadecimal literal the parser read as a variable name.
    lands when `verified` is >= 804 with it applied, and not before: coverage
    is the product, and a change that diagnoses better while producing fewer
    witnesses is not yet an improvement.
+
+0b. **The rest of the RCO100B list, with local prevalence measured.** Each was
+   surveyed on this corpus so the next person starts from evidence rather
+   than re-deriving it. Counts are CardDemo + the four side corpora, 41
+   programs.
+
+   - **Computation inversion** (their item 7). 79 `COMPUTE`, 92 `ADD`, 19
+     `SUBTRACT`, 1 `DIVIDE`, and **32 IF conditions naming a field a COMPUTE
+     writes**. Arithmetic writers are indexed with the statement as their
+     source, but the producer walk only follows `MOVE`, so an obligation on a
+     computed field falls through to an `unknown` producer and is bound
+     directly in the entry state - which the program then overwrites with the
+     computed value. The hard part is not the producer: it is that inverting
+     needs the *obligation* transformed, `X = 100` through `COMPUTE X = Y + 5`
+     becoming `Y = 95`, and that is the solver's algebra rather than a lookup.
+     Do it narrowly - integer fields, literal operand, no scaling - or the
+     truncation and overflow rules make it wrong in the silent direction.
+   - **OCCURS / REDEFINES identity** (their item 8). 64 OCCURS declarations
+     and 1,808 REDEFINES here; the runtime store is byte-aware but planner
+     provenance still keys on the base name, so `FIELD(1)` and `FIELD(2)` are
+     one knob. Related to item 1 in this list.
+   - **Precompiled SQL cadence** (their item 11), **replay queues from
+     observed chronology** (12), **compiled-feedback lifting** (13). Not
+     surveyed; 13 already has its instrument - `directions` reports whether
+     the harness reached any frame this interpreter cannot, which is the
+     number that decides whether it can pay at all.
 
 1. **REDEFINES is never aliased at runtime** - an upper bound of 382
    directions across 17 programs, the largest untouched item. Needs the
