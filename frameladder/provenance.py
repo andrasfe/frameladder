@@ -292,7 +292,7 @@ class Provenance:
                     # disagree the solver plans against a program that is not
                     # the one that runs.
                     for target, source in self._initialized(stmt):
-                        self._add(target, Writer(pname, line, "MOVE",
+                        self._add(target, Writer(pname, line, "INIT",
                                                  source=source,
                                                  guards=tuple(guards),
                                                  literals=dict(literals)))
@@ -380,11 +380,16 @@ class Provenance:
         """Every field an INITIALIZE writes, and the literal it leaves there.
 
         Returned as `(field, source)` where `source` is spelled the way a MOVE
-        source would be, so the rest of provenance - `establishing_writes`,
-        `blocking_writes`, the producer walk - reads it without knowing this
-        statement exists. Recorded as kind MOVE for the same reason: it *is* a
-        literal assignment, and a separate kind would be silently ignored by
-        every consumer that filters on one.
+        source would be, so a consumer that wants the value can read it.
+
+        Recorded under its own kind, `INIT`, which is the whole design. The
+        statement must be visible to "does the program write this field" -
+        that is the defect being fixed. It must *not* join the avoidance
+        machinery, which filters on MOVE/SET: a whole-record clear-down is
+        usually not steerable, and demanding a route avoid one produced 99
+        unsolved obligations on routes the interpreter walks happily. Recorded
+        as MOVE it cost more than it bought; recorded as INIT it is seen where
+        it matters and ignored where it does not.
         """
         text = norm(stmt.get("text", ""))
         replacing: list = []
