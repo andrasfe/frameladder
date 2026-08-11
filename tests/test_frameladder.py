@@ -2796,14 +2796,45 @@ class TestDirectionResolution(unittest.TestCase):
                          {("DR-MAIN", branches[0].ordinal, "IF", True),
                           ("DR-MAIN", branches[0].ordinal, "IF", False)})
 
-    def test_a_paragraph_alone_targets_every_decision_in_it(self):
+    def test_a_paragraph_alone_is_rejected_not_spread(self):
+        # This asserted the opposite until a real integration showed what the
+        # spread costs. Targeting every decision in the paragraph looked like
+        # the safe direction, and it destroys attribution on the way back: ten
+        # distinct internal successes collapsed onto two probes and none could
+        # be credited to the entry that asked for it.
         from frameladder.capability import load
         prog = self._program()
         cap = load({"schema_version": "1.0",
                     "uncovered_directions": [{"paragraph": "DR-MAIN"}]})
         resolution = cap.resolve_uncovered(prog)
+        self.assertEqual(resolution.wanted, set())
+        self.assertEqual(len(resolution.unresolved), 1)
+        self.assertIn("names 3 decisions", resolution.unresolved[0]["reason"])
+
+    def test_the_spread_is_still_available_for_coverage_hunting(self):
+        # An unattributable hit is still a hit when the goal is coverage
+        # rather than answering a specific probe.
+        from frameladder.capability import load
+        prog = self._program()
+        cap = load({"schema_version": "1.0",
+                    "uncovered_directions": [{"paragraph": "DR-MAIN"}]})
+        resolution = cap.resolve_uncovered(prog, strict=False)
         self.assertEqual(len(resolution.wanted), 6)   # 3 decisions, both ways
-        self.assertEqual(resolution.by_method, {"paragraph": 1})
+
+    def test_a_paragraph_with_one_decision_is_not_ambiguous(self):
+        from frameladder.capability import load
+        prog = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       SD-MAIN.
+           IF WS-A = 'A'
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        cap = load({"schema_version": "1.0",
+                    "uncovered_directions": [{"paragraph": "SD-MAIN"}]})
+        self.assertEqual(len(cap.resolve_uncovered(prog).wanted), 2)
 
     def test_an_unknown_paragraph_is_reported_not_dropped(self):
         from frameladder.capability import load

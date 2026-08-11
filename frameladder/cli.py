@@ -1468,7 +1468,7 @@ def cmd_export(args):
     entry = _entry(program, args)
     from .capability import unrepresentable
     from .coverage import branches_of
-    from .ladder import plan_for_branch, precheck
+    from .ladder import plan_for_branch, plan_representable, precheck
     from .replay import replay_script
 
     resolution = capability.resolve_uncovered(program)
@@ -1481,6 +1481,10 @@ def cmd_export(args):
     # carries many decisions. Asking once and remembering saves the dominant
     # cost on a large program.
     refusals: dict = {}
+    # Not a disposition: a rerouted plan still ends on exactly one of the
+    # fifteen. This counts how often a refusal was answered by a second route
+    # rather than by giving up.
+    rerouted = [0]
 
     def note(bucket: str, text: str) -> None:
         key = "%s: %s" % (bucket, text)
@@ -1529,6 +1533,28 @@ def cmd_export(args):
                     note("unsolved_obligation", _obligation_text(obligation))
                 continue
             blocked = unrepresentable(plan, capability)
+            if blocked and capability.stated and not args.profile_aware:
+                # A refusal is about *this route*, not about the target. The
+                # first plan is derived without the profile, so a field the
+                # harness cannot set is a reason to look for another producer
+                # - not to give up. Measured on one integration, 130 plans
+                # were refused for an unsupported output field and 48 of them
+                # named a single operation, none having tried a second way in.
+                #
+                # `plan_representable` is the existing machinery for this: it
+                # orders and re-derives routes under the profile. Asked for
+                # only on refusal, so the common path costs nothing.
+                try:
+                    alternative = plan_representable(
+                        program, branch.paragraph, capability=capability,
+                        entry=args.entry, max_routes=args.routes)
+                except Exception:                        # noqa: BLE001
+                    alternative = None
+                if alternative is not None and alternative.chain \
+                        and not alternative.open_obligations \
+                        and not unrepresentable(alternative, capability):
+                    rerouted[0] += 1
+                    plan, blocked = alternative, []
             if blocked:
                 from .capability import refusal_kind
                 # One disposition per attempt, so the first reason decides.
@@ -1579,6 +1605,7 @@ def cmd_export(args):
         "wrong_program": program_mismatch(capability, program) or None,
         "work_list": resolution.summary(),
         "attempted": attempted, "counts": counts,
+        "rerouted_after_refusal": rerouted[0],
         "unaccounted": unaccounted,
         "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])[:20]),
         "exported": rows,

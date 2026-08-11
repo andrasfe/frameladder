@@ -189,7 +189,7 @@ class Capability:
         op = self.operation(op_key)
         return bool(op) and op.accepts(_base(name))
 
-    def resolve_uncovered(self, program):
+    def resolve_uncovered(self, program, *, strict: bool = True):
         """The work list, matched against this program's own decisions.
 
         Returns a `directions.Resolution`, whose `wanted` is what a planner
@@ -199,7 +199,7 @@ class Capability:
         """
         from .directions import resolve
         return resolve(self.raw_uncovered, program,
-                       trust_ordinals=self.trust_ordinals)
+                       trust_ordinals=self.trust_ordinals, strict=strict)
 
     def discriminates(self, op_key: str) -> bool | None:
         """Whether the harness can select an outcome by program state.

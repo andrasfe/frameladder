@@ -213,8 +213,14 @@ class Resolution:
                 "ordinal_conflicts": len(self.conflicts)}
 
 
-def resolve(entries, program, *, trust_ordinals: bool = False) -> Resolution:
+def resolve(entries, program, *, trust_ordinals: bool = False,
+            strict: bool = True) -> Resolution:
     """Turn a harness's work list into decisions this planner can name.
+
+    `strict` refuses an entry that names more than one decision instead of
+    targeting all of them. On by default, because a result is only useful if
+    it can be credited to the probe that asked for it. Turn it off to hunt
+    coverage, where an unattributable hit is still a hit.
 
     `trust_ordinals` is the escape hatch for a profile that was produced by
     this tool - `coverage --work-list` writes one - where the ordinals are
@@ -282,6 +288,25 @@ def resolve(entries, program, *, trust_ordinals: bool = False) -> Resolution:
                               "paragraph": paragraph, "how": how,
                               "matched": len(found),
                               "ordinals": [b.ordinal for b in found]})
+            if strict:
+                # Rejected, not spread. Targeting every candidate looked like
+                # the safe direction - over-targeting costs budget, and
+                # mis-targeting costs a meaningless witness - and that reading
+                # missed what happens on the way *back*. A result can only be
+                # attributed to the probe that asked for it if the entry named
+                # one decision: measured on a real integration, ten distinct
+                # internal successes collapsed onto two probes and none could
+                # be credited. An unresolved entry is a question the harness
+                # can answer by sending `line`; an ambiguous one that quietly
+                # became eleven targets is not.
+                unresolved.append({
+                    "entry": index, "probe": probe, "paragraph": paragraph,
+                    "reason": ("names %d decisions, not one - add `line` to "
+                               "this entry to disambiguate" % len(found)),
+                    "matched_by": how, "candidates": len(found)})
+                by_method["rejected:" + how] = \
+                    by_method.get("rejected:" + how, 0) + 1
+                continue
 
         # An ordinal that disagrees with what the text matched is worth
         # saying out loud: it is the signature of two tools counting
