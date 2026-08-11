@@ -827,6 +827,26 @@ def cmd_why(args):
     by_depth = collections.defaultdict(lambda: [0, 0])   # depth -> [covered, all]
     stalls = collections.Counter()
 
+    # The frontier search is what the tool actually ships, so a diagnosis that
+    # ignores it describes a planner nobody runs. Its directions are collected
+    # first and counted as covered wherever they land, which keeps the
+    # depth table honest: a direction the entry-rooted plan cannot reach and
+    # the frontier can is a fact about the *planner*, not about the target.
+    from_lift: set = set()
+    if args.lift:
+        from .lift import lift as _lift
+        try:
+            result = _lift(program, entry,
+                           seeds=[({}, w, None, None) for w in WORLDS],
+                           defaults_for=lambda w: io_defaults(program, w),
+                           budget=args.lift, fanout=2)
+            for trace in result["traces"]:
+                for g in trace.guards:
+                    from_lift.add((g.paragraph, g.ordinal, g.kind,
+                                   bool(g.result)))
+        except Exception:                                # noqa: BLE001
+            from_lift = set()
+
     for b in branches_of(program):
         for direction in (True, False):
             try:
@@ -865,6 +885,11 @@ def cmd_why(args):
                        and bool(g.result) == direction for g in trace.guards):
                     decided = True
                     break
+            if not decided and (b.paragraph, b.ordinal, b.kind,
+                                bool(direction)) in from_lift:
+                buckets["covered only by the frontier search"] += 1
+                by_depth[depth][0] += 1
+                continue
             if decided:
                 buckets["covered"] += 1
                 by_depth[depth][0] += 1
@@ -1099,6 +1124,10 @@ def build_parser():
                                     "chain length - run this before tuning "
                                     "anything")
     wy.add_argument("--routes", type=int, default=4)
+    wy.add_argument("--lift", type=int, default=0, metavar="N",
+                    help="also run the frontier search, so the diagnosis "
+                         "describes the tool that ships rather than the "
+                         "entry-rooted planner alone")
     wy.set_defaults(func=cmd_why)
 
     sw = sub.add_parser("sweep", help="plan and verify every reachable target")
