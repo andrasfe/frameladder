@@ -19,7 +19,7 @@ is a deliberate property, not an accident of youth — see *Invariants*.
 ## Commands
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q      # 201 unit tests, seconds
+python3 -m pytest tests/test_frameladder.py -q      # 210 unit tests, seconds
 python3 tests/parser_agreement.py                    # parser vs reference ASTs
 python3 -m conformance.differential  <programs>      # interpreter vs GnuCOBOL
 python3 -m conformance.plan_check    <programs>      # do plans reach, in GnuCOBOL?
@@ -263,6 +263,25 @@ leaves the corpus figure flat, say so and say why it cannot show up there.
 - **Copybooks: read what is `COPY`ed.** Loading the directory gave CBACT04C
   2,640 fields instead of 129, inflating the `declared` set that live-in
   filtering and record association depend on.
+- **Reaching a frame is not taking a direction.** A plan built to make one
+  decision go one way can enter the paragraph without evaluating it, evaluate
+  it the other way, or stop on a limit first. All three were reported as
+  successes. Measured over 3,288 directions: 804 verified, 234 took the
+  *wrong* direction, 662 never reached the target, 605 never evaluated the
+  decision. Of the 2,501 plans that solved cleanly, 32% did what they were
+  built to do. Run the plan and check the guard event before calling anything
+  a witness — `cli._verify_direction`.
+- **A settled obligation must be *emitted*, not merely bound.** The third
+  costume of the repository's oldest defect. `IF WS-A = 'A'` guards the
+  PERFORM and a later `MOVE 'Z' TO WS-A` makes provenance name a `literal`
+  producer, the solver binds the right value against it, and `input_state()`
+  filters by producer kind — so the plan reports no open obligation, carries
+  the value internally, and ships an entry state without it. Bound, not
+  reported, not emitted: pick any two and the plan fails for a reason nothing
+  records. The flag is on the *binding* (`Binding.at_entry`), never by
+  rewriting the producer kind: kind is half of `slot`, and a second slot for
+  one variable stops two obligations from ever colliding. Trying it the blunt
+  way changed 61 COACTUPC plans and dropped the very field their target edits.
 - **An index shared with another program is not an identity.** Two tools can
   both number the decisions in a paragraph, agree on the paragraph, and mean
   different decisions by the same integer — this tool counts statement

@@ -97,11 +97,25 @@ class TestParser(unittest.TestCase):
         self.assertEqual(self.p.model.pic["WS-KEY"], "X(4)")
         self.assertEqual(self.p.model.initial["WS-FLAG"], "N")
 
-    def test_thru_perform_yields_both_endpoints(self):
+    def test_thru_perform_enters_the_range_it_does_not_jump_to_the_end(self):
+        # This asserted the opposite until the semantics were corrected.
+        # `PERFORM B-DEEP THRU B-EXIT` runs the whole range; an edge straight
+        # to B-EXIT makes the endpoint look independently callable, and the
+        # planner then reaches an exit paragraph without taking on one
+        # obligation from the range that was supposed to run. On a program
+        # built out of THRU ranges that is most of the call graph: it removed
+        # 37 such edges from COTRTLIC alone.
         g = graph.build_graph(self.p)
         callees = {s.callee for s in g["A-MAIN"]}
         self.assertIn("B-DEEP", callees)
-        self.assertIn("B-EXIT", callees)
+        self.assertNotIn("B-EXIT", callees)
+
+    def test_the_end_of_a_range_is_still_reachable_through_it(self):
+        # Removing the shortcut must not make the endpoint unreachable -
+        # only reachable by the work that actually reaches it.
+        from frameladder.graph import depths
+        g = graph.build_graph(self.p)
+        self.assertIn("B-EXIT", depths(g, "A-MAIN"))
 
     def test_else_is_negated_not_inherited(self):
         seen = {}
@@ -2846,6 +2860,142 @@ class TestDirectionResolution(unittest.TestCase):
         from frameladder.directions import program_mismatch
         cap = load({"schema_version": "1.0"})
         self.assertEqual(program_mismatch(cap, self._program()), "")
+
+
+class TestDirectionVerification(unittest.TestCase):
+    """Reaching a paragraph is not the request.
+
+    The request is that one decision goes one way. A run can enter the
+    paragraph without evaluating that decision, evaluate it the other way, or
+    stop on a limit before arriving - and all three were reported as exported
+    candidates until this existed. On COTRN02C it caught one of ten.
+    """
+
+    SRC = HEADER + """       01  WS-A PIC X.
+       01  WS-B PIC X.
+       PROCEDURE DIVISION.
+       DV-MAIN.
+           IF WS-A = 'A'
+              PERFORM DV-INNER
+           END-IF
+           GOBACK
+           .
+       DV-INNER.
+           IF WS-B = 'B'
+              MOVE 'Z' TO WS-A
+           END-IF
+           GOBACK
+           .
+"""
+
+    def _branch(self, prog, paragraph, index=0):
+        from frameladder.coverage import branches_of
+        hits = [b for b in branches_of(prog) if b.paragraph == paragraph]
+        return hits[index]
+
+    def _verify(self, prog, plan, branch, direction):
+        from frameladder.cli import _verify_direction
+        return _verify_direction(prog, plan, branch, direction,
+                                 prog.paragraph_names[0])
+
+    def test_the_requested_direction_is_confirmed_by_running_it(self):
+        from frameladder.ladder import plan_for_branch
+        prog = program(self.SRC)
+        branch = self._branch(prog, "DV-INNER")
+        plan = plan_for_branch(prog, "DV-INNER", branch.line, True,
+                               entry="DV-MAIN", ordinal=branch.ordinal)
+        verdict, _detail = self._verify(prog, plan, branch, True)
+        self.assertEqual(verdict, "verified")
+
+    def test_a_plan_that_takes_the_other_way_is_not_a_success(self):
+        # The plan is built for True and checked against False, which is the
+        # shape of the defect: solved, representable, reaches the paragraph,
+        # and covers the direction nobody asked for.
+        from frameladder.ladder import plan_for_branch
+        prog = program(self.SRC)
+        branch = self._branch(prog, "DV-INNER")
+        plan = plan_for_branch(prog, "DV-INNER", branch.line, True,
+                               entry="DV-MAIN", ordinal=branch.ordinal)
+        verdict, detail = self._verify(prog, plan, branch, False)
+        self.assertEqual(verdict, "wrong_direction")
+        self.assertIn("DV-INNER", detail)
+
+    def test_never_entering_the_paragraph_is_its_own_disposition(self):
+        # Distinct from wrong_direction on purpose: this one is fixed by
+        # routing, that one by the solver.
+        from frameladder.ir import Plan
+        prog = program(self.SRC)
+        branch = self._branch(prog, "DV-INNER")
+        empty = Plan(target="DV-INNER", chain=[], edges=[], atoms=[],
+                     bindings=[], rendezvous=[], open_obligations=[])
+        verdict, detail = self._verify(prog, empty, branch, True)
+        self.assertEqual(verdict, "target_not_reached")
+        self.assertIn("DV-INNER", detail)
+
+    def test_a_settled_obligation_reaches_the_emitted_entry_state(self):
+        # How this was found: the two tests above failed with
+        # target_not_reached, and the cause was not in verification at all.
+        # `IF WS-A = 'A'` guards the PERFORM, and a later `MOVE 'Z' TO WS-A`
+        # made provenance name a `literal` producer for WS-A. The solver
+        # bound the correct value against it - and `input_state()` emits only
+        # input/unknown producers, so the value was solved, reported as no
+        # open obligation, and dropped on the way out. The plan then reached
+        # nothing, for a reason nothing in it recorded.
+        from frameladder.ladder import plan_for_branch
+        prog = program(self.SRC)
+        branch = self._branch(prog, "DV-INNER")
+        plan = plan_for_branch(prog, "DV-INNER", branch.line, True,
+                               entry="DV-MAIN", ordinal=branch.ordinal)
+        self.assertEqual(plan.input_state().get("WS-A"), "A",
+                         "the guard reaching the target must be emitted, not "
+                         "merely solved")
+
+    def test_every_disposition_is_a_declared_stage(self):
+        # The accounting invariant: a verdict the summary has no column for
+        # would vanish from the totals, which is the failure being fixed.
+        from frameladder.cli import _RUN_STAGES, _STAGES
+        for stage in _RUN_STAGES:
+            self.assertIn(stage, _STAGES)
+
+    def test_a_loop_kind_can_be_verified_at_all(self):
+        # The interpreter names a loop PERFORM_UNTIL and branches_of names it
+        # LOOP. Without the join every loop direction is unverifiable and
+        # reports as never observed.
+        from frameladder.cli import _KIND_OF_GUARD
+        self.assertEqual(_KIND_OF_GUARD.get("PERFORM_UNTIL"), "LOOP")
+        self.assertEqual(_KIND_OF_GUARD.get("PERFORM_VARYING"), "LOOP")
+
+
+class TestRefusalKinds(unittest.TestCase):
+    """A refusal's *kind* is what says who fixes it."""
+
+    def test_each_refusal_maps_to_the_capability_it_names(self):
+        from frameladder.capability import refusal_kind
+        self.assertEqual(refusal_kind("cannot replay READ:F (needed to set X)"),
+                         "unsupported_operation")
+        self.assertEqual(refusal_kind("cannot inject WS-X"),
+                         "unrepresentable_input")
+        self.assertEqual(refusal_kind("READ:F cannot set CUST-ID"),
+                         "unsupported_output_field")
+        self.assertEqual(refusal_kind("READ:F needs 4 outcomes, harness holds 2"),
+                         "replay_sequence_too_long")
+
+    def test_a_series_longer_than_the_harness_holds_is_refused(self):
+        # The outcomes past the limit are the ones that end the loop, so a
+        # truncated series does not run short - it runs wrong.
+        from frameladder.capability import load, unrepresentable
+
+        class _Plan:
+            bindings = ()
+
+            def stub_plan(self):
+                return {"READ:F": [{"WS-ST": "00"}, {"WS-ST": "00"},
+                                   {"WS-ST": "10"}]}
+
+        cap = load({"schema_version": "1.0", "replayable_operations": [
+            {"op_key": "READ:F", "max_outcomes": 2}]})
+        reasons = unrepresentable(_Plan(), cap)
+        self.assertTrue(any("outcomes" in r for r in reasons), reasons)
 
 
 class TestFrameHeadroom(unittest.TestCase):

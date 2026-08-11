@@ -455,7 +455,9 @@ def build_graph(program) -> dict:
     """
     graph: dict = {}
     alters: list = []
+    ranges: list = []
     order = program.paragraph_names
+    position = {name: i for i, name in enumerate(order)}
 
     for para in program.paragraphs:
         sites: list = []
@@ -473,13 +475,26 @@ def build_graph(program) -> dict:
                         _sites.append(CallSite(pname, tgt.upper(), line,
                                                list(guards), "goto"))
             elif kind in ("PERFORM", "GO_TO", "GOTO") and attrs.get("target"):
-                for tgt in re.split(r"\s+THRU\s+|\s+THROUGH\s+", attrs["target"],
-                                    flags=re.I):
-                    tgt = tgt.strip().upper()
-                    if tgt:
-                        _sites.append(CallSite(pname, tgt, line, list(guards),
-                                               "perform" if kind == "PERFORM"
-                                               else "goto"))
+                edge = "perform" if kind == "PERFORM" else "goto"
+                parts = [t.strip().upper() for t in
+                         re.split(r"\s+THRU\s+|\s+THROUGH\s+", attrs["target"],
+                                  flags=re.I) if t.strip()]
+                if len(parts) > 1:
+                    # `PERFORM A THRU B` enters at A and runs every paragraph
+                    # through to B in source order. An edge to B as well makes
+                    # the endpoint look independently callable, and the
+                    # planner then builds a chain that jumps straight to an
+                    # exit paragraph without taking on a single obligation
+                    # from the range it was supposed to run. Only the entry is
+                    # an edge; the rest of the range is stitched below, so B
+                    # stays reachable through the work that actually reaches
+                    # it.
+                    _sites.append(CallSite(pname, parts[0], line,
+                                           list(guards), edge))
+                    ranges.append((parts[0], parts[-1]))
+                elif parts:
+                    _sites.append(CallSite(pname, parts[0], line,
+                                           list(guards), edge))
             elif kind == "ALTER" and attrs.get("destination"):
                 # The redirection only happens if the arm holding the ALTER
                 # actually ran, so its guards belong on the edge. The arm
@@ -530,6 +545,25 @@ def build_graph(program) -> dict:
         if not any(s.callee == nxt for s in graph[name]):
             graph[name].append(CallSite(name, nxt, para.get("line_end", 0),
                                         guards, "fallthrough"))
+
+    # Stitch each performed range, so its endpoint is reachable *through* the
+    # range rather than around it. Ordinary fall-through covers most of this
+    # already; what it cannot cover is a paragraph inside the range that
+    # always escapes - the `GO TO <range>-EXIT` idiom - where control does
+    # continue within the range and a plain fall-through edge is correctly
+    # withheld. Without these, dropping the endpoint edge above would make
+    # the exit paragraph unreachable instead of merely honest.
+    for start, end in ranges:
+        first, last = position.get(start), position.get(end)
+        if first is None or last is None or last <= first:
+            continue
+        for i in range(first, last):
+            name, nxt = order[i], order[i + 1]
+            if name in graph and not any(s.callee == nxt for s in graph[name]):
+                graph[name].append(
+                    CallSite(name, nxt,
+                             program.paragraphs[i].get("line_end", 0),
+                             [], "range"))
     return graph
 
 

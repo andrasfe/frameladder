@@ -526,6 +526,36 @@ It reports how each entry was matched, what it could not resolve, which
 entries named more than one decision, and — the line worth reading first —
 how many ordinals disagree with the decision their own text names.
 
+### Reaching a paragraph is not taking a direction
+
+A plan is built to make one decision go one way. Until it was checked, "the
+plan solved and reaches the target" was treated as success — and it is not the
+same claim. A run can enter the paragraph without ever evaluating that
+decision, because it sits under another condition. It can evaluate it the
+other way. It can stop on the statement budget before arriving. All three were
+exported as candidates.
+
+`export` now runs every plan and confirms the exact decision went the
+requested way. On this corpus, over all 3,288 branch directions:
+
+| disposition | count | share |
+|---|---:|---:|
+| **verified** — ran, took the requested direction | **804** | **24.5%** |
+| unsolved obligation | 787 | 23.9% |
+| target not reached | 662 | 20.1% |
+| decision not observed | 605 | 18.4% |
+| **wrong direction** | **234** | **7.1%** |
+| loop limit | 196 | 6.0% |
+
+Read the two bold rows together. Of the 2,501 plans that solved cleanly,
+**804 do what they were built to do** — and 234 confidently take the direction
+nobody asked for. Every one of those would have been shipped as a witness,
+run, and reported as covering something it did not cover.
+
+This is the single largest correction in the tool's history and, as usual
+here, it *lowered* every number that was previously reported. See
+`AGENTS.md`, "A settled obligation must be bound or reported".
+
 ### Accounting for every target that did not make it
 
 "268 attempted, 1 exported" is not a diagnosis. A target that could not be
@@ -540,23 +570,51 @@ frameladder PROG.cbl --copybooks ./cpy --capability profile.json \
 ```
 
 ```
-   40 attempted
-      precheck_refused             0
-      unreached_internally         0
-      unsolved                     3
-      unrepresentable             27
-      exported                    10
+   40 attempted, each with exactly one disposition
+      unsolved_obligation            3
+      unsupported_operation         27
+      wrong_direction                1  (ran)
+      verified                       9  <- ran, and did the thing asked
 
    why
-         15  unrepresentable: cannot replay EXEC:CICS:RECEIVE (needed to set TTYPCDI OF COTRN2AI)
-          3  unrepresentable: cannot replay EXEC:CICS:WRITE (needed to set TRAN-AMT)
-          1  unsolved: no value derived for TRNAMTI OF COTRN2AI
+         15  unsupported_operation: cannot replay EXEC:CICS:RECEIVE (needed to set TTYPCDI OF COTRN2AI)
+          3  unsupported_operation: cannot replay EXEC:CICS:WRITE (needed to set TRAN-AMT)
+          1  wrong_direction: VALIDATE-INPUT-KEY-FIELDS ordinal 21 went only False
+          1  unsolved_obligation: no value derived for TRNAMTI OF COTRN2AI
 ```
+
+Fifteen dispositions, and every attempted direction ends on exactly one of
+them — checked in the output rather than promised here, since a verdict with
+no column would silently vanish from the totals. They are split by *who fixes
+it*: no call chain is a graph that models the language less well than the
+program uses it, an unsolved obligation is the solver, an unrepresentable
+input is the harness, and a wrong direction is none of those.
 
 Which says something actionable in one line: 27 of 40 are blocked on a single
 operation the profile does not list. Adding `EXEC:CICS:RECEIVE` to
 `replayable_operations` is a one-line change on the harness side and is worth
-more than any amount of extra search on this one.
+more than any amount of extra search on this one. The `wrong_direction` row is
+the other half of the point — that candidate used to be exported.
+
+### `PERFORM A THRU B` enters at A
+
+The endpoint of a performed range is not independently callable. `PERFORM
+1000-INITIALIZATION THRU 1000-IX-EXIT` runs every paragraph between the two,
+so anything targeting the exit must take on every obligation the range
+imposes. An edge straight to the endpoint lets the planner reach an exit
+paragraph having committed to nothing — it removed **37 such edges from
+COTRTLIC alone**, and a program written in this style is mostly ranges.
+
+Only the range entry is an edge now; the rest is stitched so the endpoint
+stays reachable *through* the work that reaches it. Ordinary fall-through
+already covers most of it. What it cannot cover is the `GO TO <range>-EXIT`
+idiom, where a paragraph always escapes and a plain fall-through edge is
+correctly withheld even though control does continue inside the range.
+
+Measured on this corpus the change is coverage-neutral (2,428/3,288 before and
+after) and removes only unreachable phantom nodes — names that are not
+paragraphs of the program at all, because they live in a `COPY`'d procedure
+member. Its value is on programs built out of ranges rather than on this one.
 
 ### Operation keys, when the two sides spell them differently
 
@@ -1154,6 +1212,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 201 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 210 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

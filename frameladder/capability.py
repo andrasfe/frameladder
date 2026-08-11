@@ -317,6 +317,26 @@ def load(path_or_dict) -> Capability:
         stated=True)
 
 
+def refusal_kind(reason: str) -> str:
+    """Which capability a refusal is about, as a disposition name.
+
+    A caller counting failures needs the *kind*, not the sentence: "cannot
+    replay READ:F" and "READ:F cannot set CUST-ID" are a missing mock and a
+    missing payload field, and they are fixed by different people. The
+    sentences are built in `unrepresentable` just below, so this reads them
+    rather than re-deriving anything.
+    """
+    if reason.startswith("cannot replay "):
+        return "unsupported_operation"
+    if reason.startswith("cannot inject "):
+        return "unrepresentable_input"
+    if " cannot set " in reason:
+        return "unsupported_output_field"
+    if "outcome" in reason:
+        return "replay_sequence_too_long"
+    return "unrepresentable_input"
+
+
 def unrepresentable(plan, capability: Capability) -> list:
     """Why this plan cannot be replayed by the harness, in its own terms.
 
@@ -343,6 +363,19 @@ def unrepresentable(plan, capability: Capability) -> list:
                 out.append("%s cannot set %s" % (op_key, var))
         elif var and not capability.can_inject(var):
             out.append("cannot inject %s" % var)
+    # A series longer than the harness can hold is not a detail of delivery:
+    # the outcomes past the limit are the ones that end the loop, so a read
+    # sequence truncated to fit runs for ever or stops in the wrong place.
+    # Better named here than discovered at replay.
+    try:
+        for op_key, outcomes in (plan.stub_plan() or {}).items():
+            limit = capability.outcome_limit(op_key)
+            if limit and len(outcomes) > limit:
+                out.append("%s needs %d outcomes, harness holds %d"
+                           % (op_key, len(outcomes), limit))
+    except Exception:                                        # noqa: BLE001
+        pass
+
     seen, unique = set(), []
     for reason in out:
         if reason not in seen:

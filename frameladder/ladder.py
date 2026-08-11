@@ -440,12 +440,18 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     sequences: dict = {}
 
     def bind(producer: Producer, value, reason: str, source: str = "ladder",
-             atom=None, free: bool = False) -> bool:
+             atom=None, free: bool = False, at_entry: bool = False) -> bool:
         prior = assigned.get(producer.slot)
         if prior is not None:
+            # An earlier obligation already took this slot. If *this* one
+            # concluded the value must come from the entry state, that finding
+            # still holds for the slot as a whole - the value is unchanged,
+            # only where it has to come from is now known.
+            if at_entry:
+                prior.at_entry = True
             return prior.value == value
         b = Binding(producer.slot, producer, value, reason, source, atom,
-                    free=free)
+                    free=free, at_entry=at_entry)
         assigned[producer.slot] = b
         sequences[producer.slot] = [b]
         bindings.append(b)
@@ -775,10 +781,30 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 # value, which fights the program's own MOVE and costs the
                 # status-flag directions that depend on it.
                 if not prov.establishing_writes(var_term.name, op, value):
+                    # Mark it as entry-supplied. The reason says the entry
+                    # state is the only candidate, and `input_state` emitted
+                    # only `input`/`unknown` producers - so binding against
+                    # the `literal` producer of some unrelated later write
+                    # solved the obligation and then dropped it on the way
+                    # out. The plan reported no open obligation, carried the
+                    # right value internally, and shipped an entry state
+                    # missing the one field that reaches the target: `IF WS-A
+                    # = 'A'` guarding the PERFORM, with a `MOVE 'Z' TO WS-A`
+                    # further in, was enough to lose it. A settled obligation
+                    # must be bound *and* emitted, not one of the two.
+                    #
+                    # A flag on the binding, not a different producer. Slot
+                    # identity is `kind:var`, so rewriting the kind to `input`
+                    # here gives the variable a second slot and two
+                    # obligations can then bind it to different values without
+                    # colliding - which `Producer.slot` warns about in as many
+                    # words. Measured, that route changed 61 COACTUPC plans
+                    # and dropped the very field their target edits.
                     bind(producer, value,
                          "no write supplies %s, so it enters with it  [%s]"
                          % (var_term.name, candidate.origin),
-                         atom=candidate, free=(op != "="))
+                         atom=candidate, free=(op != "="),
+                         at_entry=True)
                 settled = True
                 break
 

@@ -721,6 +721,13 @@ class Binding:
     atom: Any = None               # the obligation that caused it
     seq: int = 0                   # position in this operation's outcome sequence
     free: bool = False             # the constraint fixed a relationship, not a value
+    # The solver concluded that nothing in the program supplies this value, so
+    # the entry state must. That is a fact about *this* obligation, not about
+    # the producer: provenance may well have named a `literal` producer for
+    # some later write to the same field. Kept as a flag rather than by
+    # rewriting the producer's kind, because the kind is half of `slot` and
+    # two slots for one variable stop the two obligations from ever colliding.
+    at_entry: bool = False
 
 
 @dataclass
@@ -741,8 +748,13 @@ class Plan:
         return bool(self.chain) and not self.open_obligations
 
     def input_state(self) -> dict:
+        # `at_entry` is not a synonym for the producer kind: it is the
+        # solver's finding that nothing in the program supplies this value.
+        # Reading only the kind dropped values that had been correctly
+        # derived, and the plan then reached nothing for a reason it did not
+        # record anywhere.
         return {b.producer.var: b.value for b in self.bindings
-                if b.producer.kind in ("input", "unknown")}
+                if b.producer.kind in ("input", "unknown") or b.at_entry}
 
     def stub_plan(self) -> dict:
         """Outcomes per operation, in the order they are delivered.

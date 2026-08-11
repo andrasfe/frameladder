@@ -1331,12 +1331,94 @@ def cmd_directions(args):
     return _emit(payload, args.json, render)
 
 
-# The dispositions, in the order a target passes through them. Named for what
-# the *harness* would call them, because the whole point of the breakdown is
-# that both sides can talk about the same number: "268 attempted, 1 exported"
-# is not a diagnosis, it is a mystery.
-_STAGES = ("not_wanted", "precheck_refused", "unreached_internally",
-           "unsolved", "unrepresentable", "exported")
+# Every attempted direction ends on exactly one of these, in the order it
+# would meet them. Named for what the *harness* would call them, because the
+# whole point of the breakdown is that both sides can talk about the same
+# number: "1,033 attempted, 0 exported" is not a diagnosis, it is a mystery,
+# and 927 of those attempts previously vanished without a classification.
+#
+# The split is by what would *fix* it. A target with no call chain needs a
+# graph that models the language better; an unsolved obligation needs a better
+# solver; an unrepresentable input needs a wider harness; a wrong direction
+# needs neither, and is a plan that would have been reported as a success.
+_STAGES = (
+    "not_wanted",                # not on the harness's work list
+    "planner_exception",         # the planner raised
+    "no_call_chain",             # nothing routes to the paragraph
+    "unsolved_obligation",       # routed, but a value was never derived
+    "precheck_refused",          # route needs what the harness cannot carry
+    "unrepresentable_input",     # binds a variable the harness cannot inject
+    "unsupported_operation",     # needs a mock the harness cannot replay
+    "unsupported_output_field",  # mock cannot set that payload field
+    "replay_sequence_too_long",  # more outcomes than the harness holds
+    "target_not_reached",        # ran, never entered the paragraph
+    "decision_not_observed",     # entered, that decision never evaluated
+    "wrong_direction",           # evaluated, never the way asked for
+    "step_limit",                # ran out of statement budget first
+    "loop_limit",                # a loop did not terminate
+    "verified",                  # observed taking the requested direction
+)
+
+# Everything from here on is a plan that exists and is representable, and
+# failed only when it was actually run.
+_RUN_STAGES = ("target_not_reached", "decision_not_observed", "wrong_direction",
+               "step_limit", "loop_limit", "verified")
+
+
+def _verify_direction(program, plan, branch, direction: bool, entry: str):
+    """Did this plan actually take the decision the way it was asked to?
+
+    Returns one of the run dispositions and a sentence for the histogram.
+
+    Reaching a paragraph is not the request. A run can enter the paragraph
+    without evaluating this decision at all (it sits under another condition),
+    evaluate it the other way, or stop on the statement budget before getting
+    there - and all three used to be reported as an exported candidate. The
+    decision is identified the same way everywhere else in this repository:
+    paragraph, ordinal within that paragraph, kind. Line is not enough,
+    because COPY expansion puts several decisions on one.
+    """
+    from .interpreter import MAX_STEPS, Interpreter
+    from .conformance_defaults import io_defaults
+
+    try:
+        interp = Interpreter(program, plan.input_state(),
+                             stubs=plan.stub_plan(), terminals=plan.terminals,
+                             defaults=io_defaults(program, "bare"))
+        trace = interp.run(entry)
+    except Exception as exc:                                 # noqa: BLE001
+        return "planner_exception", "interpreter raised %s" % type(exc).__name__
+
+    # Limits first: a run that stopped early did not decline to take the
+    # direction, it never got the chance, and calling that a wrong direction
+    # would send someone to fix the solver instead of the budget.
+    if trace.runaway:
+        return "loop_limit", "loop did not terminate in %s" % trace.runaway
+    if trace.steps >= MAX_STEPS:
+        return "step_limit", ("ran out of statement budget (%d) before the "
+                              "decision" % MAX_STEPS)
+
+    key = (branch.paragraph, branch.ordinal, branch.kind)
+    seen = {bool(g.result) for g in trace.guards
+            if (g.paragraph, g.ordinal,
+                _KIND_OF_GUARD.get(g.kind, g.kind)) == key}
+    if seen:
+        if bool(direction) in seen:
+            return "verified", ""
+        return "wrong_direction", ("%s ordinal %d went only %s"
+                                   % (branch.paragraph, branch.ordinal,
+                                      sorted(seen)[0]))
+    if branch.paragraph not in trace.entered_set:
+        return "target_not_reached", ("never entered %s" % branch.paragraph)
+    return "decision_not_observed", ("entered %s but ordinal %d was never "
+                                     "evaluated" % (branch.paragraph,
+                                                    branch.ordinal))
+
+
+# The interpreter names a loop by the verb it saw, `branches_of` by what it
+# is. Same join `coverage._KIND` makes; without it every LOOP direction is
+# unverifiable and is reported as never observed.
+_KIND_OF_GUARD = {"PERFORM_UNTIL": "LOOP", "PERFORM_VARYING": "LOOP"}
 
 
 def _obligation_text(obligation) -> str:
@@ -1423,25 +1505,43 @@ def cmd_export(args):
                                        capability=(capability if args.profile_aware
                                                    else None))
             except Exception as exc:                         # noqa: BLE001
-                counts["unreached_internally"] += 1
-                note("unreached_internally", type(exc).__name__)
+                counts["planner_exception"] += 1
+                note("planner_exception", type(exc).__name__)
                 continue
             if not plan.chain:
-                counts["unreached_internally"] += 1
-                note("unreached_internally", "no route from %s" % entry)
+                counts["no_call_chain"] += 1
+                note("no_call_chain", "nothing routes to %s from %s"
+                     % (branch.paragraph, entry))
                 continue
             if plan.open_obligations:
-                counts["unsolved"] += 1
+                counts["unsolved_obligation"] += 1
                 for obligation in plan.open_obligations[:2]:
-                    note("unsolved", _obligation_text(obligation))
+                    note("unsolved_obligation", _obligation_text(obligation))
                 continue
             blocked = unrepresentable(plan, capability)
             if blocked:
-                counts["unrepresentable"] += 1
-                for reason in blocked[:2]:
-                    note("unrepresentable", reason)
+                from .capability import refusal_kind
+                # One disposition per attempt, so the first reason decides.
+                # Every reason still reaches the histogram, since a target
+                # blocked on three things needs all three widened.
+                counts[refusal_kind(blocked[0])] += 1
+                for reason in blocked[:3]:
+                    note(refusal_kind(reason), reason)
                 continue
-            counts["exported"] += 1
+
+            # A plan that solves and is representable has still not been shown
+            # to do the thing it was asked to do. Reaching the paragraph is
+            # not the request: the request is that *this* decision goes *this*
+            # way, and a run can enter the paragraph without ever evaluating
+            # it, or evaluate it the other way, or stop on a limit before
+            # arriving. Counting those as successes is how a witness comes
+            # back green having covered nothing.
+            verdict, detail = _verify_direction(program, plan, branch,
+                                                direction, entry)
+            counts[verdict] += 1
+            if verdict != "verified":
+                note(verdict, detail)
+                continue
             row = {"paragraph": branch.paragraph, "ordinal": branch.ordinal,
                    "kind": branch.kind, "direction": direction,
                    "condition": branch.condition, "line": branch.line}
@@ -1451,19 +1551,25 @@ def cmd_export(args):
                                        entry=entry)
                 script["direction"] = row
                 scripts.append(script)
-            if args.limit and counts["exported"] >= args.limit:
+            if args.limit and counts["verified"] >= args.limit:
                 break
         else:
             continue
         break
 
     attempted = sum(counts[s] for s in _STAGES if s != "not_wanted")
+    # The invariant this section exists to provide, checked rather than
+    # asserted in prose: every direction considered ended on exactly one
+    # disposition, so the columns add up to the work that was done.
+    considered = sum(counts.values())
+    unaccounted = considered - attempted - counts["not_wanted"]
     from .directions import program_mismatch
     payload = {
         "program": program.name, "entry": entry, "profile": source,
         "wrong_program": program_mismatch(capability, program) or None,
         "work_list": resolution.summary(),
         "attempted": attempted, "counts": counts,
+        "unaccounted": unaccounted,
         "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])[:20]),
         "exported": rows,
     }
@@ -1483,14 +1589,26 @@ def cmd_export(args):
             print("   work list: %d directions from %d entries, %d unresolved"
                   % (work["directions"], work["entries_matched"],
                      work["entries_unresolved"]))
-        print("\n   %d attempted" % p["attempted"])
+        print("\n   %d attempted, each with exactly one disposition"
+              % p["attempted"])
         for stage in _STAGES:
             if stage == "not_wanted":
                 continue
-            print("      %-24s %5d" % (stage, p["counts"][stage]))
+            count = p["counts"][stage]
+            if not count and stage not in ("verified",):
+                continue
+            mark = "  <- ran, and did the thing asked" if stage == "verified" \
+                else ("  (ran)" if stage in _RUN_STAGES else "")
+            print("      %-26s %5d%s" % (stage, count, mark))
         if p["counts"]["not_wanted"]:
-            print("      %-24s %5d   (not on the work list)"
+            print("      %-26s %5d   (not on the work list)"
                   % ("skipped", p["counts"]["not_wanted"]))
+        if p["unaccounted"]:
+            # Should be impossible; said out loud rather than trusted,
+            # because "every attempt has exactly one disposition" is the
+            # whole point of the section.
+            print("      %-26s %5d   ACCOUNTING BUG"
+                  % ("unaccounted", p["unaccounted"]))
         if p["reasons"]:
             print("\n   why")
             for reason, count in p["reasons"].items():
