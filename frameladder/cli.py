@@ -423,8 +423,21 @@ def cmd_coverage(args):
         # One plan per decision *direction*, which is what the metric counts.
         from .coverage import branches_of
         from .ladder import plan_for_branch
+        from .capability import load as _load_capability, unrepresentable
+        capability = _load_capability(getattr(args, "capability", None))
+        wanted = capability.wanted
+        skipped_covered = skipped_unrepresentable = 0
         for b in branches_of(program):
             for direction in (True, False):
+                # The harness's own work list, when it supplied one. Planning
+                # for a direction it has already covered spends the budget on
+                # something that cannot pay - measured on one integration,
+                # every plan that survived to execution landed on covered
+                # code.
+                if wanted and (b.paragraph.upper(), b.ordinal, b.kind.upper(),
+                               bool(direction)) not in wanted:
+                    skipped_covered += 1
+                    continue
                 try:
                     plan = plan_for_branch(program, b.paragraph, b.line,
                                            direction, entry=args.entry,
@@ -435,6 +448,14 @@ def cmd_coverage(args):
                 except Exception:                            # noqa: BLE001
                     continue
                 if not plan.chain:
+                    continue
+                # A binding the harness cannot inject is a value it will drop
+                # in projection, and the plan then runs meaning nothing. Far
+                # better to know here, where it costs one comparison, than
+                # after the program has been compiled and run.
+                blocked = unrepresentable(plan, capability)
+                if blocked:
+                    skipped_unrepresentable += 1
                     continue
                 for world in WORLDS:
                     trace = run_plan(plan, world)
@@ -528,6 +549,9 @@ def cmd_coverage(args):
         "program": program.name, "entry": entry,
         "learned": learned.summary() if args.learn else None,
         "lift": lift_stats,
+        "capability": ({"targets_skipped_already_covered": skipped_covered,
+                        "plans_skipped_unrepresentable": skipped_unrepresentable}
+                       if capability.stated else None),
         "unreached_paragraphs": gaps["paragraphs"],
         "untouched_branches": [{"paragraph": b.paragraph, "line": b.line,
                                 "kind": b.kind, "condition": b.condition}
@@ -1016,6 +1040,12 @@ def build_parser():
                     help="also aim a plan at each decision direction")
     cv.add_argument("--families", type=int, default=0,
                     help="also run N divergence-family members per target")
+    cv.add_argument("--capability", metavar="FILE",
+                    help="harness capability profile: which variables it can "
+                         "inject, which operations it can replay, and which "
+                         "branch directions it still needs. Plans it could "
+                         "not represent are skipped before solving instead of "
+                         "being dropped in projection afterwards")
     cv.add_argument("--lift", type=int, default=0, metavar="N",
                     help="up to N runs of the frontier search: solve for the "
                          "next decision from a state that already reached it, "

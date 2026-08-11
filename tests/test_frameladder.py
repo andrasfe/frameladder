@@ -2553,3 +2553,63 @@ class TestConditionalPhrases(unittest.TestCase):
 """)
         self.assertEqual(prog.paragraph("CP-TAIL")["statements"][0]["type"],
                          "DISPLAY")
+
+
+class TestCapabilityProfile(unittest.TestCase):
+    """What the harness can do is a constraint, not a filter applied later."""
+
+    def _plan(self):
+        from frameladder.ladder import build_plan
+        p = program(HEADER + """       01  WS-IN PIC X.
+       PROCEDURE DIVISION.
+       CP-MAIN.
+           IF WS-IN = 'A'
+              PERFORM CP-DEEP
+           END-IF
+           GOBACK
+           .
+       CP-DEEP.
+           EXIT
+           .
+""")
+        return build_plan(p, "CP-DEEP", entry="CP-MAIN")
+
+    def test_absent_section_states_no_constraint(self):
+        from frameladder.capability import load, unrepresentable
+        cap = load({"schema_version": "1.0"})
+        self.assertTrue(cap.can_inject("ANYTHING"))
+        self.assertTrue(cap.can_replay("READ:F"))
+        self.assertEqual(unrepresentable(self._plan(), cap), [])
+
+    def test_empty_section_states_it_can_do_none(self):
+        # The difference matters: a harness must be able to say "I cannot
+        # inject anything, plan around it". Reading an empty list as "no
+        # constraint" silently re-enables everything it just ruled out.
+        from frameladder.capability import load, unrepresentable
+        cap = load({"schema_version": "1.0", "injectable_variables": []})
+        self.assertFalse(cap.can_inject("WS-IN"))
+        self.assertTrue(unrepresentable(self._plan(), cap),
+                        "a plan binding WS-IN cannot be represented")
+
+    def test_reason_names_the_capability_not_the_symptom(self):
+        from frameladder.capability import load, unrepresentable
+        cap = load({"schema_version": "1.0", "injectable_variables": ["OTHER"]})
+        reasons = unrepresentable(self._plan(), cap)
+        self.assertTrue(any("WS-IN" in r for r in reasons), reasons)
+
+    def test_a_qualified_name_is_matched_by_its_declaration(self):
+        # The harness lists what it declares; a plan may bind the qualified
+        # spelling of the same field.
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0", "injectable_variables": ["ACCT-ID"]})
+        self.assertTrue(cap.can_inject("ACCT-ID OF MAPAI"))
+
+    def test_a_newer_harness_does_not_break_an_older_planner(self):
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0", "something_from_the_future": [1]})
+        self.assertTrue(cap.stated)
+
+    def test_a_different_major_version_is_refused(self):
+        from frameladder.capability import load
+        with self.assertRaises(ValueError):
+            load({"schema_version": "2.0"})
