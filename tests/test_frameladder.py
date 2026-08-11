@@ -3525,3 +3525,131 @@ class TestCapabilityDiscriminators(unittest.TestCase):
                     "replayable_operations": [
                         {"op_key": "READ:F", "matches_on_state": False}]})
         self.assertIs(cap.discriminates("READ:F"), False)
+
+
+class TestLabelParsing(unittest.TestCase):
+    """Labels the parser must not lose, and namesakes it must not hide."""
+
+    def test_a_space_before_the_period_still_starts_a_paragraph(self):
+        # `1000-INIT .` is legal and appears in real source. Requiring the
+        # period to touch the name does not raise - it silently absorbs the
+        # paragraph's statements into whichever one came before, so the label
+        # is unreachable and the body is attributed to a neighbour.
+        p = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       LP-MAIN.
+           PERFORM LP-SPACED
+           GOBACK
+           .
+       LP-SPACED .
+           MOVE 'A' TO WS-A
+           .
+""")
+        self.assertIn("LP-SPACED", p.paragraph_names)
+
+    def test_a_space_before_the_period_still_starts_a_section(self):
+        p = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       LP-MAIN.
+           GOBACK
+           .
+       LP-SECT SECTION .
+           MOVE 'A' TO WS-A
+           .
+""")
+        self.assertIn("LP-SECT", p.paragraph_names)
+
+    def test_duplicate_paragraph_names_are_reported_not_hidden(self):
+        # Legal COBOL, and this parser keeps a flat list: `paragraph()`
+        # returns the first, so every later namesake is parsed, indexed and
+        # unreachable by name. Stated, because a silent wrong answer is worse
+        # than a known limitation.
+        p = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       LP-MAIN.
+           GOBACK
+           .
+       LP-TWICE.
+           MOVE 'A' TO WS-A
+           .
+       LP-TWICE.
+           MOVE 'B' TO WS-A
+           .
+""")
+        self.assertEqual(p.duplicate_paragraphs, {"LP-TWICE": 2})
+
+    def test_a_program_without_namesakes_reports_none(self):
+        p = program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       LP-ONLY.
+           GOBACK
+           .
+""")
+        self.assertEqual(p.duplicate_paragraphs, {})
+
+
+class TestConditionTails(unittest.TestCase):
+    """Words that end a statement, not a comparison."""
+
+    def _atoms(self, text):
+        from frameladder.conditions import condition_atoms
+        return [(getattr(a.lhs, "name", None), a.op, getattr(a.rhs, "value", None))
+                for alt in condition_atoms(text) for a in alt]
+
+    def test_a_trailing_then_is_not_part_of_the_literal(self):
+        # Left in place the right-hand side becomes the literal "'00' THEN",
+        # which nothing the program can hold ever equals - so the direction is
+        # not merely mis-parsed, it is permanently unsatisfiable, silently.
+        self.assertEqual(self._atoms("WS-STATUS = '00' THEN"),
+                         [("WS-STATUS", "=", "00")])
+
+    def test_a_trailing_next_sentence_is_not_part_of_the_literal(self):
+        self.assertEqual(self._atoms("WS-A = 'X' NEXT SENTENCE"),
+                         [("WS-A", "=", "X")])
+
+    def test_both_tails_at_once(self):
+        self.assertEqual(self._atoms("WS-A = 'X' THEN NEXT SENTENCE"),
+                         [("WS-A", "=", "X")])
+
+    def test_a_name_ending_in_then_is_left_alone(self):
+        # The tail is a separate word. A field called WS-THEN is not a tail,
+        # and stripping by substring would eat it.
+        self.assertEqual(self._atoms("WS-THEN = '1'"), [("WS-THEN", "=", "1")])
+
+
+class TestParenthesisedRelationLists(unittest.TestCase):
+    """`X NOT EQUAL ('00' AND '04')` is one abbreviated combined relation."""
+
+    def _atoms(self, text):
+        from frameladder.conditions import condition_atoms
+        return [[(getattr(a.lhs, "name", None), a.op, getattr(a.rhs, "value", None))
+                 for a in alt] for alt in condition_atoms(text)]
+
+    def test_an_and_list_becomes_a_conjunction(self):
+        self.assertEqual(self._atoms("WS-N NOT EQUAL ('00' AND '04' AND '05')"),
+                         [[("WS-N", "!=", "00"), ("WS-N", "!=", "04"),
+                           ("WS-N", "!=", "05")]])
+
+    def test_an_or_list_becomes_alternatives(self):
+        alts = self._atoms("WS-N = ('00' OR '04')")
+        self.assertEqual(sorted(alts), [[("WS-N", "=", "00")],
+                                        [("WS-N", "=", "04")]])
+
+    def test_a_real_expression_is_left_for_the_ordinary_parser(self):
+        # `(WS-B + 1)` is arithmetic, not a list of operands. Rewriting it
+        # would invent comparisons the program does not make.
+        from frameladder.conditions import _expand_paren_list
+        self.assertEqual(_expand_paren_list("WS-A = (WS-B + 1)"),
+                         "WS-A = (WS-B + 1)")
+
+    def test_an_ordinary_parenthesised_condition_is_untouched(self):
+        from frameladder.conditions import _expand_paren_list
+        text = "(WS-A = 1 AND WS-B = 2)"
+        self.assertEqual(_expand_paren_list(text), text)
+
+    def test_a_mixed_connector_list_is_left_alone(self):
+        # `('00' AND '04' OR '05')` has no single distribution, so it is
+        # reported unchanged rather than guessed at.
+        from frameladder.conditions import _expand_paren_list
+        text = "WS-N NOT EQUAL ('00' AND '04' OR '05')"
+        self.assertEqual(_expand_paren_list(text), text)

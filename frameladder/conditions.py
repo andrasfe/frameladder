@@ -219,7 +219,68 @@ def condition_atoms(condition: str, negate: bool = False,
     thousands of times per run, and re-running the relational-operator
     regex each time dominates everything else.
     """
-    return [list(alt) for alt in _atoms_cached(norm(condition), negate, origin)]
+    return [list(alt) for alt in _atoms_cached(_strip_tail(norm(condition)),
+                                               negate, origin)]
+
+
+# Words that end a condition rather than belong to it. `IF X = '00' THEN` and
+# `IF X = 'Y' NEXT SENTENCE` are both ordinary COBOL, and the tail is part of
+# the *statement*, not of the comparison. Left in place it is swallowed by
+# whatever operand it touches: the right-hand side of the first becomes the
+# literal `'00' THEN`, which nothing the program can hold ever equals, so the
+# direction is not merely mis-parsed - it is permanently unsatisfiable, and
+# nothing says so.
+_TAIL = re.compile(r"\s+(?:THEN|NEXT\s+SENTENCE)\s*$", re.I)
+
+
+def _strip_tail(condition: str) -> str:
+    previous = None
+    while previous != condition:
+        previous = condition
+        condition = _TAIL.sub("", condition).strip()
+    return _expand_paren_list(condition)
+
+
+# `X NOT EQUAL ('00' AND '04' AND '05')` is one abbreviated combined
+# relation, not a comparison against a three-word literal. The subject and
+# the operator distribute over the connector, which is kept: with AND the
+# expansion is a conjunction, with OR a disjunction.
+_PAREN_LIST = re.compile(
+    r"(?P<subject>[A-Z0-9][A-Z0-9\-]*(?:\s+OF\s+[A-Z0-9][A-Z0-9\-]*)*)\s*"
+    r"(?P<op>NOT\s+EQUAL\s+TO|NOT\s+EQUAL|IS\s+NOT\s+EQUAL\s+TO|NOT\s*=|"
+    r"EQUAL\s+TO|EQUALS|EQUAL|=|>=|<=|<>|>|<)\s*"
+    r"\((?P<items>[^()]+)\)", re.I)
+_CONNECTOR = re.compile(r"\s+(AND|OR)\s+", re.I)
+
+
+def _expand_paren_list(condition: str) -> str:
+    """Distribute a relation across a parenthesised list of bare operands.
+
+    Left alone, the whole bracket becomes one right-hand operand and the
+    comparison is against a value no field can hold - the same silent
+    unsatisfiability as a trailing THEN. Only lists whose members carry no
+    relational operator of their own are touched; anything else is a real
+    parenthesised expression and is left for the ordinary parser.
+    """
+    def rewrite(m):
+        items = [p.strip() for p in _CONNECTOR.split(m.group("items"))]
+        operands, connectors = items[0::2], [c.upper() for c in items[1::2]]
+        if len(operands) < 2 or not connectors:
+            return m.group(0)
+        if len(set(connectors)) != 1:
+            return m.group(0)          # mixed AND/OR: not this shape
+        if any(_COMPARE.match(o) or not o for o in operands):
+            return m.group(0)          # a real expression, not a bare list
+        subject, op = m.group("subject"), " ".join(m.group("op").split())
+        joined = (" %s " % connectors[0]).join(
+            "%s %s %s" % (subject, op, operand) for operand in operands)
+        return "(%s)" % joined
+
+    previous = None
+    while previous != condition:
+        previous = condition
+        condition = _PAREN_LIST.sub(rewrite, condition)
+    return condition
 
 
 @lru_cache(maxsize=8192)

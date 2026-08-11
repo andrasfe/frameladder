@@ -595,8 +595,14 @@ def tokenize(lines: Iterable[Line]) -> list[Token]:
     return [t for t in tokens if t.word]
 
 
-_PARA_HEADER = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\.\s*$", re.I)
-_SECTION = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s+SECTION\.\s*$", re.I)
+# The separator period may be preceded by space: `1000-INIT .` and
+# `DATE-CONV SECTION .` are both legal and both appear in real source.
+# Requiring the period to touch the name loses the paragraph entirely - not
+# as an error, but as statements silently absorbed into whichever paragraph
+# came before, so its label is unreachable and its body is attributed to a
+# neighbour.
+_PARA_HEADER = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s*\.\s*$", re.I)
+_SECTION = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s+SECTION\s*\.\s*$", re.I)
 
 
 def _procedure_lines(lines: list[Line]) -> list[Line]:
@@ -1104,6 +1110,27 @@ class Program:
             if p["name"] == upper:
                 return p
         return None
+
+    @property
+    def duplicate_paragraphs(self) -> dict:
+        """Names declared more than once, and how many times.
+
+        A COBOL program may legally repeat a paragraph name in different
+        sections, and `PERFORM` then means the one in scope. This parser keeps
+        a flat list and `paragraph()` returns the first, so every later
+        namesake is shadowed: its statements are parsed, indexed, and
+        unreachable by name. Nothing about that is visible in a plan - the
+        chain simply routes to the wrong body.
+
+        Reported rather than resolved. Resolving needs section-qualified
+        identity throughout, and a silent wrong answer is worse than a stated
+        limitation: an agent that knows two paragraphs share a name can at
+        least distrust the chain that names one.
+        """
+        counts: dict = {}
+        for p in self.paragraphs:
+            counts[p["name"]] = counts.get(p["name"], 0) + 1
+        return {name: n for name, n in counts.items() if n > 1}
 
 
 _COPYBOOK_DIRS = ("cpy", "copy", "copybook", "copybooks", "cpylib", "include",

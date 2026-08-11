@@ -1282,6 +1282,7 @@ def cmd_directions(args):
     payload.update({
         "program": program.name, "profile": source,
         "wrong_program": program_mismatch(capability, program) or None,
+        "duplicate_paragraphs": program.duplicate_paragraphs or None,
         "entries": len(capability.raw_uncovered),
         "ordinals_trusted": capability.trust_ordinals,
         "unresolved": list(resolution.unresolved)[: args.limit],
@@ -1294,6 +1295,15 @@ def cmd_directions(args):
         print("%s   profile %s" % (p["program"], p["profile"]))
         if p["wrong_program"]:
             print("\n   WRONG PROGRAM: %s\n" % p["wrong_program"])
+        if p["duplicate_paragraphs"]:
+            # Worth saying before anything else about targeting: a work list
+            # naming one of these names cannot mean a single decision, and
+            # nothing downstream can tell which body it reached.
+            print("\n   DUPLICATE PARAGRAPH NAMES - a chain naming one of "
+                  "these reaches the first, and later namesakes are "
+                  "unreachable by name:")
+            for name, count in sorted(p["duplicate_paragraphs"].items()):
+                print("      %-32s declared %d times" % (name, count))
         print("   %d entries -> %d directions on %d decisions"
               % (p["entries"], p["directions"], p["entries_matched"]))
         for how, count in p["by_method"].items():
