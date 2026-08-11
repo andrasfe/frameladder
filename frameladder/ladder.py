@@ -725,7 +725,8 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                         # nothing, and every consumer that trusted `solved`
                         # was misled.
                         makers = prov.establishing_writes(var_term.name, op,
-                                                          const_term.value)
+                                                          const_term.value,
+                                                          at=at)
                         if makers:
                             for w in makers:
                                 for guard in w.guards:
@@ -780,7 +781,8 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 # that write to be reached is better than pinning the entry
                 # value, which fights the program's own MOVE and costs the
                 # status-flag directions that depend on it.
-                if not prov.establishing_writes(var_term.name, op, value):
+                if not prov.establishing_writes(var_term.name, op, value,
+                                                at=at):
                     # Mark it as entry-supplied. The reason says the entry
                     # state is the only candidate, and `input_state` emitted
                     # only `input`/`unknown` producers - so binding against

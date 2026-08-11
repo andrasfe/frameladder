@@ -276,6 +276,27 @@ class Provenance:
                                 pname, line, "FILL", source=src.name,
                                 guards=tuple(guards), literals=dict(literals))
 
+                elif kind == "INITIALIZE":
+                    # The interpreter has always executed this; provenance did
+                    # not model it, so the two disagreed about the same
+                    # program. Nothing appeared to write the field, so the
+                    # solver bound it in the entry state - and the statement
+                    # then erased it before the read that wanted it. Inputs
+                    # constructed and wiped before use, with no obligation
+                    # recorded anywhere to say so.
+                    #
+                    # Deliberately mirrors `Interpreter._initialize`: every
+                    # elementary item under the operand, numeric to 0 and the
+                    # rest to spaces, FILLER untouched, and REPLACING writing
+                    # only the categories it names. Where the two models
+                    # disagree the solver plans against a program that is not
+                    # the one that runs.
+                    for target, source in self._initialized(stmt):
+                        self._add(target, Writer(pname, line, "MOVE",
+                                                 source=source,
+                                                 guards=tuple(guards),
+                                                 literals=dict(literals)))
+
                 elif kind == "SET":
                     name = attrs.get("name")
                     if name:
@@ -354,6 +375,52 @@ class Provenance:
                                                             source=text,
                                                             guards=tuple(guards)))
             walk_guarded(para, visit)
+
+    def _initialized(self, stmt) -> list:
+        """Every field an INITIALIZE writes, and the literal it leaves there.
+
+        Returned as `(field, source)` where `source` is spelled the way a MOVE
+        source would be, so the rest of provenance - `establishing_writes`,
+        `blocking_writes`, the producer walk - reads it without knowing this
+        statement exists. Recorded as kind MOVE for the same reason: it *is* a
+        literal assignment, and a separate kind would be silently ignored by
+        every consumer that filters on one.
+        """
+        text = norm(stmt.get("text", ""))
+        replacing: list = []
+        parts = re.split(r"\bREPLACING\b", text, maxsplit=1, flags=re.I)
+        if len(parts) > 1:
+            for m in re.finditer(
+                    r"\b(ALPHANUMERIC-EDITED|NUMERIC-EDITED|ALPHANUMERIC|"
+                    r"ALPHABETIC|NUMERIC|NATIONAL)(?:\s+DATA)?\s+BY\s+(\S+)",
+                    parts[1], re.I):
+                replacing.append((m.group(1).upper(), m.group(2)))
+        body = re.sub(r"^INITIALIZE\s+", "", parts[0], flags=re.I)
+
+        out: list = []
+        for name in re.split(r"[,\s]+", body):
+            name = name.split("(")[0].strip().upper().rstrip(".")
+            if not name or name in ("ALL", "TO", "VALUE", "THRU", "THROUGH"):
+                continue
+            children = [c for c in self.model.descendants(name)
+                        if self.model.pic_of(c)]
+            for field in (children or [name]):
+                upper = (field or "").upper()
+                # FILLER occupies bytes and carries no name a statement can
+                # reach, and INITIALIZE leaves it exactly as it was.
+                if upper == "FILLER" or upper.startswith("FILLER#"):
+                    continue
+                spec = (self.model.pic_of(field) or "").upper()
+                numeric = bool(spec) and "9" in spec and "X" not in spec
+                if replacing:
+                    want = "NUMERIC" if numeric else "ALPHANUMERIC"
+                    chosen = [v for c, v in replacing if c.startswith(want[:5])]
+                    if not chosen:
+                        continue          # this category keeps what it held
+                    out.append((field, chosen[0]))
+                    continue
+                out.append((field, "0" if numeric else "SPACES"))
+        return out
 
     def _is_payload(self, var: str) -> bool:
         return any(w.kind == "STUB" for w in self.writers.get(var.upper(), []))
@@ -681,7 +748,30 @@ class Provenance:
                 out.append(w)
         return out
 
-    def establishing_writes(self, var: str, op: str, value) -> list:
+    def _can_precede(self, w: Writer, at: tuple | None) -> bool:
+        """Could this write run before a read at ``at``?
+
+        Only the *strictly later* case is excluded, and only when there is an
+        execution order to say so. `execution_order` is a depth-first
+        preference rather than a fact - an `ALTER`ed dispatcher makes any
+        single static order a guess - so it is used here to rule a write out
+        only when it sits later in that order *and* in a different paragraph.
+        Everything unknown still counts as preceding, which is the safe
+        direction: over-counting a blocker costs a plan, under-counting one
+        ships an input the program erases before it is read.
+        """
+        if not at or not self.order:
+            return True
+        para, line = at
+        if w.para == para:
+            return w.line < line
+        here, there = self._rank(para), self._rank(w.para)
+        if here == 10 ** 6 or there == 10 ** 6:
+            return True                    # one of them is not in the order
+        return there <= here
+
+    def establishing_writes(self, var: str, op: str, value,
+                            at: tuple | None = None) -> list:
         """Conditional writes that would satisfy ``var op value`` if they ran.
 
         The mirror of :meth:`blocking_writes`. When an obligation cannot be
@@ -698,6 +788,13 @@ class Provenance:
         out = []
         for w in self.writes_to(var):
             if w.kind not in ("MOVE", "SET"):
+                continue
+            if not self._can_precede(w, at):
+                # A write that only runs after the read cannot be the thing
+                # that supplies it. Without this, modelling INITIALIZE turned
+                # 105 plans that verifiably worked into unsolved obligations,
+                # because a clear-down later in the program was read as the
+                # producer of a value needed earlier.
                 continue
             src = parse_term(w.source)
             if src.kind == "const" and holds(src.value, op, value):
