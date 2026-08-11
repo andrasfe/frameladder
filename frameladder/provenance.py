@@ -628,11 +628,35 @@ class Provenance:
         if not writers:
             return self._from_record(var, depth, seen)
 
-        for w in writers:
+        for index, w in enumerate(writers):
             if w.kind == "MOVE":
                 src = parse_term(w.source)
                 if src.kind == "const":
                     if len(writers) == 1:
+                        return Producer("literal", var=var, site=w.para,
+                                        value=src.value, trace=(var,))
+                    # The *reaching definition*, when it is unconditional, is
+                    # the value at this read - nothing can steer around it, so
+                    # walking past it to an earlier write binds a value the
+                    # program has already thrown away.
+                    #
+                    # `visible(var, at)` puts the nearest preceding write
+                    # first, and skipping a constant whenever the field has
+                    # more than one writer ignored that ordering entirely. Two
+                    # unconditional MOVEs in a caller - one from an input, then
+                    # one from a literal - and the plan bound the input,
+                    # reported no open obligation, and never reached the
+                    # target. Bound, unreported, and wrong.
+                    #
+                    # Scoped to a write in the *same paragraph*, before the
+                    # read. Across paragraphs "nearest" is a static-order
+                    # guess about which write reaches, and treating a guess as
+                    # a hard literal calls solvable routes impossible - it
+                    # cost 23 witnesses when tried. A *conditional* write also
+                    # falls through: that one can be steered around, which is
+                    # `blocking_writes`' job.
+                    if (at and index == 0 and not w.conditional
+                            and w.para == at[0] and w.line < at[1]):
                         return Producer("literal", var=var, site=w.para,
                                         value=src.value, trace=(var,))
                     continue

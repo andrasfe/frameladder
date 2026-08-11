@@ -4004,3 +4004,95 @@ class TestReachProfile(unittest.TestCase):
                                              "RP-MAIN")
         self.assertIn(verdict, ("target_not_reached", "verified",
                                 "wrong_direction", "decision_not_observed"))
+
+
+class TestReachingDefinition(unittest.TestCase):
+    """The nearest preceding write is the value at the read.
+
+    Everything a caller does between paragraph entry and the PERFORM matters:
+    its guards, its earlier exits, and its state changes. The first two were
+    already modelled; the third was not, and the failure was silent.
+    """
+
+    def _plan(self, caller_body):
+        from frameladder.ladder import build_plan
+        p = program(HEADER + """       01  WS-FLAG PIC X.
+       01  WS-IN   PIC X.
+       01  WS-HIT  PIC X.
+       PROCEDURE DIVISION.
+       RD-MAIN.
+           PERFORM RD-CALLER
+           GOBACK
+           .
+       RD-CALLER.
+""" + caller_body + """           .
+       RD-TARGET.
+           MOVE 'Y' TO WS-HIT
+           .
+       RD-DONE.
+           EXIT
+           .
+""")
+        return p, build_plan(p, "RD-TARGET", entry="RD-MAIN")
+
+    def _runs(self, p, plan):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        interp = Interpreter(p, plan.input_state(), stubs=plan.stub_plan(),
+                             terminals=plan.terminals,
+                             defaults=io_defaults(p, "bare"))
+        interp.run("RD-MAIN")
+        return interp.state.get("WS-HIT") == "Y"
+
+    def test_a_later_unconditional_literal_is_not_walked_past(self):
+        # The plan used to bind WS-IN through the *first* MOVE, ignore the
+        # second, report no open obligation, and never reach the target.
+        # Bound, unreported, and wrong - the worst shape there is.
+        _p, plan = self._plan("""           MOVE WS-IN TO WS-FLAG
+           MOVE 'N' TO WS-FLAG
+           IF WS-FLAG = 'Y'
+              PERFORM RD-TARGET
+           END-IF""")
+        self.assertTrue(plan.open_obligations,
+                        "the route is impossible and must say so")
+        self.assertNotIn("WS-IN", plan.input_state())
+
+    def test_a_guard_on_the_callsite_still_solves(self):
+        p, plan = self._plan("""           IF WS-FLAG = 'Y'
+              PERFORM RD-TARGET
+           END-IF""")
+        self.assertEqual(plan.open_obligations, [])
+        self.assertTrue(self._runs(p, plan))
+
+    def test_a_state_change_before_the_callsite_still_lifts(self):
+        # The write is a rename, so the obligation transfers to its source.
+        p, plan = self._plan("""           MOVE WS-IN TO WS-FLAG
+           IF WS-FLAG = 'Y'
+              PERFORM RD-TARGET
+           END-IF""")
+        self.assertEqual(plan.input_state().get("WS-IN"), "Y")
+        self.assertTrue(self._runs(p, plan))
+
+    def test_an_earlier_exit_is_still_avoided(self):
+        p, plan = self._plan("""           IF WS-IN = 'Q'
+              GO TO RD-DONE
+           END-IF
+           IF WS-FLAG = 'Y'
+              PERFORM RD-TARGET
+           END-IF""")
+        self.assertNotEqual(plan.input_state().get("WS-IN"), "Q")
+        self.assertTrue(self._runs(p, plan))
+
+    def test_a_conditional_literal_is_still_steerable(self):
+        # A write under a guard can be avoided, so it must NOT become the
+        # reaching definition - that is `blocking_writes`' job, and turning it
+        # into a hard literal would call a solvable route impossible.
+        p, plan = self._plan("""           MOVE WS-IN TO WS-FLAG
+           IF WS-IN = 'Z'
+              MOVE 'N' TO WS-FLAG
+           END-IF
+           IF WS-FLAG = 'Y'
+              PERFORM RD-TARGET
+           END-IF""")
+        self.assertEqual(plan.open_obligations, [])
+        self.assertTrue(self._runs(p, plan))
