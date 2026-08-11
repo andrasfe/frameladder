@@ -19,7 +19,7 @@ is a deliberate property, not an accident of youth — see *Invariants*.
 ## Commands
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q      # 237 unit tests, seconds
+python3 -m pytest tests/test_frameladder.py -q      # 243 unit tests, seconds
 python3 tests/parser_agreement.py                    # parser vs reference ASTs
 python3 -m conformance.differential  <programs>      # interpreter vs GnuCOBOL
 python3 -m conformance.plan_check    <programs>      # do plans reach, in GnuCOBOL?

@@ -160,6 +160,65 @@ def _direct_children(model, group: str) -> list:
     return cached[1].get(group.upper(), [])
 
 
+def occurrence_span(model, name: str):
+    """``(group, offset_of_occurrence_1, element_length, count)`` or None.
+
+    A table's occurrences are bytes inside the group that contains them, not
+    separate storage: at runtime `WS-CELL(2)` is read out of `WS-TAB`, and
+    the flat name `WS-CELL` is only ever occurrence one. Anything that wants
+    to *set* occurrence two therefore has to write the group, and this is
+    where the arithmetic for that lives.
+    """
+    upper = (name or "").upper()
+    times = (model.occurs or {}).get(upper, 0)
+    if not times:
+        return None
+    for group in _containers(model, upper):
+        for field in record_layout(model, group):
+            if field.name == upper and field.occurs == times and field.length:
+                element = field.length // times
+                if element:
+                    return group, field.offset, element, times
+    return None
+
+
+def _containers(model, name: str) -> list:
+    """Groups that contain this field, innermost first."""
+    out = []
+    for group, kids in (getattr(model, "children", {}) or {}).items():
+        if name in [k.upper() for k in kids]:
+            out.append(group.upper())
+    if out:
+        return out
+    # No child index: fall back to any declared group that lists it as a
+    # descendant, which is the same relation the interpreter reads.
+    return [g for g in (getattr(model, "pic", {}) or {})
+            if name in [d.upper() for d in model.descendants(g)]]
+
+
+def place_occurrences(model, base: str, values: dict, current: str = "") -> str:
+    """Compose a group's bytes from ``{occurrence_number: value}``.
+
+    Returns the group's new value. Occurrences the caller did not name keep
+    whatever `current` held, so setting occurrence two does not blank
+    occurrence one.
+    """
+    span = occurrence_span(model, base)
+    if not span:
+        return current
+    _group, offset, element, times = span
+    width = offset + element * times
+    buffer = list((current or "").ljust(width)[:width])
+    for number, value in values.items():
+        if not (1 <= number <= times):
+            continue
+        start = offset + element * (number - 1)
+        text = str(value)
+        text = text[:element] if len(text) > element else text.ljust(element)
+        buffer[start:start + element] = list(text)
+    return "".join(buffer)
+
+
 def render(model, root: str, values: dict | None = None) -> str:
     """The record as bytes, with any known values placed in their fields."""
     fields = record_layout(model, root)

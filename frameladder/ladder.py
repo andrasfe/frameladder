@@ -12,6 +12,7 @@ from .graph import (build_graph, chain_via, execution_order, shortest_chain,
                     survival_atoms)
 from .ir import (Atom, Binding, Plan, Producer, Term, flip, holds,
                  negate_atom, parse_term)
+from .layout import occurrence_span, place_occurrences
 from .provenance import Provenance
 
 
@@ -457,6 +458,68 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         bindings.append(b)
         return True
 
+    cells: dict = {}                    # base field -> {occurrence: value}
+
+    def _variably_subscripted(all_atoms) -> set:
+        """Tables this plan indexes by something other than a literal."""
+        out: set = set()
+        for a in all_atoms:
+            for term in (getattr(a, "lhs", None), getattr(a, "rhs", None)):
+                index = getattr(term, "index", ()) or ()
+                if not index:
+                    continue
+                if any(not str(i).strip().isdigit() for i in index):
+                    out.add(term.name.upper())
+        return out
+
+    def bind_cell(term, value, atom, op: str) -> bool:
+        """Bind one occurrence of a table, by composing its group's bytes.
+
+        Returns False when this is not a literal-subscripted reference to a
+        table with a known layout, in which case the ordinary path runs.
+
+        Only equality, and only a constant subscript. `WS-CELL(WS-I)` names
+        whichever occurrence the index holds at that moment, which is a
+        different question and is left alone rather than guessed at.
+        """
+        if op != "=" or len(term.index) != 1:
+            return False
+        if term.name.upper() in variably_subscripted:
+            # Somewhere else in this plan the same table is indexed by a
+            # variable, which binds the flat base name - occurrence one. Using
+            # the group here as well would put two spellings of the same bytes
+            # in one entry state, and whichever the interpreter seeds second
+            # wins. Better to leave the whole field on the old path than to
+            # emit a state that contradicts itself.
+            return False
+        try:
+            number = int(str(term.index[0]).strip())
+        except (TypeError, ValueError):
+            return False
+        span = occurrence_span(model, term.name)
+        if not span:
+            return False
+        group, _offset, _element, _times = span
+        seen = cells.setdefault(term.name.upper(), {})
+        if seen.get(number) not in (None, value):
+            return False                # same occurrence, two values: a real
+        seen[number] = value             # conflict, so let the normal path say so
+        composed = place_occurrences(model, term.name, seen)
+        producer = prov.producer(group, None)
+        prior = assigned.get(producer.slot)
+        if prior is not None:
+            # Merge rather than collide: later occurrences are more bytes of
+            # a group this plan already owns.
+            prior.value = composed
+            prior.reason = ("occurrences %s of %s"
+                            % (",".join(str(n) for n in sorted(seen)),
+                               term.name))
+            return True
+        return bind(producer, composed,
+                    "occurrence %d of %s  [%s]"
+                    % (number, term.name, getattr(atom, "origin", "")),
+                    atom=atom)
+
     def extend_sequence(producer: Producer, value, reason: str, atom=None) -> bool:
         """Record a *later* outcome of an operation already given one.
 
@@ -524,6 +587,7 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
 
     # Solve per variable, not per obligation: gather every comparison first.
     wanted_by_var = constraints_on(atoms + [a for a, _ in derived], model)
+    variably_subscripted = _variably_subscripted(atoms + [a for a, _ in derived])
 
     queue = deque((a, 0) for a in atoms)
     handled: set = set()
@@ -656,6 +720,17 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
             if value is None:
                 failures.append("no witness value for %s" % candidate)
                 continue
+
+            # Two obligations on *different occurrences* of one table are not
+            # in conflict: they are different bytes of the same group, the
+            # same way two outcomes of one READ are consecutive rather than
+            # contradictory. Keyed on the base name they collided, so
+            # `WS-CELL(1) = 'A' AND WS-CELL(2) = 'B'` bound the first and
+            # reported the second as an open obligation - a plainly
+            # satisfiable condition called unsolvable.
+            if bind_cell(var_term, value, candidate, op):
+                settled = True
+                break
 
             producer = prov.producer(var_term.name, at)
             existing = assigned.get(producer.slot)

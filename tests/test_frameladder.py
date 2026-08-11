@@ -3835,3 +3835,82 @@ class TestCursorSequences(unittest.TestCase):
         trace = interp.run("CS-MAIN")
         self.assertEqual(interp.state.get("SQLCODE"), 100)
         self.assertFalse(trace.runaway)
+
+
+class TestOccurrenceIdentity(unittest.TestCase):
+    """`FIELD(1)` and `FIELD(2)` are different bytes, not one knob."""
+
+    SRC = HEADER + """       01  WS-TAB.
+           05  WS-CELL PIC X OCCURS 5 TIMES.
+       01  WS-OK PIC X.
+       PROCEDURE DIVISION.
+       OC-MAIN.
+           IF WS-CELL(1) = 'A' AND WS-CELL(2) = 'B'
+              MOVE 'Y' TO WS-OK
+           END-IF
+           GOBACK
+           .
+"""
+
+    def _plan(self, src=None):
+        from frameladder.coverage import branches_of
+        from frameladder.ladder import plan_for_branch
+        p = program(src or self.SRC)
+        branch = [b for b in branches_of(p) if b.paragraph == "OC-MAIN"][0]
+        return p, plan_for_branch(p, "OC-MAIN", branch.line, True,
+                                  entry=None, ordinal=branch.ordinal)
+
+    def test_two_occurrences_are_not_a_conflict(self):
+        # Keyed on the base name they collided: the first was bound and the
+        # second reported as an open obligation, so a plainly satisfiable
+        # condition came back unsolvable.
+        _p, plan = self._plan()
+        self.assertEqual(plan.open_obligations, [])
+
+    def test_the_group_carries_both_occurrences(self):
+        _p, plan = self._plan()
+        self.assertEqual(plan.input_state(), {"WS-TAB": "AB   "})
+
+    def test_the_plan_actually_takes_the_direction(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        p, plan = self._plan()
+        interp = Interpreter(p, plan.input_state(), stubs=plan.stub_plan(),
+                             terminals=plan.terminals,
+                             defaults=io_defaults(p, "bare"))
+        interp.run("OC-MAIN")
+        self.assertEqual(interp.state.get("WS-OK"), "Y")
+
+    def test_composition_matches_what_the_interpreter_would_write(self):
+        # The composed bytes must equal what two MOVEs produce, or the plan
+        # is describing a record the program cannot hold.
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        p = program(HEADER + """       01  WS-TAB.
+           05  WS-CELL PIC X OCCURS 5 TIMES.
+       PROCEDURE DIVISION.
+       OC-MAIN.
+           MOVE 'A' TO WS-CELL(1)
+           MOVE 'B' TO WS-CELL(2)
+           GOBACK
+           .
+""")
+        interp = Interpreter(p, {}, defaults=io_defaults(p, "bare"))
+        interp.run("OC-MAIN")
+        from frameladder.layout import place_occurrences
+        self.assertEqual(place_occurrences(p.model, "WS-CELL", {1: "A", 2: "B"}),
+                         interp.state.get("WS-TAB"))
+
+    def test_a_variable_subscript_is_left_alone(self):
+        # `WS-CELL(WS-I)` names whichever occurrence the index holds at that
+        # moment. That is a different question and is not guessed at.
+        from frameladder.layout import occurrence_span
+        p = program(self.SRC)
+        self.assertIsNotNone(occurrence_span(p.model, "WS-CELL"))
+        _p, plan = self._plan(self.SRC.replace("WS-CELL(2)", "WS-CELL(WS-IDX)"))
+        self.assertNotIn("WS-TAB", plan.input_state())
+
+    def test_a_field_that_does_not_occur_has_no_span(self):
+        from frameladder.layout import occurrence_span
+        p = program(self.SRC)
+        self.assertIsNone(occurrence_span(p.model, "WS-OK"))
