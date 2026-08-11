@@ -602,6 +602,14 @@ def tokenize(lines: Iterable[Line]) -> list[Token]:
 # came before, so its label is unreachable and its body is attributed to a
 # neighbour.
 _PARA_HEADER = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s*\.\s*$", re.I)
+# `B1. ADD 1 TO WS-C1.` - a label sharing its line with the first sentence.
+_PARA_INLINE = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s*\.\s+(\S.*)$", re.I)
+# Words that end a sentence on their own and are not labels, so a line like
+# `EXIT. MOVE A TO B` is not read as a paragraph called EXIT. Verbs, not
+# names: a paragraph may legally be called anything else.
+_RESERVED_SENTENCE = re.compile(
+    r"^(?:EXIT|CONTINUE|GOBACK|STOP|NEXT|END-IF|END-EVALUATE|END-PERFORM|"
+    r"ELSE|WHEN|THEN)$", re.I)
 _SECTION = re.compile(r"^([A-Z0-9][A-Z0-9-]*)\s+SECTION\s*\.\s*$", re.I)
 
 
@@ -641,6 +649,21 @@ def split_paragraphs(lines: list[Line]) -> list[tuple[str, list[Line]]]:
             if current_name is not None:
                 paragraphs.append((current_name, current))
             current_name, current = header.group(1).upper(), []
+            continue
+        # A label may share its line with the sentence that follows it -
+        # `B1. ADD 1 TO WS-C1.` is one paragraph, not one statement. Requiring
+        # the label to own the line loses the paragraph silently: nothing can
+        # PERFORM it, so every call to it does nothing at all and the body is
+        # attributed to whichever paragraph came before. Only Area A is
+        # considered, where a bare word followed by a period is a label by
+        # position rather than by guesswork.
+        inline = _PARA_INLINE.match(stripped) if indent <= 4 else None
+        if inline and not _RESERVED_SENTENCE.match(inline.group(1)):
+            if current_name is not None:
+                paragraphs.append((current_name, current))
+            current_name = inline.group(1).upper()
+            current = [Line(line.number,
+                            " " * 11 + inline.group(2))]
             continue
         if current_name is None:
             current_name = ENTRY_PARAGRAPH
@@ -844,9 +867,17 @@ class _Parser:
         # a call: read as `PERFORM <paragraph>` the parser goes looking for a
         # paragraph named after the counter, finds none, and the body that
         # followed becomes ordinary statements that run exactly once.
+        # `PERFORM A 3 TIMES` and `PERFORM A WS-N TIMES` are out-of-line
+        # loops over a named paragraph: TIMES appears at index 2 or later,
+        # after the target. `PERFORM WS-N TIMES` is the inline form, where it
+        # is at index 1 and the first word is the count. Excluding every
+        # statement containing TIMES sent the out-of-line form to the inline
+        # parser, which swallowed the target name and ran the following
+        # statements once.
+        _times_at = upper.index("TIMES") if "TIMES" in upper else -1
         if words and upper[0] not in ("UNTIL", "VARYING", "WITH", "TEST") \
                 and not re.match(r"^\d+$", upper[0]) \
-                and "TIMES" not in upper:
+                and (_times_at < 0 or _times_at >= 2):
             target = words[0].word.upper()
             attrs: dict[str, Any] = {"target": target}
             if "THRU" in upper or "THROUGH" in upper:
@@ -854,15 +885,37 @@ class _Parser:
                 if k + 1 < len(words):
                     attrs["target"] = "%s THRU %s" % (target, words[k + 1].word.upper())
             rest = " ".join(w.word for w in words[1:])
+            # A loop clause on an out-of-line PERFORM was dropped entirely:
+            # `PERFORM A VARYING I FROM 1 BY 1 UNTIL I > 3` kept only the
+            # UNTIL, so the induction variable was never initialised and
+            # never stepped. With I left at its initial value the condition
+            # is decided once and the body runs zero times - not a wrong
+            # count, no iterations at all.
+            if re.search(r"\bTEST\s+AFTER\b", rest, re.I):
+                attrs["test_after"] = True
+            if "VARYING" in upper:
+                attrs["varying"] = rest[rest.upper().index("VARYING"):]
+                return {"type": "PERFORM", "text": text,
+                        "line_start": head.line, "line_end": head.line,
+                        "attributes": attrs, "children": []}
+            if _times_at >= 2:
+                attrs["times"] = " ".join(w.word for w in words[1:])
+                return {"type": "PERFORM", "text": text,
+                        "line_start": head.line, "line_end": head.line,
+                        "attributes": attrs, "children": []}
             m = re.search(r"\bUNTIL\b(.*)", rest, re.I)
             if m:
                 attrs["condition"] = m.group(1).strip()
-                body = self.statements({"END-PERFORM", "."})
-                if self.peek() == "END-PERFORM":
-                    self.i += 1
+                # No inline body. `PERFORM A UNTIL X` loops over paragraph A;
+                # COBOL has no form with both a target and an inline body, so
+                # reading the following statements as one put whatever came
+                # next *inside* the loop. Written without an intervening
+                # period the next statement was swallowed - a GOBACK became
+                # the loop body, ending the run on the first iteration before
+                # the target had run at all.
                 return {"type": "PERFORM", "text": text, "line_start": head.line,
                         "line_end": head.line, "attributes": attrs,
-                        "children": body}
+                        "children": []}
             return {"type": "PERFORM", "text": text, "line_start": head.line,
                     "line_end": head.line, "attributes": attrs, "children": []}
 

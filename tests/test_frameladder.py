@@ -3653,3 +3653,114 @@ class TestParenthesisedRelationLists(unittest.TestCase):
         from frameladder.conditions import _expand_paren_list
         text = "WS-N NOT EQUAL ('00' AND '04' OR '05')"
         self.assertEqual(_expand_paren_list(text), text)
+
+
+class TestOutOfLineLoops(unittest.TestCase):
+    """`PERFORM <para> VARYING/TIMES/TEST AFTER` is a loop over that paragraph.
+
+    The clause was parsed off an out-of-line PERFORM and discarded, leaving
+    only the UNTIL - so the induction variable was never initialised and never
+    stepped, and the body ran *zero* times rather than a wrong number of
+    times. Every expected count here was confirmed against GnuCOBOL.
+    """
+
+    def _run(self, mainline, body="           ADD 1 TO WS-C\n"):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        p = program(HEADER + """       01  WS-I PIC 9(4).
+       01  WS-J PIC 9(4).
+       01  WS-N PIC 9(4).
+       01  WS-C PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       OL-MAIN.
+""" + mainline + """           GOBACK
+           .
+       OL-BODY.
+""" + body + """           .
+""")
+        interp = Interpreter(p, {}, defaults=io_defaults(p, "bare"))
+        interp.run("OL-MAIN")
+        return interp.state
+
+    def test_varying_runs_the_body_once_per_value(self):
+        state = self._run("           PERFORM OL-BODY VARYING WS-I "
+                          "FROM 1 BY 1 UNTIL WS-I > 3\n")
+        self.assertEqual(state.get("WS-C"), 3)
+        self.assertEqual(state.get("WS-I"), 4)
+
+    def test_a_negative_step_counts_down(self):
+        state = self._run("           PERFORM OL-BODY VARYING WS-I "
+                          "FROM 3 BY -1 UNTIL WS-I < 1\n")
+        self.assertEqual(state.get("WS-C"), 3)
+        self.assertEqual(state.get("WS-I"), 0)
+
+    def test_after_nests_inside_varying(self):
+        # COBOL runs the inner range in full for every value of the outer one.
+        state = self._run("           PERFORM OL-BODY VARYING WS-I "
+                          "FROM 1 BY 1 UNTIL WS-I > 2\n"
+                          "              AFTER WS-J FROM 1 BY 1 UNTIL WS-J > 2\n")
+        self.assertEqual(state.get("WS-C"), 4)
+
+    def test_a_literal_times_count(self):
+        state = self._run("           PERFORM OL-BODY 3 TIMES\n")
+        self.assertEqual(state.get("WS-C"), 3)
+
+    def test_a_named_times_count(self):
+        state = self._run("           MOVE 3 TO WS-N\n"
+                          "           PERFORM OL-BODY WS-N TIMES\n")
+        self.assertEqual(state.get("WS-C"), 3)
+
+    def test_test_after_runs_the_body_before_looking(self):
+        state = self._run("           MOVE 1 TO WS-I\n"
+                          "           PERFORM OL-BODY WITH TEST AFTER "
+                          "UNTIL WS-I > 3\n",
+                          body="           ADD 1 TO WS-C\n"
+                               "           ADD 1 TO WS-I\n")
+        self.assertEqual(state.get("WS-C"), 3)
+
+    def test_a_targeted_loop_does_not_swallow_the_next_statement(self):
+        # The parser read the statements *after* a targeted PERFORM ... UNTIL
+        # as its inline body. COBOL has no form with both a target and an
+        # inline body, so a GOBACK written on the next line became the loop
+        # body and ended the run on the first iteration - before the target
+        # had run at all.
+        p = program(HEADER + """       01  WS-I PIC 9(4).
+       PROCEDURE DIVISION.
+       OL-MAIN.
+           PERFORM OL-BODY UNTIL WS-I > 3
+           GOBACK
+           .
+       OL-BODY.
+           ADD 1 TO WS-I
+           .
+""")
+        perform = [s for s in p.paragraph("OL-MAIN")["statements"]
+                   if s.get("type") == "PERFORM"][0]
+        self.assertEqual(perform.get("children"), [])
+
+    def test_a_label_sharing_its_line_with_a_sentence(self):
+        # `B1. ADD 1 TO WS-C.` is one paragraph and one sentence. Requiring
+        # the label to own its line loses the paragraph silently: nothing can
+        # PERFORM it, so every call does nothing and the body is attributed
+        # to whichever paragraph came before.
+        p = program(HEADER + """       01  WS-C PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       IL-MAIN.
+           PERFORM IL-BODY
+           GOBACK
+           .
+       IL-BODY. ADD 1 TO WS-C.
+""")
+        self.assertIn("IL-BODY", p.paragraph_names)
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        interp = Interpreter(p, {}, defaults=io_defaults(p, "bare"))
+        interp.run("IL-MAIN")
+        self.assertEqual(interp.state.get("WS-C"), 1)
+
+    def test_a_sentence_verb_is_not_mistaken_for_a_label(self):
+        # `EXIT. MOVE ...` must not declare a paragraph called EXIT.
+        from frameladder.cobol import _PARA_INLINE, _RESERVED_SENTENCE
+        m = _PARA_INLINE.match("EXIT. MOVE 'A' TO WS-C")
+        self.assertTrue(m)
+        self.assertTrue(_RESERVED_SENTENCE.match(m.group(1)))

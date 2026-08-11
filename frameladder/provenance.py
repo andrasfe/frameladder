@@ -30,9 +30,21 @@ class Writer:
 
 
 def op_key(text: str) -> str:
-    m = re.search(r"CALL\s+'([^']+)'", text, re.I)
+    # Either quote character is legal, and matching only the apostrophe sent
+    # `CALL "CEEDAYS"` to the catch-all EXTERNAL queue - where it shares its
+    # outcomes with every other unrecognised operation in the program.
+    m = re.search(r"CALL\s+['\"]([^'\"]+)['\"]", text, re.I)
     if m:
         return "CALL:%s" % m.group(1).upper()
+    # A dynamic call names a variable holding the program name. Which program
+    # that is cannot be read off this statement, but the *site* is still an
+    # identity, and one queue per program-name variable is much closer than
+    # one queue for the whole program: date conversion, validation, lookup and
+    # abend all take their outcomes from the same list otherwise, in call
+    # order, and the first wrong answer poisons every later one.
+    m = re.search(r"\bCALL\s+([A-Z][A-Z0-9-]*)", text, re.I)
+    if m and m.group(1).upper() not in ("USING", "BY", "RETURNING"):
+        return "CALL:@%s" % m.group(1).upper()
     m = re.search(r"\bEXEC\s+(CICS|SQL|DLI)\b\s*(\w+)?", text, re.I)
     if m:
         return "EXEC:%s%s" % (m.group(1).upper(),

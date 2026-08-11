@@ -1420,7 +1420,28 @@ class Interpreter:
                 self._loop(condition, children, para, depth, line, ordinal,
                            bool(attrs.get("test_after")))
                 return
+            # An out-of-line loop has no inline body; its body is the target.
+            # `_varying`, `_times` and `_loop` are all correct already and
+            # were simply never reached from here, so the induction variable
+            # of `PERFORM A VARYING I FROM 1 BY 1 UNTIL I > 3` was never
+            # initialised or stepped and the body ran zero times.
+            body = ([{"type": "PERFORM", "text": "PERFORM " + target,
+                      "line_start": line, "line_end": line,
+                      "attributes": {"target": target}, "children": []}]
+                    if target else [])
+            varying = attrs.get("varying")
+            if varying and body:
+                self._varying(varying, body, para, depth, line, ordinal)
+                return
+            times = attrs.get("times")
+            if times and body:
+                self._times(times, body, para, depth, line, ordinal)
+                return
             if condition:
+                if body:
+                    self._loop(condition, body, para, depth, line, ordinal,
+                               bool(attrs.get("test_after")))
+                    return
                 count = 0
                 while not self.evaluate(condition) and count < MAX_LOOP:
                     self.perform(target, depth + 1)
