@@ -491,6 +491,30 @@ whose VALUE was a hexadecimal literal the parser read as a variable name.
 
 ## Open work, in the order I would take it
 
+0. **Temporal, route-sensitive provenance: which write reaches *this* read on
+   *this* route?** Now the prerequisite for several other items rather than
+   one of them. `writes_to` is a global lookup; `visible(var, at)` orders
+   writers but does not filter them, and `execution_order` is documented as a
+   preference precisely because an `ALTER`ed dispatcher makes any static order
+   a guess.
+
+   The cost of not having it is measured. Modelling `INITIALIZE` as a real
+   write - which is plainly correct, since the interpreter has always executed
+   it and the two models disagreeing about one program is the thing this file
+   warns about - converts 584 late silent failures into early honest ones and
+   *also* turns 99 plans that verifiably work into unsolved obligations, so
+   `verified` falls 804 -> 697. On COACTUPC the clear-down of
+   `CDEMO-FROM-PROGRAM` is guarded by the same condition the target direction
+   needs, so steering around it demands `EIBCALEN != 0` while reaching the
+   branch demands `EIBCALEN = 0`. A real contradiction on that route - and the
+   interpreter takes the direction anyway, because the obligation being
+   steered around was not load-bearing for that decision.
+
+   The work is on the `initialize-provenance` branch with its numbers. It
+   lands when `verified` is >= 804 with it applied, and not before: coverage
+   is the product, and a change that diagnoses better while producing fewer
+   witnesses is not yet an improvement.
+
 1. **REDEFINES is never aliased at runtime** - an upper bound of 382
    directions across 17 programs, the largest untouched item. Needs the
    byte-level store that item 4 also calls for; doing it once brings MOVE
