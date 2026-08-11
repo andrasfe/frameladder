@@ -724,18 +724,49 @@ free.
    nothing, and a field with no copybook has no PIC — so no width, no sign,
    no 88-levels, and no candidate values. It does not error; coverage is
    just quietly worse. This is the most common silent failure.
-2. **Runtime scales with decisions, not lines.** Roughly one branch per ten
-   lines, and `coverage --branches` runs every direction in three I/O worlds
-   with overlays. On a large program start with `--sample 0 --overlays 0`
-   for a fast structural read, then add them back.
-3. **Constructs that are not modelled**, so anything gated behind them will
+2. **Runtime scales with decisions times program size.** Roughly one branch
+   per ten lines, `coverage --branches` derives a plan per *direction*, and
+   each plan is run in three I/O worlds — so the work is quadratic in the
+   source, not linear. Measured on a 32,325-line monolith assembled out of
+   this corpus (1,288 paragraphs, 3,401 branches, 73 copybooks): the branch
+   sweep gets through **0.42 s per direction**, so its 6,802 directions are
+   about 48 minutes before the sampling and paragraph stages start at all.
+
+   `--sample 0 --overlays 0` is **not** the lever, and this file used to say
+   it was. On the two corpora it costs 4.0 and 2.1 pooled points
+   respectively to save 23% of the runtime; on the 32,325-line program it changes nothing
+   at all, because the budget is exhausted inside the branch loop and the
+   sampling stage is never reached. What to run instead, in this order:
+
+   | on 32,325 lines | wall | directions |
+   |---|---|---|
+   | `coverage --lift-only --lift 600` | **22 s** | 397/6802 = 5.8% |
+   | `coverage --sample 150 --lift 600` (no `--branches`) | 346 s | 410/6802 = 6.0% |
+   | `coverage --branches --lift 600 --time-budget 420` | 428 s | 82/6802 = 1.2% |
+
+   The frontier search is the whole first look and it costs seconds. Reach
+   for `--branches` when it has saturated, and give it `--time-budget
+   SECONDS --work-list FILE` so it stops rather than disappears; the next
+   run reads that file back through `--capability` and continues, skipping
+   both what was covered and what was already attempted. Peak memory was
+   103 MB in every case — size is not the problem, time is.
+
+3. **Read `step_capped_runs` before reading the percentage.** A run is
+   capped at `MAX_STEPS = 20,000` statements *for the whole program*, and
+   that constant does not scale with the source. On the 32,325-line program
+   30% of runs ended on the cap and only **157 of 1,288 paragraphs were
+   entered by any run at all** — so the ceiling on coverage there is a
+   constant in `interpreter.py`, not the planner, and no amount of
+   `--routes`, `--sample` or patience moves it. On a 4,236-line program the
+   same figure is zero, which is why it has not mattered until now.
+4. **Constructs that are not modelled**, so anything gated behind them will
    not be planned: `SEARCH`/`SEARCH ALL`, `REDEFINES` aliasing, `OCCURS`
    indexing (subscripts are flattened — `T(1)` and `T(2)` are one cell),
    `INSPECT`, `SORT`/`MERGE` with `INPUT`/`OUTPUT PROCEDURE` (no call edges,
    so the procedures look unreachable), and nested programs (`LINKAGE
    SECTION` is parsed as a paragraph). `python3 -m conformance.microdiff`
    prints the current list, measured against GnuCOBOL.
-4. **Record layout is a module, not a command.** `layout.py` gives byte
+5. **Record layout is a module, not a command.** `layout.py` gives byte
    offsets and exact lengths (19/19 against GnuCOBOL) if you need to write
    real fixed-width data files rather than field maps. Import it.
 

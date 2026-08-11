@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
+
+# Memoisation sizes. A program has a fixed vocabulary of condition texts and
+# operand spellings, so these caches saturate early and then never miss; the
+# limit exists to bound a process that loads several programs, not to bound
+# one. Nothing here is order-dependent: every memoised function below is a
+# pure function of its arguments returning an immutable value, so the cache
+# can only change how long an answer takes, never which answer it is.
+_CACHE = 1 << 16
 
 _LITERAL = re.compile(r"^'([^']*)'$|^\"([^\"]*)\"$|^([+-]?\d+(?:\.\d+)?)$")
 # X'0A1B' - hexadecimal, two digits per byte.
@@ -79,8 +88,29 @@ AID_VALUES = {
 _QUOTED_RUN = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 
+_WHITESPACE = re.compile(r"\s+")
+
+
+@lru_cache(maxsize=200_000)
+def _normed(text: str) -> str:
+    out, at = [], 0
+    for m in _QUOTED_RUN.finditer(text):
+        out.append(_WHITESPACE.sub(" ", text[at:m.start()]))
+        out.append(m.group(0))
+        at = m.end()
+    out.append(_WHITESPACE.sub(" ", text[at:]))
+    return "".join(out).strip()
+
+
 def norm(text: str) -> str:
     """Conditions arrive folded across source lines; flatten them first.
+
+    Memoised, and the patterns are compiled once. A run asks this the same
+    question tens of millions of times - it sits under `parse_term`,
+    `base_name` and `condition_atoms`, each called per operand per statement
+    - and `re.sub` with a pattern *string* pays the module's cache lookup on
+    every one of them. Measured at 68.8M calls and 143.6s cumulative on one
+    program before caching.
 
     Everything outside a quoted literal is whitespace-insensitive and
     everything inside one is not. Collapsing runs of spaces indiscriminately
@@ -89,14 +119,7 @@ def norm(text: str) -> str:
     with two spaces in it is decided against a literal the program does not
     contain.
     """
-    text = (text or "").replace("\n", " ")
-    out, at = [], 0
-    for m in _QUOTED_RUN.finditer(text):
-        out.append(re.sub(r"\s+", " ", text[at:m.start()]))
-        out.append(m.group(0))
-        at = m.end()
-    out.append(re.sub(r"\s+", " ", text[at:]))
-    return "".join(out).strip()
+    return _normed(text.replace("\n", " ")) if text else ""
 
 
 @dataclass(frozen=True)
@@ -166,6 +189,7 @@ _QUALIFIED = re.compile(r"^(.*?)\s+(?:OF|IN)\s+[A-Z0-9][A-Z0-9-]*"
                         r"(?:\s+(?:OF|IN)\s+[A-Z0-9][A-Z0-9-]*)*\s*$", re.I)
 
 
+@lru_cache(maxsize=_CACHE)
 def base_name(text: str) -> str:
     """The field a qualified reference names, without its qualifier.
 
@@ -286,7 +310,14 @@ def _split_top_colon(text: str) -> list:
     return out
 
 
+@lru_cache(maxsize=_CACHE)
 def parse_term(text: str) -> Term:
+    """Read one operand.
+
+    Memoised: a `Term` is frozen, so what comes back cannot be altered by
+    whoever asked for it, and the same operand text is re-read once per
+    statement per run - fourteen million times on a 1,500-line program.
+    """
     text = norm(text).strip(".")
     while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):
         text = text[1:-1].strip()
@@ -391,6 +422,14 @@ _ARITH_OPS = {"+", "-", "*", "/", "**"}
 
 def arith_tokens(text: str) -> list:
     """Split an arithmetic expression into operands, operators and parens.
+    A fresh list every time, because a caller may consume it.
+    """
+    return list(_arith_tokens(text))
+
+
+@lru_cache(maxsize=_CACHE)
+def _arith_tokens(text: str) -> tuple:
+    """The tokens themselves, memoised. See `arith_tokens`.
 
     COBOL identifiers contain hyphens, so `WS-A - WS-B` and `WS-A-WS-B` are
     different things and the language settles it with whitespace: an
@@ -442,12 +481,13 @@ def arith_tokens(text: str) -> list:
             continue
         merged.append(tokens[index])
         index += 1
-    return merged
+    return tuple(merged)
 
 
+@lru_cache(maxsize=_CACHE)
 def is_arithmetic(text: str) -> bool:
     """True when the text is an expression rather than a single operand."""
-    tokens = arith_tokens(text)
+    tokens = _arith_tokens(text)
     return any(t in _ARITH_OPS for t in tokens) and len(tokens) > 1
 
 

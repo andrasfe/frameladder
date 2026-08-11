@@ -305,7 +305,8 @@ def _seed(item) -> tuple:
 
 
 def lift(program, entry: str, *, seeds, defaults_for, budget: int = 600,
-         fanout: int = 2, attempts: int = 4, on_trace=None) -> dict:
+         fanout: int = 2, attempts: int = 4, on_trace=None,
+         should_stop=None) -> dict:
     """Extend the reached frontier one decision at a time.
 
     ``seeds`` are ``(state, world)`` pairs to start from and ``defaults_for``
@@ -357,6 +358,12 @@ def lift(program, entry: str, *, seeds, defaults_for, budget: int = 600,
         push(state, world, 0, index)
 
     while queue and stats["runs"] < budget:
+        # A run budget bounds the search but says nothing about how long a
+        # run takes, and on a large program that is the whole difference
+        # between a bounded command and an open-ended one.
+        if should_stop is not None and should_stop():
+            stats["stopped_early"] = True
+            break
         negative, _seq, state, world, world_index = heapq.heappop(queue)
         depth = -negative
         stubs, terminals = outside[world_index]

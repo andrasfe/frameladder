@@ -516,6 +516,19 @@ class ByteMemory:
         self.layout = layout
         self._buffers: dict = {}
 
+    def copy(self) -> "ByteMemory":
+        """A snapshot of the bytes as they stand, sharing the layout.
+
+        Costs one buffer copy per record *touched so far*, which at entry is
+        the handful the entry state wrote - not one per declared field. The
+        alternative, materialising every field into a dict, is linear in the
+        data division and was being paid once per run.
+        """
+        other = ByteMemory(self.layout)
+        other._buffers = {root: bytearray(buffer)
+                          for root, buffer in self._buffers.items()}
+        return other
+
     def buffer(self, root: str) -> bytearray:
         target = self.layout.alias.get(root, root)
         buffer = self._buffers.get(target)

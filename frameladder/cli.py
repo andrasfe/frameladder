@@ -360,7 +360,7 @@ def cmd_coverage(args):
     """What a whole plan set exercises, and what it leaves untouched."""
     program = _program(args)
     journal = Journal(args.work_dir)
-    from .coverage import accumulate, missing
+    from .coverage import empty as _empty_coverage, missing
     from .interpreter import Interpreter
     from .ladder import analyse, build_family
     from .learned import Learned
@@ -377,6 +377,31 @@ def cmd_coverage(args):
     warm = {name: learned.best(name) for name in learned.fields
             if learned.best(name) is not None}
     seen_directions: set = set()
+
+    # Folded as they arrive rather than kept. See `coverage.Coverage.observe`.
+    cov = _empty_coverage(program)
+
+    def record(trace) -> None:
+        if trace is not None:
+            cov.observe(trace)
+
+    # A whole-program sweep is linear in decisions and each run is linear in
+    # the program, so the work is quadratic in the source and there is a size
+    # past which "it finishes" stops being true. A budget makes the run
+    # bounded and, more importantly, makes what it did not get to *reported*
+    # rather than silently missing. Off by default: with no budget the run is
+    # a function of the program alone, which is the invariant everywhere else.
+    import time as _time
+    deadline = (_time.monotonic() + args.time_budget) if args.time_budget else None
+    stopped: dict = {}
+
+    def out_of_time(stage: str, done: int, total: int) -> bool:
+        if deadline is None or _time.monotonic() < deadline:
+            return False
+        stopped.setdefault("reason", "time-budget")
+        stopped.setdefault("seconds", args.time_budget)
+        stopped.setdefault("stages", {})[stage] = "%d/%d" % (done, total)
+        return True
 
     def run_plan(plan, world="bare"):
         """Run it, and remember the values if it covered anything new."""
@@ -396,6 +421,15 @@ def cmd_coverage(args):
 
     import random as _random
     _rng = _random.Random(args.seed)
+
+    # Loaded here, not inside the `--branches` block: the payload below reads
+    # it unconditionally, so scoping it to one branch of the command left
+    # plain `coverage`, `coverage --sample N` and `--lift-only` raising
+    # UnboundLocalError. A profile is a property of the run, not of one stage.
+    from .capability import load as _load_capability, unrepresentable
+    capability = _load_capability(getattr(args, "capability", None))
+    wanted = capability.wanted
+    skipped_covered = skipped_unrepresentable = 0
 
     # The value pool, built once. Every literal the program compares a field
     # against, plus one value it compares against nothing - without the
@@ -431,7 +465,6 @@ def cmd_coverage(args):
                                   length=args.sequences,
                                   codes=args.fault_codes)
 
-    traces = []
     lift_stats = None
     # Every derived plan is a place the frontier search can start from, and
     # the two reach different things: derivation gets past a guard the search
@@ -456,10 +489,6 @@ def cmd_coverage(args):
         # One plan per decision *direction*, which is what the metric counts.
         from .coverage import branches_of
         from .ladder import plan_for_branch
-        from .capability import load as _load_capability, unrepresentable
-        capability = _load_capability(getattr(args, "capability", None))
-        wanted = capability.wanted
-        skipped_covered = skipped_unrepresentable = 0
         for b in branches_of(program):
             for direction in (True, False):
                 # The harness's own work list, when it supplied one. Planning
@@ -491,9 +520,7 @@ def cmd_coverage(args):
                     skipped_unrepresentable += 1
                     continue
                 for world in WORLDS:
-                    trace = run_plan(plan, world)
-                    if trace is not None:
-                        traces.append(trace)
+                    record(run_plan(plan, world))
                 if args.lift:
                     lift_seeds.append((plan.input_state(), "bare",
                                        plan.stub_plan(), plan.terminals))
@@ -511,9 +538,13 @@ def cmd_coverage(args):
                                          terminals=plan.terminals,
                                          defaults=io_defaults(program, "bare"))
                     try:
-                        traces.append(interp.run(entry))
+                        record(interp.run(entry))
                     except Exception:                        # noqa: BLE001
                         continue
+            # The inner loop broke on the budget, so break the outer one too.
+            else:
+                continue
+            break
 
     if args.sample:
         # Deliberate hybrid. Backward derivation reaches guards that sampling
@@ -522,12 +553,14 @@ def cmd_coverage(args):
         # ~100 directions each way, and the literature on directed symbolic
         # execution reports the same: mixing beats either pure strategy.
         for _ in range(args.sample):   # noqa: B007  - _ selects the world
+            if out_of_time("sample", _, args.sample):
+                break
             state = {name: _rng.choice(values) for name, values in pool.items()}
             interp = Interpreter(program, state,
                                  defaults=io_defaults(program,
                                                       WORLDS[_ % len(WORLDS)]))
             try:
-                traces.append(interp.run(entry))
+                record(interp.run(entry))
             except Exception:                                # noqa: BLE001
                 continue
 
@@ -542,11 +575,14 @@ def cmd_coverage(args):
                                  terminals=world["terminals"],
                                  defaults=io_defaults(program, world["world"]))
             try:
-                traces.append(interp.run(entry))
+                record(interp.run(entry))
             except Exception:                                # noqa: BLE001
                 continue
 
-    for target in ([] if args.lift_only else program.paragraph_names[1:]):
+    paragraph_targets = [] if args.lift_only else program.paragraph_names[1:]
+    for _index, target in enumerate(paragraph_targets):
+        if out_of_time("paragraph_targets", _index, len(paragraph_targets)):
+            break
         plans = []
         if args.families:
             plans = [m["plan"] for m in
@@ -558,16 +594,16 @@ def cmd_coverage(args):
             plans = [plan] if plan.chain else []
         for plan in plans:
             for world in WORLDS:
-                trace = run_plan(plan, world)
-                if trace is not None:
-                    traces.append(trace)
+                record(run_plan(plan, world))
 
     if args.lift:
         from .lift import lift as _lift
         result = _lift(program, entry, seeds=lift_seeds,
                        defaults_for=lambda w: io_defaults(program, w),
-                       budget=args.lift, fanout=args.lift_fanout)
-        traces.extend(result["traces"])
+                       budget=args.lift, fanout=args.lift_fanout,
+                       on_trace=record,
+                       should_stop=(None if deadline is None else
+                                    lambda: out_of_time("frontier", 0, args.lift)))
         lift_stats = result["stats"]
         for trace in result["traces"]:
             seen_directions.update((g.paragraph, g.ordinal, g.kind,
@@ -575,7 +611,6 @@ def cmd_coverage(args):
 
     if args.learn:
         learned.save()
-    cov = accumulate(program, traces)
     gaps = missing(program, cov)
     payload = dict(cov.summary())
     payload.update({
@@ -585,24 +620,65 @@ def cmd_coverage(args):
         "capability": ({"targets_skipped_already_covered": skipped_covered,
                         "plans_skipped_unrepresentable": skipped_unrepresentable}
                        if capability.stated else None),
+        "stopped_early": stopped or None,
         "unreached_paragraphs": gaps["paragraphs"],
         "untouched_branches": [{"paragraph": b.paragraph, "line": b.line,
-                                "kind": b.kind, "condition": b.condition}
+                                "kind": b.kind, "ordinal": b.ordinal,
+                                "condition": b.condition}
                                for b in gaps["untouched"]],
         "one_way_only": [{"paragraph": b.paragraph, "line": b.line,
-                          "kind": b.kind, "condition": b.condition,
-                          "only": went}
+                          "kind": b.kind, "ordinal": b.ordinal,
+                          "condition": b.condition, "only": went}
                          for b, went in gaps["one_way_only"]],
     })
 
+    # The still-uncovered directions, in the shape `--capability` reads. A
+    # sweep that had to stop is only useful if the next one can pick up where
+    # it left off, and the work list is what carries that across: run two of
+    # the same command with `--capability` plans the directions run one did
+    # not reach and skips the ones it did.
+    if args.work_list:
+        work = [{"paragraph": b.paragraph, "ordinal": b.ordinal,
+                 "kind": b.kind, "direction": d}
+                for b in gaps["untouched"] for d in (True, False)]
+        work += [{"paragraph": b.paragraph, "ordinal": b.ordinal,
+                  "kind": b.kind, "direction": not went}
+                 for b, went in gaps["one_way_only"]]
+        # Only when the run was cut short: a run that finished tried
+        # everything, so holding its failures back would leave a work list
+        # that says there is nothing left to do.
+        deferred = 0
+        if stopped and attempted:
+            fresh = [d for d in work
+                     if (d["paragraph"].upper(), d["ordinal"],
+                         d["kind"].upper(), d["direction"]) not in attempted]
+            deferred = len(work) - len(fresh)
+            work = fresh
+        with open(args.work_list, "w") as fh:
+            json.dump({"schema_version": "1.0", "program": program.name,
+                       "uncovered_directions": work}, fh, indent=1)
+        payload["work_list"] = {"path": args.work_list, "directions": len(work),
+                                "held_back_already_attempted": deferred}
+
     def render(p):
         print("%s   %d runs" % (p["program"], p["runs"]))
+        if p["step_capped_runs"]:
+            # Worth its own line rather than a footnote: a program whose runs
+            # end on the statement budget has an upper bound on coverage that
+            # no amount of planning can lift, and the number that is stuck is
+            # not the planner's.
+            print("  step-capped %d of %d runs stopped on the statement budget"
+                  % (p["step_capped_runs"], p["runs"]))
         print("  paragraphs %-12s %5.1f%%" % (p["paragraphs"], p["paragraph_pct"]))
         print("  directions %-12s %5.1f%%" % (p["directions"], p["direction_pct"]))
         if p.get("learned"):
             print("  dictionary %s" % json.dumps(p["learned"]))
         if p.get("lift"):
             print("  frontier   %s" % json.dumps(p["lift"]))
+        if p.get("stopped_early"):
+            print("  STOPPED    %s" % json.dumps(p["stopped_early"]))
+        if p.get("work_list"):
+            print("  work list  %s" % json.dumps(p["work_list"]))
         if p["unreached_paragraphs"]:
             print("\nnever entered (%d): %s"
                   % (len(p["unreached_paragraphs"]),
@@ -1249,6 +1325,18 @@ def build_parser():
                          "point with each of its N most-likely statuses - the "
                          "ones the program tests for first, then the "
                          "platform's own. 0 keeps the sequences clean")
+    cv.add_argument("--time-budget", type=float, default=0.0, metavar="SECONDS",
+                    help="stop planning after this long and report what was "
+                         "not reached. The work is quadratic in the size of "
+                         "the source - one plan per decision direction, each "
+                         "run linear in the program - so on a large program "
+                         "the choice is a budget or an unknown wait. Off by "
+                         "default, because without it a run is a function of "
+                         "the program alone")
+    cv.add_argument("--work-list", metavar="FILE",
+                    help="write the directions still uncovered, in the format "
+                         "--capability reads, so the next run continues this "
+                         "one instead of repeating it")
     cv.add_argument("--limit", type=int, default=12)
     cv.set_defaults(func=cmd_coverage)
 

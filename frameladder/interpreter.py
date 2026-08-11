@@ -26,8 +26,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .conditions import condition_atoms
-from .ir import holds, norm, parse_term
+from .conditions import condition_atoms, when_condition
+from .ir import base_name, holds, is_arithmetic, norm, parse_term
 
 
 def _decimals(spec: str) -> int:
@@ -553,7 +553,20 @@ class Interpreter:
         self.altered: dict = {}
         # What the harness supplied at entry. A terminal read re-delivers it,
         # so it has to survive the program clearing the area first.
-        self._supplied = dict(self.state)
+        #
+        # Held as a snapshot of the *bytes*, not as a materialised map. Every
+        # declared name has a slot, so `dict(state)` read one value per field
+        # in the whole data division on every construction - 6,953 of them on
+        # a 32,000-line program, once per run, on 38,000 runs. The snapshot
+        # answers the same question: what did this name hold at entry.
+        supplied = FieldMap(self.memory.copy(), {})
+        supplied.extra = dict(self.state.extra)
+        self._supplied = supplied
+        # Membership is asked of the same keys the materialised map had - the
+        # laid-out names plus whatever had no slot - and not of `FieldMap`'s
+        # own test, which resolves a qualified reference to its declaration
+        # and would answer yes to a key the map never held.
+        self._supplied_slots = self.memory.layout.slots
         # Two names over one set of bytes. Built once because it is a
         # property of the data division, not of the run.
         self._overlays = self._overlay_map()
@@ -639,7 +652,6 @@ class Interpreter:
         the group last held as a whole, so the test answers a question about
         a value nobody wrote.
         """
-        from .ir import base_name
         key = name if name in self.model.children else base_name(name)
         fields = self._elementary(key) if key in self.model.children else []
         if not fields:
@@ -795,7 +807,6 @@ class Interpreter:
         an unevaluated intrinsic is not an approximation, it is a field with
         no value, and every comparison against it goes one fixed way.
         """
-        from .ir import parse_term as _pt
         name = term.func
         args = list(term.args)
 
@@ -909,7 +920,6 @@ class Interpreter:
 
     @staticmethod
     def _is_expression(term) -> bool:
-        from .ir import is_arithmetic
         return (term.kind == "var" and not term.func and not term.refmod
                 and not term.index and is_arithmetic(term.name))
 
@@ -1372,7 +1382,6 @@ class Interpreter:
                 value = norm(arm.get("attributes", {}).get("value", ""))
                 if value.upper() in ("OTHER", "ANY"):
                     continue
-                from .conditions import when_condition
                 condition = when_condition(subject, value)
                 result = self.evaluate(condition)
                 if norm(subject).upper() == "FALSE":
@@ -1700,7 +1709,7 @@ class Interpreter:
         for area in stub_outputs(norm(stmt.get("text", ""))):
             names = [area] + list(self.model.descendants(area))
             for name in names:
-                if name in self._supplied:
+                if name in self._supplied_slots or name in self._supplied.extra:
                     self.state[name] = self._supplied[name]
                     self._note(name, None)
 
@@ -2538,7 +2547,6 @@ class Interpreter:
 
     def _key_step(self, condition: str, keys: list, direction: dict) -> int:
         """+1 to look higher up the table, -1 lower, 0 when undecidable."""
-        from .ir import base_name
         alternatives = condition_atoms(condition)
         if not alternatives:
             return 0

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .interpreter import MAX_STEPS
+
 
 # The interpreter names a loop by the verb it saw; `branches_of` names it by
 # what it is. Without this the two never join, and every loop in the program
@@ -98,6 +100,11 @@ class Coverage:
     directions_hit: set = field(default_factory=set)   # (para, line, kind, bool)
     branches_total: int = 0
     runs: int = 0
+    # Runs that ran out of statement budget rather than ending. On a large
+    # program this is the number to read first: a run capped at MAX_STEPS
+    # stopped wherever it happened to be, so every decision after that point
+    # is uncovered because nothing reached it, not because no plan exists.
+    step_capped: int = 0
 
     @property
     def paragraph_pct(self) -> float:
@@ -107,8 +114,28 @@ class Coverage:
     def direction_pct(self) -> float:
         return 100.0 * len(self.directions_hit) / max(1, 2 * self.branches_total)
 
+    def observe(self, trace) -> None:
+        """Fold one run in and forget it.
+
+        A whole-program sweep is one run per branch direction, and every run
+        carries a guard event per decision with a snapshot of the operands
+        that decided it. Keeping the traces to union them at the end costs
+        memory proportional to *runs times decisions*, which is quadratic in
+        the size of the program - 5,300 traces on a 4,000-line one. Nothing
+        downstream reads a trace twice, so folding it here is the same
+        answer in constant space.
+        """
+        self.runs += 1
+        if trace.steps >= MAX_STEPS:
+            self.step_capped += 1
+        self.paragraphs_hit |= set(trace.entered)
+        for event in trace.guards:
+            self.directions_hit.add((event.paragraph, event.ordinal,
+                                     _KIND.get(event.kind, event.kind),
+                                     bool(event.result)))
+
     def summary(self) -> dict:
-        return {"runs": self.runs,
+        return {"runs": self.runs, "step_capped_runs": self.step_capped,
                 "paragraphs": "%d/%d" % (len(self.paragraphs_hit),
                                          self.paragraphs_total),
                 "paragraph_pct": round(self.paragraph_pct, 1),
@@ -117,17 +144,17 @@ class Coverage:
                 "direction_pct": round(self.direction_pct, 1)}
 
 
+def empty(program) -> Coverage:
+    """A coverage tally for this program, with nothing observed yet."""
+    return Coverage(paragraphs_total=len(program.paragraph_names),
+                    branches_total=len(branches_of(program)))
+
+
 def accumulate(program, traces) -> Coverage:
     """Union what a set of runs touched."""
-    cov = Coverage(paragraphs_total=len(program.paragraph_names),
-                   branches_total=len(branches_of(program)))
+    cov = empty(program)
     for trace in traces:
-        cov.runs += 1
-        cov.paragraphs_hit |= set(trace.entered)
-        for event in trace.guards:
-            cov.directions_hit.add((event.paragraph, event.ordinal,
-                                    _KIND.get(event.kind, event.kind),
-                                    bool(event.result)))
+        cov.observe(trace)
     return cov
 
 

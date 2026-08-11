@@ -138,9 +138,26 @@ def _direct_children(model, group: str) -> list:
 
     FILLER is included: it cannot be referenced but it takes up space, and
     a layout that skips it puts everything after it at the wrong offset.
+
+    Indexed once per data model rather than scanned per group. Scanning made
+    laying out one record cost the *whole* data division, and `record_layout`
+    recurses, so a group nested five deep re-read every declaration in the
+    program five times over: 99 million string comparisons for eight plans on
+    a 32,000-line program, which was two thirds of the time to derive one.
+    Declaration order is preserved because a dict keeps insertion order, so
+    the answer is identical to the scan it replaces.
     """
-    return [name for name, parent in model.parent.items()
-            if parent.upper() == group.upper()]
+    cached = getattr(model, "_fl_children_index", None)
+    if cached is None or cached[0] != len(model.parent):
+        index: dict = {}
+        for name, parent in model.parent.items():
+            index.setdefault(parent.upper(), []).append(name)
+        cached = (len(model.parent), index)
+        try:
+            model._fl_children_index = cached
+        except Exception:                                        # noqa: BLE001
+            pass
+    return cached[1].get(group.upper(), [])
 
 
 def render(model, root: str, values: dict | None = None) -> str:

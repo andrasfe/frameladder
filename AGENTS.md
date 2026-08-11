@@ -170,6 +170,14 @@ value generation earned most of it back honestly. When a construct is
 unparsed, check whether it became a settable name before believing any
 number that depends on it.
 
+**A spot check is not a measurement, and saying "measured at zero" when it
+was three programs is worse than saying nothing.** A commit here claimed a
+provenance change was "measured at zero on both corpora"; it was checked on
+three programs, the largest one timed out and was skipped, and the change
+was **-199 directions** - -145 on that program alone. If a claim of zero is
+worth making it is worth a sweep, and if the sweep is too slow to run then
+the honest report is "not measured".
+
 **Measure before building.** Several plausible features measured at zero and
 were not built: name-based sibling transfer (0% once guarded), prefix
 inheritance of witnesses (0%, because the chooser was already deterministic).
@@ -344,8 +352,26 @@ one of them is the corpus this was built against:
 
 | | programs | median | range | pooled |
 |---|---|---|---|---|
-| CardDemo | 28 | **90.7%** | 29.8-100% | 2005/3288 = **61.0%** |
-| everything else | 17 | 83.6% | 43.9-100% | 1647/1992 = **82.7%** |
+| CardDemo | 28 | **90.7%** | 57.1-100% | 2525/3288 = **76.8%** |
+| everything else | 17 | **84.2%** | 43.9-100% | 1660/1992 = **83.3%** |
+
+**Those are commit `31d3afa`'s figures and the code has not produced them
+since.** Re-measured on the same corpora with the same command two commits
+later, the first corpus pools **1817/3288 = 55.3%** (median 89.3) and the
+second **1636/1992 = 82.1%** (median 84.2). The 199 directions are one hunk:
+`b8ff856` gave `Provenance.visible` a base-name fallback, and its own message
+records the change as *measured at zero on both corpora*. It is not zero.
+Reverting that hunk alone brings the largest program back to 256/858 =
+**29.8%** exactly, from 12.9%.
+
+The mechanism is the one the paragraphs below already describe, arriving from
+the other side. A qualified BMS input field now finds the `EXEC CICS RECEIVE
+MAP` that fills it instead of finding no writer at all, so it stops being an
+entry input and becomes a stub output — and a stub output the plan cannot
+deliver is an uncovered direction. Whether 55.3% or 61.0% is the honest
+number is exactly the open item below; what is not defensible is a table that
+describes neither the code nor a stated commit. **Re-measure before quoting,
+and say which commit.**
 
 The two CardDemo numbers moved in opposite directions when the byte-level
 store landed, and both are right. The **median rose** (88.1 -> 90.7) because
