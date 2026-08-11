@@ -3764,3 +3764,74 @@ class TestOutOfLineLoops(unittest.TestCase):
         m = _PARA_INLINE.match("EXIT. MOVE 'A' TO WS-C")
         self.assertTrue(m)
         self.assertTrue(_RESERVED_SENTENCE.match(m.group(1)))
+
+
+class TestCursorSequences(unittest.TestCase):
+    """A cursor is a read loop whose status channel is SQLCODE."""
+
+    SRC = HEADER + """       01  SQLCODE PIC S9(9) COMP.
+       01  WS-ROWS PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       CS-MAIN.
+           EXEC SQL OPEN C1 END-EXEC
+           PERFORM CS-FETCH UNTIL SQLCODE = 100
+           GOBACK
+           .
+       CS-FETCH.
+           EXEC SQL FETCH C1 INTO :WS-ROWS END-EXEC
+           ADD 1 TO WS-ROWS
+           .
+"""
+
+    def _worlds(self):
+        from frameladder.ladder import analyse
+        from frameladder.sequences import sequence_worlds
+        p = program(self.SRC)
+        _graph, prov = analyse(p)
+        return p, sequence_worlds(p, prov, prov.literals)
+
+    def test_a_fetch_is_found_by_the_statement_not_by_a_name(self):
+        from frameladder.sequences import cursor_keys
+        self.assertEqual(cursor_keys(program(self.SRC)), ["EXEC:SQL:FETCH"])
+
+    def test_a_program_without_a_cursor_gets_none(self):
+        self.assertEqual(
+            __import__("frameladder.sequences", fromlist=["x"]).cursor_keys(
+                program(HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       NC-MAIN.
+           GOBACK
+           .
+""")), [])
+
+    def test_the_cadence_is_rows_then_no_more_rows(self):
+        # `0, 0, 0, 100` is a series, not a value. Only files had sequences,
+        # so SQLCODE could hold one value for a whole run and a fetch loop
+        # was reachable only by making the first fetch return no rows - a
+        # different route through the program, or none.
+        _p, worlds = self._worlds()
+        byname = {w["name"]: w for w in worlds}
+        self.assertIn("records:3", byname)
+        world = byname["records:3"]
+        self.assertEqual([e["set"] for e in world["stubs"]["EXEC:SQL:FETCH"]],
+                         [{"SQLCODE": 0}] * 3)
+        self.assertEqual(world["terminals"]["EXEC:SQL:FETCH"], {"SQLCODE": 100})
+
+    def test_a_db2_program_with_no_files_still_gets_sequences(self):
+        # The early return on "no FILE STATUS" skipped cursors entirely -
+        # which is exactly the set of programs that need them.
+        p, worlds = self._worlds()
+        self.assertEqual(p.model.file_status, {})
+        self.assertTrue(worlds)
+
+    def test_the_loop_actually_ends_on_the_terminal(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        p, worlds = self._worlds()
+        world = {w["name"]: w for w in worlds}["records:3"]
+        interp = Interpreter(p, {}, stubs=world["stubs"],
+                             terminals=world["terminals"],
+                             defaults=io_defaults(p, world["world"]))
+        trace = interp.run("CS-MAIN")
+        self.assertEqual(interp.state.get("SQLCODE"), 100)
+        self.assertFalse(trace.runaway)

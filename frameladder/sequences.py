@@ -59,6 +59,8 @@ the same sequences on every run.
 
 from __future__ import annotations
 
+import re
+
 from .heuristics import complement_value
 
 # Enough to tell first from last with a middle in between. Measured rather
@@ -357,7 +359,11 @@ def sequence_worlds(program, prov, literals: dict, lengths=DEFAULT_LENGTHS,
     hypothesis; this one is the cheap half and it is the half that terminates.
     """
     files = sorted(program.model.file_status)
-    if not files:
+    cursors = cursor_keys(program)
+    # A DB2 program has no FILE STATUS at all, so returning early on "no
+    # files" skipped the cursor sequences entirely - the exact programs that
+    # need them.
+    if not files and not cursors:
         return []
     out: list = []
     for length in lengths:
@@ -382,10 +388,64 @@ def sequence_worlds(program, prov, literals: dict, lengths=DEFAULT_LENGTHS,
             # record - so the sequence would have no end and the code after
             # the loop would be reached only by the interpreter giving up.
             terminals[read_key(name)] = {status: END_OF_FILE}
+        for key in cursors:
+            # A cursor is a read loop whose status channel is SQLCODE rather
+            # than a FILE STATUS field, and it needs the same shape: rows,
+            # then no more rows. Only files were given sequences, so SQLCODE
+            # could hold one value for a whole run - and `0, 0, 0, 100` is
+            # not a value, it is a series. A fetch loop was therefore
+            # reachable only by making the very first fetch return no rows,
+            # which takes a different route through the program, or none.
+            stubs[key] = [{"when": {}, "set": {SQLCODE_FIELD: SQL_ROW},
+                           "seq": index, "inferred": False}
+                          for index in range(length)]
+            terminals[key] = {SQLCODE_FIELD: SQL_NO_MORE_ROWS}
         if stubs:
             out.append({"name": "records:%d" % length, "world": "populated",
                         "stubs": stubs, "terminals": terminals})
     return out
+
+
+# Platform vocabulary, in the sense `AGENTS.md` allows: SQLCODE is SQLCODE the
+# way an HTTP status is a number, and 100 is "no more rows" in every DB2 there
+# has ever been. Nothing here reads a *name* to decide what a field means.
+SQLCODE_FIELD = "SQLCODE"
+SQL_ROW = 0
+SQL_NO_MORE_ROWS = 100
+
+
+def cursor_keys(program) -> list:
+    """Operation keys for the fetches in this program, in source order.
+
+    Evidence, not convention: a program has a cursor because it contains
+    `EXEC SQL FETCH`, and the key is the one `provenance.op_key` builds for
+    that statement, so the sequence lands on the operation the plan will
+    actually name.
+
+    A precompiled source is the case worth stating. After precompilation the
+    SQL is commented out and only the host-language call remains, so nothing
+    matches here and the program gets no cursor sequence - while its active
+    code still branches on SQLCODE. That is a real gap and it is this
+    function's boundary; recognising commented SQL needs the raw source
+    rather than the parsed statements.
+    """
+    from .provenance import op_key
+    keys: list = []
+
+    def walk(stmt):
+        text = (stmt.get("text") or "")
+        if re.search(r"\bEXEC\s+SQL\b", text, re.I) and \
+                re.search(r"\bFETCH\b", text, re.I):
+            key = op_key(text)
+            if key not in keys:
+                keys.append(key)
+        for child in stmt.get("children") or []:
+            walk(child)
+
+    for para in program.paragraphs:
+        for stmt in para.get("statements", []):
+            walk(stmt)
+    return keys
 
 
 # Two positions are enough to separate "it failed straight away" from "it

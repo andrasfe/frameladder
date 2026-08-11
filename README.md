@@ -1212,6 +1212,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 232 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 237 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```
