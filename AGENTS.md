@@ -492,8 +492,30 @@ whose VALUE was a hexadecimal literal the parser read as a variable name.
 ## Open work, in the order I would take it
 
 0. **Temporal, route-sensitive provenance: which write reaches *this* read on
-   *this* route?** Now the prerequisite for several other items rather than
-   one of them. `writes_to` is a global lookup; `visible(var, at)` orders
+   *this* route?** The single highest-value item in the repository. It gates
+   two finished branches and the largest disposition on both corpora.
+
+   The diagnosis, measured rather than argued. For every plan that fails to
+   reach its target - 662 of 3,288 here, 54% of the RCO100B funnel - ask how
+   far along its own chain it got. Nearly all of it: the modal shapes are
+   2/3, 1/2, 3/4. The plan walks the route and misses the **last hop**, so
+   the failure sits in the guard that admits it to the target. Traced to the
+   end on one case: the plan binds a field at entry, a conditional `SET ...
+   TO LOW-VALUES` in the mainline resets it before the read, and the
+   88-level condition admitting the last hop then goes the wrong way.
+
+   Both branches fail the same way when the missing writes are modelled -
+   correctness up, witnesses down - because negating the guard on such a
+   write is often unsatisfiable on the route being taken:
+
+   | | verified | late failures removed |
+   |---|---:|---:|
+   | `blocking-writes-set` | 804 -> 703 | 626 |
+   | `initialize-provenance` | 804 -> 796 | 584 |
+
+   Neither lands until the solver can ask whether a write can actually run
+   between the binding and the read *on this route*. Do that and both branches
+   become pure gain. `writes_to` is a global lookup; `visible(var, at)` orders
    writers but does not filter them, and `execution_order` is documented as a
    preference precisely because an `ALTER`ed dispatcher makes any static order
    a guess.
