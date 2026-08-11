@@ -901,6 +901,93 @@ class TestExternalWorld(unittest.TestCase):
                          "one subprogram, two invocations, two outcomes")
 
 
+class TestTerminalInput(unittest.TestCase):
+    """A field an operation fills is that operation's outcome, and the
+    program's spelling of it must not decide which operation gets the credit.
+
+    All three of these were one bug on a screen program: the output map
+    redefines the input map, the program clears the output map before
+    sending, and the operator's field is refilled by the terminal read. Get
+    any of them wrong and the field is never set, so every arm behind it is
+    unreachable while the plan reports itself solved.
+    """
+
+    SCREEN = HEADER + """       01  IN-AREA.
+           05  IN-KEY  PIC X(4).
+           05  IN-NAME PIC X(4).
+       01  OUT-AREA REDEFINES IN-AREA.
+           05  OUT-KEY  PIC X(4).
+           05  OUT-NAME PIC X(4).
+       01  WS-RC PIC S9(8) COMP.
+       01  WS-OTHER PIC X(4).
+       PROCEDURE DIVISION.
+       AE-MAIN.
+           MOVE LOW-VALUES TO OUT-AREA
+           EXEC CICS RECEIVE MAP('M1') MAPSET('S1') INTO(IN-AREA)
+                RESP(WS-RC) END-EXEC
+           IF IN-KEY OF IN-AREA NOT = LOW-VALUES
+              PERFORM AE-DEEP
+           END-IF
+           GOBACK
+           .
+       AE-DEEP.
+           MOVE WS-OTHER TO IN-KEY OF IN-AREA
+           GOBACK
+           .
+"""
+
+    def test_a_qualified_write_and_a_plain_one_are_one_field(self):
+        # `MOVE X TO A OF R` files a writer under the qualified spelling and
+        # the operation that fills R files one under the declared name. Read
+        # apart, the reaching definition is whichever half was spelled.
+        from frameladder.ladder import analyse
+        p = program(self.SCREEN)
+        _graph, prov = analyse(p)
+        kinds = {w.kind for w in prov.writes_to("IN-KEY OF IN-AREA")}
+        self.assertEqual(kinds, {"MOVE", "STUB"})
+        self.assertEqual(kinds, {w.kind for w in prov.writes_to("IN-KEY")})
+
+    def test_the_terminal_read_is_the_producer_of_what_it_fills(self):
+        from frameladder.ladder import analyse
+        p = program(self.SCREEN)
+        _graph, prov = analyse(p)
+        made = prov.producer("IN-KEY OF IN-AREA", ("AE-MAIN", 999))
+        self.assertEqual(made.kind, "stub")
+        self.assertEqual(made.op_key, "EXEC:CICS:RECEIVE")
+
+    def test_a_clause_names_a_resource_not_a_field_to_read(self):
+        # `MAP('M1')` discriminates two invocations of one verb. There is no
+        # field called MAP, so matching it against the state made every
+        # derived CICS outcome silently unmatched - and then replaced by the
+        # default, which is invisible from the plan.
+        p = program(self.SCREEN)
+        plan = build_plan(p, "AE-DEEP", entry="AE-MAIN")
+        stubs = plan.stub_plan()
+        self.assertIn("EXEC:CICS:RECEIVE", stubs)
+        when = stubs["EXEC:CICS:RECEIVE"][0]["when"]
+        self.assertEqual({when.get("MAP"), when.get("MAPSET")}, {"M1", "S1"})
+        result = verify(p, plan, "AE-MAIN")
+        self.assertTrue(result["reached"],
+                        "the outcome the plan derived has to be delivered")
+
+    def test_one_delivery_carries_every_field_it_names(self):
+        # A read fills a whole record, so bindings that differ by variable and
+        # share a position are one outcome. Emitted one entry each they
+        # described a call returning one field and then returning again, and
+        # the consumer stops at the first match.
+        from frameladder.ir import Binding, Plan, Producer
+        made = lambda var: Producer("stub", var=var, op_key="READ:F",
+                                    discriminators={"WS-DD": "A"})
+        plan = Plan("T", ["T"], [], [], [
+            Binding("a", made("F-ONE"), 1, "", seq=0),
+            Binding("b", made("F-TWO"), 2, "", seq=0),
+            Binding("c", made("F-ONE"), 9, "", seq=1),
+        ], [], [])
+        entries = plan.stub_plan()["READ:F"]
+        self.assertEqual([e["set"] for e in entries],
+                         [{"F-ONE": 1, "F-TWO": 2}, {"F-ONE": 9}])
+
+
 class TestDependencies(unittest.TestCase):
     """What routing through a frame obliges a test to control."""
 

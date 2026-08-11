@@ -514,7 +514,7 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         If the program writes it at all, conditionally or not, the entry
         state supplies the first value and the program produces the rest.
         """
-        return bool(prov.writers.get(var.upper()))
+        return bool(prov.writes_to(var))
 
     # Solve per variable, not per obligation: gather every comparison first.
     wanted_by_var = constraints_on(atoms + [a for a, _ in derived], model)

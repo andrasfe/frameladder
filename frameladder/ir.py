@@ -604,17 +604,31 @@ class Plan:
         then end-of-file. Two bindings on the same field are therefore not
         in conflict - they are consecutive outcomes - so ordering matters
         and `seq` carries it.
+
+        One outcome can name several fields, though, and that is the common
+        case rather than the exotic one: a terminal read fills every field on
+        the screen and a record read fills every field of the record. Those
+        bindings differ by variable, not by position, so they are the same
+        delivery - `seq` says so - and emitting one entry each described a
+        call that returns one field and then returns again. The consumer
+        delivers the first matching entry and stops, so nine of ten planned
+        fields were dropped at the one moment they were supposed to arrive.
         """
         out: dict = {}
+        index: dict = {}
         for b in sorted(self.bindings, key=lambda x: x.seq):
             if b.producer.kind != "stub":
                 continue
-            out.setdefault(b.producer.op_key, []).append({
-                "when": b.producer.discriminators,
-                "set": {b.producer.var: b.value},
-                "seq": b.seq,
-                "inferred": b.producer.inferred,
-            })
+            when = b.producer.discriminators
+            slot = (b.producer.op_key, tuple(sorted(when.items())), b.seq)
+            entry = index.get(slot)
+            if entry is None:
+                entry = {"when": when, "set": {}, "seq": b.seq,
+                         "inferred": b.producer.inferred}
+                index[slot] = entry
+                out.setdefault(b.producer.op_key, []).append(entry)
+            entry["set"][b.producer.var] = b.value
+            entry["inferred"] = entry["inferred"] or b.producer.inferred
         return out
 
     def flat_state(self) -> dict:

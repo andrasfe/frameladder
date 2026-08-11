@@ -309,7 +309,7 @@ def cmd_explain(args):
             "writers": [{"paragraph": w.para, "line": w.line, "kind": w.kind,
                          "source": w.source, "conditional": w.conditional,
                          "guards": [str(g) for g in w.guards]}
-                        for w in prov.writers.get(name, [])][:12],
+                        for w in prov.writes_to(name)][:12],
         }
 
     source = prov.frame_source(frame)

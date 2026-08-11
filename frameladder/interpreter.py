@@ -67,6 +67,7 @@ TERMINATING_EXECS = {"EXEC:CICS:RETURN", "EXEC:CICS:XCTL", "EXEC:CICS:ABEND"}
 # most of it. Bounded, because each task is a fixed point once the commarea
 # stops changing.
 MAX_TASKS = 4
+_EXEC_HEAD = re.compile(r"\bEXEC\s+(CICS|SQL|DLI)\b", re.I)
 _RETURN_TRANSID = re.compile(r"\bTRANSID\s*\(", re.I)
 _RETURN_COMMAREA = re.compile(r"\bCOMMAREA\s*\(\s*([A-Z0-9-]+)", re.I)
 
@@ -535,6 +536,7 @@ class Interpreter:
         # that needs the write suppressed.
         self._pinned: set = set()
         self._delivered: dict = {}
+        self._selector_cache: dict = {}
         self._visits: dict = {}
         self._layouts: dict = {}
         self.calls: dict = {}
@@ -1641,21 +1643,33 @@ class Interpreter:
             raise _Stop()
         self._deliver_terminal_input(key, stmt)
         entries = self.stubs.get(key, [])
-        matched = False
-        for index, entry in enumerate(entries):
-            when = {k.upper(): v for k, v in (entry.get("when") or {}).items()}
-            if all(holds(self.value_of(parse_term(k)), "=", v)
-                   for k, v in when.items()):
-                matched = True
-                break
+        selectors = self._selectors_of(stmt)
+
+        def wanted(entry) -> bool:
+            for k, v in (entry.get("when") or {}).items():
+                k = k.upper()
+                # Two kinds of discriminator arrive here under one name. A
+                # field set before the call is read from the state; a clause
+                # the command itself names - `MAP('...')`, `DATASET(...)` -
+                # is a property of *this statement* and there is no field by
+                # that name to read. Looked up as a field it came back empty,
+                # so no entry ever matched and every outcome the ladder
+                # derived for a CICS command was silently replaced by the
+                # default. That is invisible from the plan, which looks
+                # perfectly well formed.
+                here = selectors[k] if k in selectors else self.value_of(
+                    parse_term(k))
+                if not holds(here, "=", v):
+                    return False
+            return True
+
+        matched = any(wanted(entry) for entry in entries)
         if not matched:
             for name, value in self.defaults.get(key, {}).items():
                 self._force(name, value)
             return
         for index, entry in enumerate(entries):
-            when = {k.upper(): v for k, v in (entry.get("when") or {}).items()}
-            if not all(holds(self.value_of(parse_term(k)), "=", v)
-                       for k, v in when.items()):
+            if not wanted(entry):
                 continue
             if self._delivered.get((key, index), 0) >= self.repeat:
                 continue
@@ -1665,6 +1679,16 @@ class Interpreter:
             return
         for name, value in self.terminals.get(key, {}).items():
             self._force(name, value)
+
+    def _selectors_of(self, stmt) -> dict:
+        """The resources this command names, as `provenance` recorded them."""
+        text = stmt.get("text", "") or ""
+        cached = self._selector_cache.get(id(stmt))
+        if cached is None:
+            from .provenance import exec_selectors
+            cached = exec_selectors(text) if _EXEC_HEAD.search(text) else {}
+            self._selector_cache[id(stmt)] = cached
+        return cached
 
     def _force(self, name: str, value) -> None:
         """Deliver a stub's outcome, bypassing everything that would refuse it.

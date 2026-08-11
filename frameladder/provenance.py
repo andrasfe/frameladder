@@ -211,13 +211,48 @@ class Provenance:
         self.slices: dict = {}          # var -> (start, length, value) facts
         self.payloads: set = set()
         self.operations: dict = {}      # paragraph -> external ops performed
+        self.spellings: dict = {}       # base name -> every way it is written
         self._index()
         self._find_selectors()
         self._harvest_literals()
 
     # -- indexing ----------------------------------------------------------
     def _add(self, var: str, writer: Writer):
-        self.writers.setdefault(var.upper(), []).append(writer)
+        upper = var.upper()
+        self.writers.setdefault(upper, []).append(writer)
+        base = base_name(upper)
+        if base != upper:
+            self.spellings.setdefault(base, []).append(upper)
+
+    def writes_to(self, var: str) -> list:
+        """Every write that lands on this field, however it is spelled.
+
+        ``MOVE X TO A OF R`` and ``EXEC CICS RECEIVE INTO(R)`` write the same
+        bytes, but they arrive here under two keys - the qualified reference
+        and the declared name the record's descendants are listed under. Kept
+        apart, the reaching-definition walk sees only whichever half the
+        reader happened to spell, so a field the program fills at one site and
+        reads at another looks unwritten from one side and unread from the
+        other.
+
+        The runtime store already settled this question the other way:
+        ``Layout.slot_for`` falls back to the base name, so the two spellings
+        are one cell during execution. Provenance disagreeing with execution
+        about which writes exist is the same defect the byte store fixed for
+        values, one layer up - and it is what made a screen field's producer
+        come back as the file READ six statements later instead of the
+        terminal RECEIVE that actually fills it.
+        """
+        upper = (var or "").upper()
+        out = list(self.writers.get(upper, []))
+        base = base_name(upper)
+        aliases = ([base] if base != upper else []) + \
+            [s for s in self.spellings.get(base, []) if s != upper]
+        for alias in aliases:
+            for w in self.writers.get(alias, []):
+                if w not in out:
+                    out.append(w)
+        return out
 
     def _index(self):
         for para in self.program.paragraphs:
@@ -521,21 +556,17 @@ class Provenance:
         return self.order.get(para, 10 ** 6)
 
     def visible(self, var: str, at: tuple | None) -> list:
-        writers = self.writers.get(var.upper(), [])
-        if not writers:
-            # A qualified reference names a declaration recorded under its
-            # base name, so the *lookup* has to see through the qualifier
-            # even though the identity keeps it - the same split `model.look`
-            # already makes. Without this a qualified map field finds no
-            # writer at all, falls through to the record-association guess,
-            # and is attributed to whichever stub shares the most name
-            # tokens: `ACTIDINI OF COTRN2AI` came back as a field of a file
-            # READ rather than of the terminal RECEIVE that fills it. The
-            # plan then binds an outcome for the wrong operation and the
-            # field the condition tests is never set by anything.
-            base = base_name(var)
-            if base != var.upper():
-                writers = self.writers.get(base, [])
+        # A qualified reference names a declaration recorded under its base
+        # name, so the *lookup* has to see through the qualifier even though
+        # the identity keeps it - the same split `model.look` already makes.
+        # Merging rather than falling back matters: a map field the program
+        # also MOVEs to has writers under both spellings, and taking only the
+        # qualified half attributed it to whichever stub filled the MOVE's
+        # source, so a screen field came back as a field of a file READ
+        # rather than of the terminal RECEIVE that actually fills it, the
+        # plan bound an outcome for the wrong operation, and the field the
+        # condition tests was never set by anything.
+        writers = self.writes_to(var)
         if not at or not self.order:
             return writers
         para, line = at
@@ -642,7 +673,7 @@ class Provenance:
         """Conditional writes that would violate ``var op value`` if run."""
         from .ir import holds
         out = []
-        for w in self.writers.get(var.upper(), []):
+        for w in self.writes_to(var):
             if not w.conditional or w.kind != "MOVE":
                 continue
             src = parse_term(w.source)
@@ -665,7 +696,7 @@ class Provenance:
         """
         from .ir import holds
         out = []
-        for w in self.writers.get(var.upper(), []):
+        for w in self.writes_to(var):
             if w.kind not in ("MOVE", "SET"):
                 continue
             src = parse_term(w.source)
