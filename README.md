@@ -466,6 +466,152 @@ removing it would shift every later outcome onto an earlier call.
 `represent` classifies every plan the tool would emit as representable or not,
 with those same reasons.
 
+### Naming a decision, when the two sides count decisions differently
+
+This is the thing to get right before anything else, because getting it wrong
+is silent.
+
+A work list says *this decision, this way*. Both sides know which decisions
+are uncovered and neither can say so in the other's words. `frameladder`
+numbers a decision by its **statement position inside its paragraph**, because
+COPY expansion puts many decisions on one source line and the line cannot tell
+them apart. A harness may reasonably number **per (paragraph, kind)** instead.
+On `COTRN02C`, the four `IF`s in `MAIN-PARA` are ordinals 3, 8, 12 and 22 here
+and 0, 1, 2, 3 there.
+
+The failure that produces is the bad kind. Their third `IF` is ordinal 3,
+which *is* a valid ordinal here and names a different decision, so it resolves
+to something plausible and nothing raises. **Across the 28 CardDemo programs,
+reading foreign ordinals at face value put 1,251 of 1,644 targets on the wrong
+decision — 23.9% correct.** That is what a run reporting "268 targets
+analysed, 1 exported, witness landed on the paragraph but not the direction"
+looks like from the inside.
+
+So identify a decision by what the *program* says, not by what either tool
+counts:
+
+```json
+{"paragraph": "1000-INITIALIZATION", "condition": "WS-RESP-CD NOT = 0",
+ "line": 412, "direction": false, "probe_id": "@@B:117:F"}
+```
+
+`condition` and `line` are read off the COBOL, so both sides derive them from
+the same file. Spelling is normalised before comparison — `IS EQUAL TO`
+against `=`, quote style, case, whitespace, a leading `IF`, outer parentheses,
+a trailing period — so the two parsers need not agree on rendering, only on
+what they read. Measured across 41 programs and 2,540 decisions, every one of
+those renderings resolves **100% correctly, with nothing unresolved**. Degrade
+the input further — truncate the condition, or omit it entirely and give only
+a paragraph — and resolution stays correct but *widens*: 118 and 135
+extra directions targeted respectively. Over-targeting costs planning budget;
+mis-targeting costs a witness that means nothing. The design prefers the
+former, always, and reports when it does it.
+
+`ordinal` is still accepted, and is read as an identity only when the profile
+says `"ordinal_source": "frameladder"` — true of a work list this tool wrote
+itself, so `coverage --work-list` feeding the next run keeps full precision.
+`probe_id` is echoed back untouched on everything derived from an entry, so
+results join without either side adopting the other's scheme. Direction may be
+a boolean or `T`/`F`, `Y`/`N`, `taken`/`not-taken`, `then`/`else`; **omit it
+and both directions are planned**, which is right, since picking one would be
+a guess that surfaces later as a witness on the direction nobody wanted.
+
+Check a profile before spending a run on it:
+
+```bash
+frameladder PROG.cbl --copybooks ./cpy --capability profile.json directions
+```
+
+It reports how each entry was matched, what it could not resolve, which
+entries named more than one decision, and — the line worth reading first —
+how many ordinals disagree with the decision their own text names.
+
+### Accounting for every target that did not make it
+
+"268 attempted, 1 exported" is not a diagnosis. A target that could not be
+routed to, one routed to but not solved, and one solved into a plan the
+harness cannot represent call for three completely different fixes — a better
+route, a better solver, a wider capability — so `export` counts them
+separately and each carries its reasons.
+
+```bash
+frameladder PROG.cbl --copybooks ./cpy --capability profile.json \
+    export --out candidates.json
+```
+
+```
+   40 attempted
+      precheck_refused             0
+      unreached_internally         0
+      unsolved                     3
+      unrepresentable             27
+      exported                    10
+
+   why
+         15  unrepresentable: cannot replay EXEC:CICS:RECEIVE (needed to set TTYPCDI OF COTRN2AI)
+          3  unrepresentable: cannot replay EXEC:CICS:WRITE (needed to set TRAN-AMT)
+          1  unsolved: no value derived for TRNAMTI OF COTRN2AI
+```
+
+Which says something actionable in one line: 27 of 40 are blocked on a single
+operation the profile does not list. Adding `EXEC:CICS:RECEIVE` to
+`replayable_operations` is a one-line change on the harness side and is worth
+more than any amount of extra search on this one.
+
+### Operation keys, when the two sides spell them differently
+
+Case and punctuation never need an alias: `EXEC:CICS:READ`, `EXEC CICS READ`
+and `exec/cics/read` all match. What cannot be derived by anybody is a harness
+that knows a file by a DD name, a table name or a handle the COBOL never
+mentions, so the profile states those and they are matched exactly:
+
+```json
+{"op_key": "READ:CUSTOMER-FILE", "aliases": ["READ:CUSTDD"], "fields": ["CUST-ID"]}
+```
+
+An alias widens what the harness said it can do, never what it did not: an
+operation absent from the profile stays refused, and a real `op_key` always
+wins a collision with some other entry's alias.
+
+### Whether re-planning from a failed attempt would pay, measured on your estate
+
+Re-planning from an attempt's `first_missing_frame` is an appealing idea: the
+real program demonstrably got as far as the frame before it, so that frame is
+a state the harness can reproduce and a better place to plan from than the
+entry. It only pays, though, if the harness gets somewhere derivation cannot
+already start. Built and measured here, it did not: **frame-rooted search
+reached 11.7% of wanted directions against 9.1% entry-rooted, but seeding on
+every paragraph with no attempt report at all reached 179 of 786 off-corpus
+against frame-rooted's 176.** The frames were ranking seeds, not adding reach.
+The reason is visible in one number — over seven GnuCOBOL-runnable programs
+this interpreter reached **53** chain frames and the real compiled run **13**,
+because the compiled program abends on files that are not there. The harness
+was running *shallower*, so there was nothing to resume into.
+
+That is a property of a corpus with no data behind its mocks. An estate with
+real data may well invert it, and if it does, the feature is worth building.
+So rather than assume either way, put your attempts in the profile:
+
+```json
+"attempts": [{"target": "3000-POST", "reached_frames": ["MAIN", "1000-INIT"],
+              "first_missing_frame": "2000-VALIDATE"}]
+```
+
+and `directions` reports the deciding number:
+
+```
+   frames from 12 attempt(s): harness reached 31, of which this interpreter cannot reach 9
+      2000-VALIDATE
+      ...
+   9 frame(s) the harness reached are unreachable from MAIN here - re-planning
+   from them would open ground derivation cannot start on, so it is worth doing
+```
+
+If that count is zero, resuming from frames will rank seeds and nothing more,
+and the effort belongs elsewhere. If it is not, send the number and the
+feature has its justification. Nothing about planning changes either way —
+this reports, it does not steer.
+
 ### What it measures, with a profile nobody has stated yet
 
 No harness states a profile today, so `--proxy` derives one from the source
@@ -821,6 +967,8 @@ frameladder PROGRAM [--copybooks DIR] [--entry PARA] [--work-dir DIR] [--json] C
 | `sweep` | plan and verify every target |
 | `replay TARGET` | the complete ordered outcome series, terminal included, and every value the harness would have had to drop |
 | `represent` | which plans a stated harness could run, and why the rest could not |
+| `directions` | how a harness's work list lands on this program's decisions — run this against a new profile before spending a run on it |
+| `export [--out FILE]` | plan every uncovered direction the harness asked for, and account for every one that did not make it |
 | `bind` / `note` / `resume` | the journal, so a loop survives a restart |
 
 `--capability FILE` states what will run the plans; without one nothing is
@@ -1006,6 +1154,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 94 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 201 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

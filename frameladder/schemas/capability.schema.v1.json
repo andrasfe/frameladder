@@ -12,6 +12,11 @@
       "description": "Program the profile describes, for the harness's own bookkeeping.",
       "type": "string"
     },
+    "ordinal_source": {
+      "description": "Who counted the `ordinal` fields below. Only \"frameladder\" is read as an identity; anything else (or absence) means the ordinals are the harness's own and are used as a hint at most. This is not pedantry: frameladder numbers a decision by its statement position within its paragraph, while a harness may number per (paragraph, kind), so their third IF is frameladder's ordinal 3 -- a number that usually exists and usually names a different decision. Measured on the CardDemo corpus, taking foreign ordinals at face value pointed 1251 of 1644 targets at the wrong decision, silently. Identify decisions by `condition` and `line` instead; those are properties of the COBOL that both sides read off the same file.",
+      "type": "string",
+      "enum": ["frameladder", "harness", "unknown"]
+    },
     "injectable_variables": {
       "description": "Entry-state variables the harness can set. A binding on anything else makes a plan unrepresentable. Omit the section entirely to state no constraint; an empty array means the harness can inject nothing.",
       "type": "array",
@@ -42,6 +47,11 @@
                 "description": "Longest outcome series the harness can replay for this operation. 0 or absent means no stated limit. A read loop needs a series, not a value.",
                 "type": "integer",
                 "minimum": 0
+              },
+              "aliases": {
+                "description": "Other names the harness answers to for this same operation. Case and punctuation are already handled -- EXEC:CICS:READ, `EXEC CICS READ` and `exec/cics/read` all match without an alias -- so this is for the rest, where the harness knows a file by a DD name, a table name or a handle the COBOL never mentions. That mapping cannot be derived from the source by anyone, which is why the harness states it rather than having it guessed.",
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
               }
             }
           }
@@ -49,17 +59,35 @@
       }
     },
     "uncovered_directions": {
-      "description": "The work list. Targeting these rather than deep paragraphs is what stops a plan succeeding on code that was already covered. `ordinal` is the decision's position within its paragraph -- a line does not identify a decision, because COPY expansion puts many on one line.",
+      "description": "The work list. Targeting these rather than deep paragraphs is what stops a plan succeeding on code that was already covered. Identify each decision by `paragraph` plus `condition` and/or `line`: those are read off the COBOL, so both sides derive the same value from the same file. `ordinal` is accepted but is only an identity when `ordinal_source` is \"frameladder\" -- see that field for why a foreign ordinal is worse than no ordinal. An entry that gives only a paragraph is honoured by targeting every decision in it, which costs planning budget rather than correctness. Run `frameladder <program> directions --capability <file>` to see exactly how a work list resolved before spending a run on it.",
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["paragraph", "ordinal", "direction"],
+        "required": ["paragraph"],
         "additionalProperties": true,
         "properties": {
           "paragraph": { "type": "string", "minLength": 1 },
+          "condition": {
+            "description": "The decision's condition as written in the source. The most reliable identifier there is: spelling differences (IS EQUAL TO against =, quote style, case, whitespace, a leading IF, outer parentheses, a trailing period) are all normalised away before comparison.",
+            "type": "string"
+          },
+          "line": {
+            "description": "Source line of the decision. Narrows a condition that appears more than once in one paragraph. Not sufficient alone when COPY expansion puts several decisions on one line -- then every decision on it is targeted.",
+            "type": "integer"
+          },
           "ordinal": { "type": "integer" },
-          "kind": { "enum": ["IF", "WHEN", "LOOP", "PHRASE"] },
-          "direction": { "type": "boolean" }
+          "kind": {
+            "description": "Aliases are accepted: EVALUATE and SEARCH resolve to WHEN, PERFORM UNTIL / PERFORM VARYING to LOOP, AT END / INVALID KEY to PHRASE. A kind that matches nothing in the paragraph is ignored rather than treated as a claim the paragraph lacks it.",
+            "type": "string"
+          },
+          "probe_id": {
+            "description": "The harness's own id for this direction, echoed back untouched on anything derived from it, so results can be joined without either side adopting the other's identity scheme.",
+            "type": "string"
+          },
+          "direction": {
+            "description": "Which way. Accepts a boolean, or T/F, Y/N, taken/not-taken, then/else, match/nomatch. Absent means the whole decision is open and both directions are planned -- which is right, because picking one would be a guess that surfaces later as a witness on the direction nobody wanted.",
+            "type": ["boolean", "string"]
+          }
         }
       }
     },

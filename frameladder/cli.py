@@ -428,7 +428,12 @@ def cmd_coverage(args):
     # UnboundLocalError. A profile is a property of the run, not of one stage.
     from .capability import load as _load_capability, unrepresentable
     capability = _load_capability(getattr(args, "capability", None))
-    wanted = capability.wanted
+    # Resolved against this program, never read as raw ordinals: the harness
+    # and this tool number decisions differently, and taking the number at
+    # face value pointed 1,251 of 1,644 targets on the CardDemo corpus at a
+    # decision nobody asked for. See `directions`.
+    resolution = capability.resolve_uncovered(program)
+    wanted = resolution.wanted
     skipped_covered = skipped_unrepresentable = 0
 
     # The value pool, built once. Every literal the program compares a field
@@ -618,7 +623,8 @@ def cmd_coverage(args):
         "learned": learned.summary() if args.learn else None,
         "lift": lift_stats,
         "capability": ({"targets_skipped_already_covered": skipped_covered,
-                        "plans_skipped_unrepresentable": skipped_unrepresentable}
+                        "plans_skipped_unrepresentable": skipped_unrepresentable,
+                        "work_list": resolution.summary()}
                        if capability.stated else None),
         "stopped_early": stopped or None,
         "unreached_paragraphs": gaps["paragraphs"],
@@ -638,11 +644,16 @@ def cmd_coverage(args):
     # the same command with `--capability` plans the directions run one did
     # not reach and skips the ones it did.
     if args.work_list:
+        # `condition` and `line` travel with every entry because they are the
+        # only identity a *different* tool can match on - the ordinal is this
+        # one's own statement numbering and means nothing outside it.
         work = [{"paragraph": b.paragraph, "ordinal": b.ordinal,
-                 "kind": b.kind, "direction": d}
+                 "kind": b.kind, "direction": d, "condition": b.condition,
+                 "line": b.line}
                 for b in gaps["untouched"] for d in (True, False)]
         work += [{"paragraph": b.paragraph, "ordinal": b.ordinal,
-                  "kind": b.kind, "direction": not went}
+                  "kind": b.kind, "direction": not went,
+                  "condition": b.condition, "line": b.line}
                  for b, went in gaps["one_way_only"]]
         # Only when the run was cut short: a run that finished tried
         # everything, so holding its failures back would leave a work list
@@ -656,6 +667,10 @@ def cmd_coverage(args):
             work = fresh
         with open(args.work_list, "w") as fh:
             json.dump({"schema_version": "1.0", "program": program.name,
+                       # Our own ordinals, so the next run may use them as an
+                       # identity. Any profile without this stamp is matched
+                       # on text instead.
+                       "ordinal_source": "frameladder",
                        "uncovered_directions": work}, fh, indent=1)
         payload["work_list"] = {"path": args.work_list, "directions": len(work),
                                 "held_back_already_attempted": deferred}
@@ -1163,8 +1178,11 @@ def cmd_represent(args):
                        max_routes=args.routes,
                        measure_precheck=True)
     payload["profile"] = source
-    payload["injectable_variables"] = len(capability.injectable)
-    payload["replayable_operations"] = len(capability.operations)
+    # A stated profile may still omit a section, which means "no constraint"
+    # and is not the same as an empty one. `None` here is a count of nothing
+    # stated, not a crash.
+    payload["injectable_variables"] = len(capability.injectable or ())
+    payload["replayable_operations"] = len(capability.operations or ())
     if source.startswith("proxy"):
         payload["caveat"] = PROXY_CAVEAT
 
@@ -1198,6 +1216,288 @@ def cmd_represent(args):
                                           "; ".join(row["reasons"][:2])))
         if p.get("caveat"):
             print("\n   %s" % p["caveat"])
+    return _emit(payload, args.json, render)
+
+
+def _frame_headroom(capability, program, args) -> dict:
+    """Does the harness get anywhere this interpreter cannot?
+
+    This is the whole question behind re-planning from a failed attempt's
+    `first_missing_frame`. Resuming from a frame the harness reached only pays
+    if that frame is somewhere derivation cannot already start; if this
+    interpreter reaches everything the harness does and more, the frames are a
+    ranking of seeds rather than new ground.
+
+    Measured here it was the latter, decisively - over seven GnuCOBOL-runnable
+    programs the interpreter reached 53 chain frames and the real compiled run
+    13, because the compiled program abends on files that are not there. That
+    is a property of a corpus with no data behind its mocks, and an estate
+    with real data may well invert it. So the number is computed rather than
+    assumed, from whatever attempts the profile carries, and it is reported
+    without changing what the planner does.
+    """
+    attempts = getattr(capability, "attempts", ()) or ()
+    reached: set = set()
+    for attempt in attempts:
+        reached |= {str(f).upper() for f in attempt.reached_frames}
+        if attempt.first_missing_frame:
+            reached.add(str(attempt.first_missing_frame).upper())
+    if not attempts:
+        return {"attempts": 0, "reached": 0, "beyond_us": [], "unknown": [],
+                "verdict": "no attempts in the profile"}
+
+    entry = _entry(program, args)
+    graph = build_graph(program)
+    ours = {name.upper() for name in depths(graph, entry)}
+    known = {name.upper() for name in program.paragraph_names}
+    beyond = sorted(name for name in reached if name in known and name not in ours)
+    unknown = sorted(name for name in reached if name not in known)
+
+    if beyond:
+        verdict = ("%d frame(s) the harness reached are unreachable from %s "
+                   "here - re-planning from them would open ground derivation "
+                   "cannot start on, so it is worth doing"
+                   % (len(beyond), entry))
+    else:
+        verdict = ("every frame the harness reached is already reachable from "
+                   "%s here, so resuming from them ranks seeds rather than "
+                   "adding reach" % entry)
+    return {"attempts": len(attempts), "reached": len(reached),
+            "beyond_us": beyond, "unknown": unknown, "verdict": verdict}
+
+
+def cmd_directions(args):
+    """How a harness's work list lands on this program's decisions.
+
+    A diagnostic, and the first thing to run against a new profile. It answers
+    the question that was previously unanswerable from either side: of the
+    directions you asked for, which ones do I believe I can name, how did I
+    name them, and what did I have to guess.
+    """
+    program = _program(args)
+    capability, source = _capability(args, program)
+    resolution = capability.resolve_uncovered(program)
+    from .directions import program_mismatch
+    payload = dict(resolution.summary())
+    payload.update({
+        "program": program.name, "profile": source,
+        "wrong_program": program_mismatch(capability, program) or None,
+        "entries": len(capability.raw_uncovered),
+        "ordinals_trusted": capability.trust_ordinals,
+        "unresolved": list(resolution.unresolved)[: args.limit],
+        "ambiguous": list(resolution.ambiguous)[: args.limit],
+        "conflicts": list(resolution.conflicts)[: args.limit],
+        "frames": _frame_headroom(capability, program, args),
+    })
+
+    def render(p):
+        print("%s   profile %s" % (p["program"], p["profile"]))
+        if p["wrong_program"]:
+            print("\n   WRONG PROGRAM: %s\n" % p["wrong_program"])
+        print("   %d entries -> %d directions on %d decisions"
+              % (p["entries"], p["directions"], p["entries_matched"]))
+        for how, count in p["by_method"].items():
+            print("      %-28s %5d" % (how, count))
+        if p["entries_unresolved"]:
+            print("\n   unresolved %d" % p["entries_unresolved"])
+            for row in p["unresolved"]:
+                print("      %-24s %s" % (row.get("paragraph", "?"),
+                                          row["reason"]))
+        if p["ordinal_conflicts"]:
+            # The single most useful line for an integrator. Ordinals that
+            # disagree are not a fault in either tool; they are two counting
+            # schemes, and a profile matched on text is unaffected. Silence
+            # here would have hidden the mismatch that made 1,251 of 1,644
+            # targets on this corpus point at the wrong decision.
+            print("\n   %d entries carry an ordinal that disagrees with the "
+                  "decision their text names." % p["ordinal_conflicts"])
+            print("   Text won, which is correct unless the profile sets "
+                  "ordinal_source: frameladder.")
+        if p["ambiguous_entries"]:
+            print("\n   %d entries name more than one decision; all are "
+                  "targeted" % p["ambiguous_entries"])
+            for row in p["ambiguous"]:
+                print("      %-24s %d decisions via %s"
+                      % (row["paragraph"], row["matched"], row["how"]))
+        frames = p["frames"]
+        if frames["attempts"]:
+            print("\n   frames from %d attempt(s): harness reached %d, of "
+                  "which this interpreter cannot reach %d"
+                  % (frames["attempts"], frames["reached"],
+                     len(frames["beyond_us"])))
+            for name in frames["beyond_us"][:8]:
+                print("      %s" % name)
+            print("   %s" % frames["verdict"])
+    return _emit(payload, args.json, render)
+
+
+# The dispositions, in the order a target passes through them. Named for what
+# the *harness* would call them, because the whole point of the breakdown is
+# that both sides can talk about the same number: "268 attempted, 1 exported"
+# is not a diagnosis, it is a mystery.
+_STAGES = ("not_wanted", "precheck_refused", "unreached_internally",
+           "unsolved", "unrepresentable", "exported")
+
+
+def _obligation_text(obligation) -> str:
+    """An unsolved obligation in the words of the program, not the dataclass.
+
+    A histogram is only useful if its keys are readable and *repeat*; a raw
+    `Atom(lhs=Term(kind='var', ...))` is neither, since the value fields make
+    every entry unique and the count is always one.
+    """
+    atoms = obligation if isinstance(obligation, (tuple, list)) else [obligation]
+    names = []
+    for atom in atoms:
+        for side in ("lhs", "rhs"):
+            term = getattr(atom, side, None)
+            name = getattr(term, "name", None)
+            if name and name not in names:
+                names.append(name)
+    if not names:
+        return str(obligation)[:80]
+    joined = ", ".join(names[:3])
+    return "no value derived for %s" % joined
+
+
+def cmd_export(args):
+    """Plan every uncovered direction the harness asked for, and account for
+    every one that did not make it.
+
+    The previous integration reported 268 targets analysed and one candidate
+    exported, with no way to tell a target the planner could not route to from
+    one it routed to and could not solve, from one it solved into a plan the
+    harness cannot represent. Those three call for completely different fixes
+    - a better route, a better solver, a wider capability - so they are
+    counted separately and each carries its reasons.
+    """
+    program = _program(args)
+    capability, source = _capability(args, program)
+    entry = _entry(program, args)
+    from .capability import unrepresentable
+    from .coverage import branches_of
+    from .ladder import plan_for_branch, precheck
+    from .replay import replay_script
+
+    resolution = capability.resolve_uncovered(program)
+    wanted = resolution.wanted
+    counts = {stage: 0 for stage in _STAGES}
+    reasons: dict = {}
+    scripts: list = []
+    rows: list = []
+    # Route refusals are per paragraph, not per direction, and a paragraph
+    # carries many decisions. Asking once and remembering saves the dominant
+    # cost on a large program.
+    refusals: dict = {}
+
+    def note(bucket: str, text: str) -> None:
+        key = "%s: %s" % (bucket, text)
+        reasons[key] = reasons.get(key, 0) + 1
+
+    for branch in branches_of(program):
+        for direction in (True, False):
+            key = (branch.paragraph.upper(), branch.ordinal,
+                   branch.kind.upper(), bool(direction))
+            if wanted and key not in wanted:
+                counts["not_wanted"] += 1
+                continue
+            if capability.stated and args.precheck:
+                if branch.paragraph not in refusals:
+                    try:
+                        refusals[branch.paragraph] = precheck(
+                            program, branch.paragraph, capability,
+                            entry=args.entry)
+                    except Exception:                        # noqa: BLE001
+                        refusals[branch.paragraph] = []
+                refused = refusals[branch.paragraph]
+                if refused:
+                    counts["precheck_refused"] += 1
+                    for reason in refused[:2]:
+                        note("precheck_refused", reason)
+                    continue
+            try:
+                plan = plan_for_branch(program, branch.paragraph, branch.line,
+                                       direction, entry=args.entry,
+                                       max_routes=args.routes,
+                                       ordinal=branch.ordinal,
+                                       capability=(capability if args.profile_aware
+                                                   else None))
+            except Exception as exc:                         # noqa: BLE001
+                counts["unreached_internally"] += 1
+                note("unreached_internally", type(exc).__name__)
+                continue
+            if not plan.chain:
+                counts["unreached_internally"] += 1
+                note("unreached_internally", "no route from %s" % entry)
+                continue
+            if plan.open_obligations:
+                counts["unsolved"] += 1
+                for obligation in plan.open_obligations[:2]:
+                    note("unsolved", _obligation_text(obligation))
+                continue
+            blocked = unrepresentable(plan, capability)
+            if blocked:
+                counts["unrepresentable"] += 1
+                for reason in blocked[:2]:
+                    note("unrepresentable", reason)
+                continue
+            counts["exported"] += 1
+            row = {"paragraph": branch.paragraph, "ordinal": branch.ordinal,
+                   "kind": branch.kind, "direction": direction,
+                   "condition": branch.condition, "line": branch.line}
+            rows.append(row)
+            if args.out:
+                script = replay_script(plan, capability, program=program,
+                                       entry=entry)
+                script["direction"] = row
+                scripts.append(script)
+            if args.limit and counts["exported"] >= args.limit:
+                break
+        else:
+            continue
+        break
+
+    attempted = sum(counts[s] for s in _STAGES if s != "not_wanted")
+    from .directions import program_mismatch
+    payload = {
+        "program": program.name, "entry": entry, "profile": source,
+        "wrong_program": program_mismatch(capability, program) or None,
+        "work_list": resolution.summary(),
+        "attempted": attempted, "counts": counts,
+        "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])[:20]),
+        "exported": rows,
+    }
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump({"schema_version": "1.0", "program": program.name,
+                       "entry": entry, "candidates": scripts}, fh, indent=1)
+        payload["written"] = {"path": args.out, "candidates": len(scripts)}
+
+    def render(p):
+        print("%s   entry %s   profile %s" % (p["program"], p["entry"],
+                                              p["profile"]))
+        if p["wrong_program"]:
+            print("\n   WRONG PROGRAM: %s\n" % p["wrong_program"])
+        work = p["work_list"]
+        if work["directions"]:
+            print("   work list: %d directions from %d entries, %d unresolved"
+                  % (work["directions"], work["entries_matched"],
+                     work["entries_unresolved"]))
+        print("\n   %d attempted" % p["attempted"])
+        for stage in _STAGES:
+            if stage == "not_wanted":
+                continue
+            print("      %-24s %5d" % (stage, p["counts"][stage]))
+        if p["counts"]["not_wanted"]:
+            print("      %-24s %5d   (not on the work list)"
+                  % ("skipped", p["counts"]["not_wanted"]))
+        if p["reasons"]:
+            print("\n   why")
+            for reason, count in p["reasons"].items():
+                print("      %5d  %s" % (count, reason))
+        if p.get("written"):
+            print("\n   wrote %d replayable candidate(s) to %s"
+                  % (p["written"]["candidates"], p["written"]["path"]))
     return _emit(payload, args.json, render)
 
 
@@ -1414,6 +1714,31 @@ def build_parser():
     rr.add_argument("--routes", type=int, default=4)
     rr.add_argument("--limit", type=int, default=12)
     rr.set_defaults(func=cmd_represent)
+
+    dr = sub.add_parser("directions", help="how a harness's work list lands "
+                                           "on this program's decisions")
+    dr.add_argument("--proxy", nargs="?", const="status",
+                    choices=["status", "outputs"])
+    dr.add_argument("--limit", type=int, default=12)
+    dr.set_defaults(func=cmd_directions)
+
+    ex = sub.add_parser("export", help="plan every uncovered direction the "
+                                       "harness asked for, and account for "
+                                       "every one that did not make it")
+    ex.add_argument("--out", metavar="FILE",
+                    help="write the replayable candidates as JSON")
+    ex.add_argument("--limit", type=int, default=0,
+                    help="stop after this many exported candidates; 0 is all")
+    ex.add_argument("--routes", type=int, default=4)
+    ex.add_argument("--proxy", nargs="?", const="status",
+                    choices=["status", "outputs"])
+    ex.add_argument("--max-outcomes", type=int, default=0)
+    ex.add_argument("--profile-aware", action="store_true",
+                    help="let the profile pick the route, not just judge it")
+    ex.add_argument("--no-precheck", dest="precheck", action="store_false",
+                    help="solve every target even when the route is already "
+                         "known to need something the harness cannot carry")
+    ex.set_defaults(func=cmd_export, precheck=True)
 
     b = sub.add_parser("bind", help="record a decision the agent made")
     b.add_argument("--bind", action="append", required=True, metavar="VAR=VALUE")

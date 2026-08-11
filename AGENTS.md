@@ -19,7 +19,7 @@ is a deliberate property, not an accident of youth — see *Invariants*.
 ## Commands
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q      # 76 unit tests, seconds
+python3 -m pytest tests/test_frameladder.py -q      # 201 unit tests, seconds
 python3 tests/parser_agreement.py                    # parser vs reference ASTs
 python3 -m conformance.differential  <programs>      # interpreter vs GnuCOBOL
 python3 -m conformance.plan_check    <programs>      # do plans reach, in GnuCOBOL?
@@ -263,6 +263,21 @@ leaves the corpus figure flat, say so and say why it cannot show up there.
 - **Copybooks: read what is `COPY`ed.** Loading the directory gave CBACT04C
   2,640 fields instead of 129, inflating the `declared` set that live-in
   filtering and record association depend on.
+- **An index shared with another program is not an identity.** Two tools can
+  both number the decisions in a paragraph, agree on the paragraph, and mean
+  different decisions by the same integer — this tool counts statement
+  position, Specter counts per (paragraph, kind). The number is *plausible* on
+  both sides, so nothing raises: 1,251 of 1,644 CardDemo targets silently
+  pointed at the wrong decision. Join on what the program says (condition
+  text, source line), never on what either side counted, and treat a foreign
+  index as a hint that is worth *reporting when it disagrees* — see
+  `directions.py`. The general form: when an identifier crosses a process
+  boundary, either both sides derive it from the shared artifact or it is not
+  an identifier.
+- **Inserting a dataclass field is an API change.** Adding `aliases` in the
+  middle of `Operation` silently redirected every positional construction's
+  fourth argument, so `matches_on_state` landed in `aliases` and every lookup
+  raised. New fields go last, and `TestOperationAliases` now pins the order.
 
 ## Generalisation is checked, not assumed
 

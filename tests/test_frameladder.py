@@ -2701,6 +2701,272 @@ class TestCapabilityProfile(unittest.TestCase):
         with self.assertRaises(ValueError):
             load({"schema_version": "2.0"})
 
+
+class TestDirectionResolution(unittest.TestCase):
+    """Naming one decision, when the two tools count decisions differently."""
+
+    SRC = HEADER + """       01  WS-A PIC X.
+       01  WS-B PIC X.
+       PROCEDURE DIVISION.
+       DR-MAIN.
+           IF WS-A = 'A'
+              MOVE 'X' TO WS-B
+           END-IF
+           IF WS-B = 'B'
+              MOVE 'Y' TO WS-A
+           END-IF
+           IF WS-A = 'C'
+              MOVE 'Z' TO WS-B
+           END-IF
+           GOBACK
+           .
+"""
+
+    def _program(self):
+        return program(self.SRC)
+
+    def _branches(self):
+        from frameladder.coverage import branches_of
+        return branches_of(self._program())
+
+    def test_a_foreign_ordinal_is_never_read_as_an_identity(self):
+        # The failure this module exists to prevent. A harness numbering per
+        # (paragraph, kind) calls the third IF ordinal 2; this tool numbers by
+        # statement position, where ordinal 2 is a different decision that
+        # usually exists. Nothing detects that from the number alone, so the
+        # number is not trusted.
+        from frameladder.capability import load
+        prog, branches = self._program(), self._branches()
+        third = branches[2]
+        cap = load({"schema_version": "1.0", "uncovered_directions": [
+            {"paragraph": "DR-MAIN", "ordinal": 2, "kind": "IF",
+             "condition": third.condition, "direction": True}]})
+        resolution = cap.resolve_uncovered(prog)
+        self.assertEqual(resolution.wanted,
+                         {("DR-MAIN", third.ordinal, "IF", True)})
+        self.assertTrue(resolution.conflicts,
+                        "an ordinal that disagrees with the text is reported")
+
+    def test_our_own_ordinals_are_trusted_when_stamped(self):
+        from frameladder.capability import load
+        prog, branches = self._program(), self._branches()
+        cap = load({"schema_version": "1.0",
+                    "ordinal_source": "frameladder",
+                    "uncovered_directions": [
+                        {"paragraph": "DR-MAIN", "ordinal": branches[1].ordinal,
+                         "kind": "IF", "direction": False}]})
+        self.assertTrue(cap.trust_ordinals)
+        self.assertEqual(cap.resolve_uncovered(prog).wanted,
+                         {("DR-MAIN", branches[1].ordinal, "IF", False)})
+
+    def test_the_same_condition_written_differently_still_matches(self):
+        from frameladder.capability import load
+        prog, branches = self._program(), self._branches()
+        cap = load({"schema_version": "1.0", "uncovered_directions": [
+            {"paragraph": "dr-main",
+             "condition": '( if ws-a is equal to "A" ).',
+             "direction": "T"}]})
+        resolution = cap.resolve_uncovered(prog)
+        self.assertEqual(resolution.wanted,
+                         {("DR-MAIN", branches[0].ordinal, "IF", True)})
+
+    def test_no_direction_named_means_both(self):
+        # A decision named without a direction is wholly open. Picking one
+        # would be a guess that shows up later as a witness on the direction
+        # nobody wanted.
+        from frameladder.capability import load
+        prog, branches = self._program(), self._branches()
+        cap = load({"schema_version": "1.0", "uncovered_directions": [
+            {"paragraph": "DR-MAIN", "condition": branches[0].condition}]})
+        self.assertEqual(cap.resolve_uncovered(prog).wanted,
+                         {("DR-MAIN", branches[0].ordinal, "IF", True),
+                          ("DR-MAIN", branches[0].ordinal, "IF", False)})
+
+    def test_a_paragraph_alone_targets_every_decision_in_it(self):
+        from frameladder.capability import load
+        prog = self._program()
+        cap = load({"schema_version": "1.0",
+                    "uncovered_directions": [{"paragraph": "DR-MAIN"}]})
+        resolution = cap.resolve_uncovered(prog)
+        self.assertEqual(len(resolution.wanted), 6)   # 3 decisions, both ways
+        self.assertEqual(resolution.by_method, {"paragraph": 1})
+
+    def test_an_unknown_paragraph_is_reported_not_dropped(self):
+        from frameladder.capability import load
+        prog = self._program()
+        cap = load({"schema_version": "1.0", "uncovered_directions": [
+            {"paragraph": "NO-SUCH-PARA", "condition": "X = 1"}]})
+        resolution = cap.resolve_uncovered(prog)
+        self.assertEqual(resolution.wanted, set())
+        self.assertEqual(len(resolution.unresolved), 1)
+        self.assertIn("no such paragraph", resolution.unresolved[0]["reason"])
+
+    def test_a_probe_id_survives_the_round_trip(self):
+        # The harness must be able to join results back to its own identity
+        # without either side adopting the other's numbering.
+        from frameladder.capability import load
+        prog, branches = self._program(), self._branches()
+        cap = load({"schema_version": "1.0", "uncovered_directions": [
+            {"paragraph": "DR-MAIN", "condition": branches[0].condition,
+             "direction": True, "probe_id": "@@B:41:T"}]})
+        matches = cap.resolve_uncovered(prog).matches
+        self.assertEqual([m.probe for m in matches], ["@@B:41:T"])
+
+    def test_kind_aliases_are_accepted(self):
+        from frameladder.directions import normalize_kind
+        self.assertEqual(normalize_kind("EVALUATE"), "WHEN")
+        self.assertEqual(normalize_kind("PERFORM UNTIL"), "LOOP")
+        self.assertEqual(normalize_kind("AT END"), "PHRASE")
+
+    def test_a_profile_for_another_program_is_reported(self):
+        # Paragraph names repeat across a shop's programs, so a mismatched
+        # profile resolves rather than fails: COTRN02C's work list run against
+        # COSGN00C matched 16 of 40 entries and exported 7 meaningless
+        # candidates before this said anything.
+        from frameladder.capability import load
+        from frameladder.directions import program_mismatch
+        prog = self._program()
+        cap = load({"schema_version": "1.0", "program": "SOME-OTHER-PGM"})
+        self.assertIn("SOME-OTHER-PGM", program_mismatch(cap, prog))
+
+    def test_a_spelling_difference_is_not_a_mismatch(self):
+        # The two sides disagree about what a program is called - a file stem,
+        # a PROGRAM-ID, a member name, with or without an extension - and
+        # crying wolf on that would train the reader to ignore the warning.
+        from frameladder.capability import load
+        from frameladder.directions import program_mismatch
+        prog = self._program()
+        for spelling in (prog.name, prog.name + ".cbl", prog.name.lower(),
+                         "/some/path/" + prog.name + ".CBL"):
+            cap = load({"schema_version": "1.0", "program": spelling})
+            self.assertEqual(program_mismatch(cap, prog), "", spelling)
+
+    def test_no_program_stated_is_not_a_mismatch(self):
+        from frameladder.capability import load
+        from frameladder.directions import program_mismatch
+        cap = load({"schema_version": "1.0"})
+        self.assertEqual(program_mismatch(cap, self._program()), "")
+
+
+class TestFrameHeadroom(unittest.TestCase):
+    """Whether resuming from a harness's frames could add reach at all.
+
+    Re-planning from a failed attempt's `first_missing_frame` only pays if the
+    harness gets somewhere derivation cannot already start. That is a property
+    of the estate, not of the idea, so it is measured rather than assumed.
+    """
+
+    SRC = HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       FH-MAIN.
+           IF WS-A = 'A'
+              PERFORM FH-REACHED
+           END-IF
+           GOBACK
+           .
+       FH-REACHED.
+           GOBACK
+           .
+       FH-ORPHAN.
+           EXIT
+           .
+"""
+    # FH-REACHED ends in GOBACK on purpose. With a bare EXIT, COBOL falls
+    # through into FH-ORPHAN and the "orphan" is reachable after all - which
+    # is the fixture being wrong, not the analysis.
+
+    def _args(self, capability_path=None):
+        import argparse
+        return argparse.Namespace(entry=None, capability=capability_path,
+                                  conventions=None, proxy=None)
+
+    def test_a_frame_we_cannot_reach_is_worth_resuming_from(self):
+        from frameladder.capability import load
+        from frameladder.cli import _frame_headroom
+        prog = program(self.SRC)
+        cap = load({"schema_version": "1.0", "attempts": [
+            {"target": "FH-ORPHAN", "reached_frames": ["FH-MAIN", "FH-ORPHAN"]}]})
+        result = _frame_headroom(cap, prog, self._args())
+        self.assertEqual(result["beyond_us"], ["FH-ORPHAN"])
+        self.assertIn("worth doing", result["verdict"])
+
+    def test_frames_we_already_reach_only_rank_seeds(self):
+        from frameladder.capability import load
+        from frameladder.cli import _frame_headroom
+        prog = program(self.SRC)
+        cap = load({"schema_version": "1.0", "attempts": [
+            {"target": "FH-REACHED", "reached_frames": ["FH-MAIN", "FH-REACHED"]}]})
+        result = _frame_headroom(cap, prog, self._args())
+        self.assertEqual(result["beyond_us"], [])
+        self.assertIn("ranks seeds", result["verdict"])
+
+    def test_a_frame_this_program_does_not_have_is_not_counted_as_reach(self):
+        # A name we do not know is a vocabulary gap, not new ground, and
+        # counting it as reach would argue for the feature on false evidence.
+        from frameladder.capability import load
+        from frameladder.cli import _frame_headroom
+        prog = program(self.SRC)
+        cap = load({"schema_version": "1.0", "attempts": [
+            {"target": "X", "reached_frames": ["NOT-IN-THIS-PROGRAM"]}]})
+        result = _frame_headroom(cap, prog, self._args())
+        self.assertEqual(result["beyond_us"], [])
+        self.assertEqual(result["unknown"], ["NOT-IN-THIS-PROGRAM"])
+
+    def test_no_attempts_says_so_rather_than_implying_a_verdict(self):
+        from frameladder.capability import load
+        from frameladder.cli import _frame_headroom
+        cap = load({"schema_version": "1.0"})
+        result = _frame_headroom(cap, program(self.SRC), self._args())
+        self.assertEqual(result["attempts"], 0)
+        self.assertIn("no attempts", result["verdict"])
+
+
+class TestOperationAliases(unittest.TestCase):
+    """The two sides key one mock differently, and say so rather than guess."""
+
+    def test_punctuation_and_case_need_no_alias(self):
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0", "replayable_operations": [
+            {"op_key": "EXEC:CICS:READ"}]})
+        for spelling in ("EXEC CICS READ", "exec/cics/read", "Exec.Cics.Read"):
+            self.assertTrue(cap.can_replay(spelling), spelling)
+
+    def test_a_declared_alias_is_honoured(self):
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0", "replayable_operations": [
+            {"op_key": "READ:CUSTOMER-FILE", "aliases": ["READ:CUSTDD"],
+             "fields": ["CUST-ID"]}]})
+        self.assertTrue(cap.can_replay("READ:CUSTDD"))
+        self.assertTrue(cap.can_set("READ:CUSTDD", "CUST-ID"))
+        self.assertFalse(cap.can_set("READ:CUSTDD", "SOMETHING-ELSE"))
+
+    def test_an_undeclared_name_is_still_refused(self):
+        # Aliasing widens what the harness said, never what it did not.
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0", "replayable_operations": [
+            {"op_key": "READ:CUSTOMER-FILE"}]})
+        self.assertFalse(cap.can_replay("READ:ORDER-FILE"))
+
+    def test_a_real_op_key_wins_a_collision_with_an_alias(self):
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0", "replayable_operations": [
+            {"op_key": "READ:A", "aliases": ["READ:B"]},
+            {"op_key": "READ:B", "max_outcomes": 7}]})
+        self.assertEqual(cap.outcome_limit("READ:B"), 7)
+
+    def test_aliases_stay_last_in_the_field_order(self):
+        # `represent.py` and several tests construct an Operation
+        # positionally. A field inserted above `aliases` silently changes what
+        # their fourth argument means, which is exactly how this arrived.
+        import dataclasses
+        from frameladder.capability import Operation
+        names = [f.name for f in dataclasses.fields(Operation)]
+        self.assertEqual(names[-1], "aliases")
+        self.assertEqual(names[:4],
+                         ["op_key", "fields", "max_outcomes",
+                          "matches_on_state"])
+
+
 class TestRepresentability(unittest.TestCase):
     """Classifying what the harness could run, in the harness's own words."""
 

@@ -37,6 +37,25 @@ from dataclasses import dataclass, field
 SCHEMA_VERSION = "1.0"
 
 
+def canonical_op(op_key: str) -> str:
+    """One spelling for an operation both sides know by different names.
+
+    The two programs key the same mock differently: a verb and a target
+    joined by whatever separator each happened to pick, sometimes with the
+    system in the middle (`EXEC:CICS:READ` against `EXEC CICS READ`). The
+    parts are the identity; the punctuation between them is not. Hyphens are
+    left alone because they are inside COBOL names, not between them.
+
+    This only unifies punctuation and case. It will not connect two genuinely
+    different names - that is what `aliases` is for, and a harness that needs
+    one says so rather than having it guessed.
+    """
+    text = str(op_key or "").upper()
+    for separator in (":", "/", ".", "|", ",", "\t"):
+        text = text.replace(separator, " ")
+    return ":".join(text.split())
+
+
 @dataclass(frozen=True)
 class Operation:
     """A mock the harness can replay, and how far it can be driven."""
@@ -52,6 +71,17 @@ class Operation:
     # `None` means the harness did not say; the planner reports such outcomes
     # rather than refusing them, because silence is not a no.
     matches_on_state: bool | None = None
+    # Other names the harness answers to for this same operation. Punctuation
+    # and case are handled by `canonical_op`; this is for the rest, where the
+    # harness calls a file by a DD name, a DDL name or a handle the source
+    # never mentions. Nothing can derive that mapping from the COBOL, so the
+    # profile states it and the planner reports which alias it matched.
+    #
+    # Last on purpose. `represent.py` and the tests construct an Operation
+    # positionally, so a field inserted above this line silently changes what
+    # their fourth argument means - which is how this arrived, with
+    # `matches_on_state` landing in `aliases` and every lookup raising.
+    aliases: frozenset = frozenset()
 
     def accepts(self, name: str) -> bool:
         return not self.fields or name.upper() in self.fields
@@ -98,6 +128,16 @@ class Capability:
     operations: dict | None = None                      # op_key -> Operation
     uncovered: tuple = ()                               # Direction
     attempts: tuple = ()                                # Attempt
+    # The work list exactly as the harness wrote it. `uncovered` above is the
+    # strict reading, which only works when both sides number decisions the
+    # same way - and they do not. Resolution against a parsed program is the
+    # supported path; see `directions.resolve`.
+    raw_uncovered: tuple = ()
+    # Set when the profile claims its ordinals came from this tool, which is
+    # true of one `coverage --work-list` feeding the next run.
+    trust_ordinals: bool = False
+    # op_key (canonical) -> the Operation it names, including aliases.
+    _op_index: dict | None = None
     # An empty profile must not silently forbid everything: a caller that
     # supplies no capabilities is saying "no constraints stated", which is
     # the behaviour every existing command already has.
@@ -109,16 +149,57 @@ class Capability:
             return True
         return _base(name) in self.injectable
 
+    def operation(self, op_key: str):
+        """The Operation this key names, under any spelling the profile allows.
+
+        Exact first, then punctuation-and-case, then declared aliases. The
+        tiers are tried in decreasing order of confidence so that a profile
+        which names an operation exactly is never overridden by a looser
+        match on some other entry.
+        """
+        if self.operations is None:
+            return None
+        exact = self.operations.get((op_key or "").upper())
+        if exact is not None:
+            return exact
+        return (self._index()).get(canonical_op(op_key))
+
+    def _index(self) -> dict:
+        if self._op_index is None:
+            index: dict = {}
+            for op in (self.operations or {}).values():
+                index.setdefault(canonical_op(op.op_key), op)
+            # Aliases go in second so a real op_key always wins a collision:
+            # two operations claiming one alias is the harness's ambiguity,
+            # not something to resolve by iteration order.
+            for op in (self.operations or {}).values():
+                for alias in op.aliases:
+                    index.setdefault(canonical_op(alias), op)
+            self._op_index = index
+        return self._op_index
+
     def can_replay(self, op_key: str) -> bool:
         if not self.stated or self.operations is None:
             return True
-        return (op_key or "").upper() in self.operations
+        return self.operation(op_key) is not None
 
     def can_set(self, op_key: str, name: str) -> bool:
         if not self.stated or self.operations is None:
             return True
-        op = self.operations.get((op_key or "").upper())
+        op = self.operation(op_key)
         return bool(op) and op.accepts(_base(name))
+
+    def resolve_uncovered(self, program):
+        """The work list, matched against this program's own decisions.
+
+        Returns a `directions.Resolution`, whose `wanted` is what a planner
+        should use in place of `self.wanted`. Kept here rather than at the
+        call site because every caller needs the same thing and the failure
+        mode of getting it wrong is silent.
+        """
+        from .directions import resolve
+        return resolve(self.raw_uncovered, program,
+                       trust_ordinals=self.trust_ordinals)
 
     def discriminates(self, op_key: str) -> bool | None:
         """Whether the harness can select an outcome by program state.
@@ -129,11 +210,11 @@ class Capability:
         silence would throw away a quarter of the work for a claim nobody
         made.
         """
-        op = (self.operations or {}).get((op_key or "").upper())
+        op = self.operation(op_key)
         return op.matches_on_state if op else None
 
     def outcome_limit(self, op_key: str) -> int:
-        op = (self.operations or {}).get((op_key or "").upper())
+        op = self.operation(op_key)
         return op.max_outcomes if op else 0
 
     @property
@@ -197,15 +278,23 @@ def load(path_or_dict) -> Capability:
             key,
             frozenset(str(f).upper() for f in entry.get("fields") or ()),
             int(entry.get("max_outcomes") or 0),
-            None if matches is None else bool(matches))
+            None if matches is None else bool(matches),
+            frozenset(str(a).upper() for a in entry.get("aliases") or ()))
 
+    raw_uncovered = tuple(d for d in raw.get("uncovered_directions") or ()
+                          if isinstance(d, dict))
     uncovered = tuple(
         Direction(str(d.get("paragraph", "")).upper(),
                   int(d.get("ordinal", -1)),
                   str(d.get("kind", "IF")).upper(),
                   bool(d.get("direction", True)))
-        for d in raw.get("uncovered_directions") or ()
-        if isinstance(d, dict))
+        for d in raw_uncovered)
+
+    # Whose ordinals are these? Only this tool's own output may be read as an
+    # identity; anything else names a paragraph at best. `coverage
+    # --work-list` stamps the field, so the common round-trip keeps its
+    # precision without any profile having to opt in by hand.
+    ordinal_source = str(raw.get("ordinal_source", "")).strip().lower()
 
     attempts = tuple(
         Attempt(str(a.get("target", "")),
@@ -223,6 +312,8 @@ def load(path_or_dict) -> Capability:
         operations=operations,
         uncovered=uncovered,
         attempts=attempts,
+        raw_uncovered=raw_uncovered,
+        trust_ordinals=(ordinal_source == "frameladder"),
         stated=True)
 
 
