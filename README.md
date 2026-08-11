@@ -433,6 +433,120 @@ opening a missing file for input fails where opening it for output creates it.
   This is the strongest argument against using the tool as a primary parity
   oracle, and it stands.
 
+## The harness is a constraint, not a filter
+
+A plan is derived against this repository's own interpreter, where every
+variable is settable and every operation is replayable. Whatever will actually
+run it is narrower — and the expensive part is that the narrowing is silent.
+A harness that cannot inject a field drops it in projection; the plan still
+runs, still reports a status, and no longer means anything. On the one
+integration measured, of 45 internally valid plans **35 could not be
+represented, 4 reached COBOL, 3 succeeded, and all 3 landed on branches that
+were already covered.**
+
+`capability.py` is the contract that makes that sayable up front: which
+variables the harness can inject, which operations it can replay and which
+fields each of those can set, how long an outcome series it can hold, and
+which directions it still has not covered. Two commands use it.
+
+```bash
+frameladder PROG.cbl --copybooks ./cpy --json replay 3000-VALIDATE --proxy
+frameladder PROG.cbl --copybooks ./cpy represent --proxy --profile-aware
+```
+
+`replay` emits the whole ordered series a harness runs without interpreting
+anything: per operation, outcome 1..n in delivery order **and the terminal**,
+truncated to `max_outcomes` where the profile states one. What it will not do
+is drop something quietly. Every field the profile refuses, every input it
+cannot inject and every outcome past the limit comes back in `reasons`, in the
+harness's own words (*cannot inject X*, *cannot replay READ:F*), and an
+outcome whose fields were all refused stays in place holding nothing — because
+removing it would shift every later outcome onto an earlier call.
+
+`represent` classifies every plan the tool would emit as representable or not,
+with those same reasons.
+
+### What it measures, with a profile nobody has stated yet
+
+No harness states a profile today, so `--proxy` derives one from the source
+using the rule a real one uses: **a variable is injectable when the program
+compares it against a literal or it carries an 88-level `VALUE`**, and **an
+operation is replayable when the source puts one of its outputs in a status
+channel — and can set exactly those status fields**, because a mock record
+carries a status and not a record image. Which fields are status fields comes
+from `FILE STATUS IS`, a `RESP` operand and `SQLCODE`; never from a name.
+
+**This is a proxy and it proves nothing about any harness.** It is an upper
+bound in three known ways, all of them in the same direction: injectability is
+treated as a property of the variable rather than of the entry state; a
+program in which no operation has a status channel gets no operation
+constraint at all (8 of 46 programs, 15 solved plans that bind an outcome);
+and the real rule has name-based clauses this deliberately omits.
+
+Solved plans — one per reachable paragraph — that the profile could not
+replay:
+
+| | programs | plans | unrepresentable | median | range |
+|---|---|---|---|---|---|
+| the corpus this was built against | 29 | 494 | **53.2%** | 0.0% | 0–96.6% |
+| everything else | 17 | 229 | **55.0%** | 10.3% | 0–100% |
+
+The median is 0 and the pooled figure is 53%, which is the whole shape of the
+result: **16 of those 29 programs lose nothing and 7 lose more than half**.
+The batch programs are almost entirely representable; the loss is concentrated
+in the CICS screen programs, where the plan depends on an operation whose
+outcome is not in any status channel — a `SEND MAP`, an `XCTL` — so nothing
+about it can be handed back. Quote the median and the range.
+
+Loosening the operation rule to "it can set anything the source records it as
+writing" brackets the answer at 33.8% / 52.8%. The half that does not move is
+`cannot inject`, which is the half that does not depend on that choice.
+
+### Making the planner profile-aware moves 51 plans, and the share by 5-10 points
+
+Two mechanisms: reject a route before solving it, and prefer a route whose
+bindings the profile permits. Neither relaxes an obligation — an `OR` offers
+two ways to satisfy one condition and a target usually has more than one way
+in, so both are choices the program had already left open.
+
+| | solved plans | unrepresentable | runnable |
+|---|---|---|---|
+| the corpus this was built against, plain | 494 | 263 = 53.2% | 231 |
+| the same, profile-aware | 500 | 244 = **48.8%** | **256** |
+| everything else, plain | 229 | 126 = 55.0% | 103 |
+| the same, profile-aware | 236 | 107 = **45.3%** | **129** |
+
+*Runnable* — solved **and** representable — is the figure to watch, because
+the denominator moves slightly: the profile-aware pass also settles six or
+seven plans the plain one leaves open, by taking the other branch of an `OR`.
+It changed 4 of those 29 programs and 8 of the 17 elsewhere, and made none
+worse.
+
+Where it does nothing it does nothing for a reason worth knowing: on the deep
+CICS programs the operation that cannot be replayed sits in the mainline, so
+*every* route needs it and there is no other way in to prefer. Route
+preference cannot rescue a program whose entry point is the problem. The gain
+is larger off-corpus than on it, which is the check to repeat after any
+change here.
+
+**The cheap prefilter agreed with the full solve on every route the proxy
+refused** — 403 refusals, none of them wrong. It is not exact in general: a
+hand-written profile listing two variables and one operation produced 2 false
+refusals out of 26 targets, both because the solve met the obligation by
+reaching a write that establishes the value rather than by binding the
+producer `precheck` objected to. So the filter skips and orders, and when
+*every* route is refused the base route is derived anyway and the finished
+plan gives the answer. A filter that decides what gets tested has to be wrong
+in the harmless direction.
+
+**A gap in the contract, found by measuring rather than by reading it.**
+188 of the 819 plans carry an outcome selected by a *discriminator* — "this
+`READ` returns not-found only while the create flag is off" — and `Capability`
+has no way to say whether the harness can match on program state. A harness
+whose mock is a plain ordered list will deliver those in order and ignore the
+condition. They are counted in `notes` rather than refused, since refusing
+them would assume an answer the profile does not give.
+
 ## Coverage
 
 `frameladder <program> coverage --branches` measures what a whole plan set
@@ -674,7 +788,13 @@ frameladder PROGRAM [--copybooks DIR] [--entry PARA] [--work-dir DIR] [--json] C
 | `explain FRAME --variables A,B --source` | one frame, with provenance |
 | `family TARGET` | many tests reaching one target, differing only where free |
 | `sweep` | plan and verify every target |
+| `replay TARGET` | the complete ordered outcome series, terminal included, and every value the harness would have had to drop |
+| `represent` | which plans a stated harness could run, and why the rest could not |
 | `bind` / `note` / `resume` | the journal, so a loop survives a restart |
+
+`--capability FILE` states what will run the plans; without one nothing is
+assumed and no plan is refused. `--proxy` derives a stand-in from the source
+and labels every figure it produces as one.
 
 ## What it models
 

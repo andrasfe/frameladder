@@ -34,6 +34,10 @@
                 "type": "array",
                 "items": { "type": "string", "minLength": 1 }
               },
+              "matches_on_state": {
+                "description": "Whether the harness can select an outcome by inspecting program state, rather than only replaying an ordered list. A plan tells two invocations of one verb apart by a discriminator -- 'the READ whose key is X returns not-found' -- and a harness that cannot match on state will deliver those in order and ignore the condition, which is a different test from the one planned. Omit if you do not know; omission is reported, not treated as a refusal.",
+                "type": "boolean"
+              },
               "max_outcomes": {
                 "description": "Longest outcome series the harness can replay for this operation. 0 or absent means no stated limit. A read loop needs a series, not a value.",
                 "type": "integer",

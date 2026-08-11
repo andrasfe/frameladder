@@ -294,10 +294,73 @@ def analyse(program):
     return cached
 
 
+def _producer_refusal(producer, capability) -> str | None:
+    """Why the harness cannot deliver what this producer produces, or None.
+
+    The same three sentences `capability.unrepresentable` uses, asked of a
+    producer instead of a binding - so the planner and the report speak one
+    vocabulary and a reason means the same thing wherever it appears.
+    """
+    kind = getattr(producer, "kind", "")
+    var = getattr(producer, "var", "") or ""
+    op_key = getattr(producer, "op_key", "") or ""
+    if kind == "stub":
+        if not capability.can_replay(op_key):
+            return "cannot replay %s (needed to set %s)" % (
+                op_key or "an external operation", var)
+        if var and not capability.can_set(op_key, var):
+            return "%s cannot set %s" % (op_key, var)
+    elif var and not capability.can_inject(var):
+        return "cannot inject %s" % var
+    return None
+
+
+def precheck(program, target: str, capability, *, entry: str | None = None,
+             via=()) -> list:
+    """What this route needs that the harness cannot carry, before any solving.
+
+    Cheap on purpose: the chain's guards name variables, a variable's producer
+    is an index lookup, and a producer the profile refuses is a refusal
+    whatever value the solve would eventually have chosen. It is a *filter*
+    and not a proof - the solve may satisfy an obligation without ever binding
+    the producer, by reaching a write that establishes it - so it is used to
+    order and to skip routes, never to declare a target unreachable. The
+    disagreement rate against the full solve is measured rather than assumed;
+    see `represent.classify`.
+
+    Returns ``[(atom, reason)]``, empty when the route is clear.
+    """
+    if not getattr(capability, "stated", False):
+        return []
+    graph, prov = analyse(program)
+    entry = (entry or program.paragraph_names[0]).upper()
+    target = target.upper()
+    if target == entry and not via:
+        return []
+    path = (chain_via(graph, entry, list(via), target) if via
+            else shortest_chain(graph, entry, target))
+    if path is None:
+        return []
+    out, seen = [], set()
+    for site in path:
+        for guard in site.guards:
+            for atom in _resolve_88(guard, program.model):
+                at = origin_site(atom.origin)
+                for term in (atom.lhs, atom.rhs):
+                    if term.kind != "var" or not term.name:
+                        continue
+                    reason = _producer_refusal(prov.producer(term.name, at),
+                                               capability)
+                    if reason and reason not in seen:
+                        seen.add(reason)
+                        out.append((atom, reason))
+    return out
+
+
 def build_plan(program, target: str, *, entry: str | None = None, via=(),
                agent_bindings: dict | None = None, kinds: set | None = None,
                preferred: dict | None = None, extra: list | None = None,
-               max_rounds: int = 8) -> Plan:
+               max_rounds: int = 8, capability=None) -> Plan:
     """Derive a reaching plan for ``target``.
 
     ``via`` pins the call trace through named frames, so a caller can ask
@@ -311,6 +374,12 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     verified for a shorter chain can be offered this way, so traces that
     share a prefix agree on the arbitrary values instead of each inventing
     their own - without ever overriding something a constraint decided.
+
+    ``capability`` is weaker still and never changes what is *required*: where
+    one obligation offers several ways to be satisfied, the ways the harness
+    can actually deliver are tried first. A profile can therefore only change
+    which of two equally valid witnesses is chosen, which is the one place it
+    is safe for a harness limitation to reach into a derivation.
     """
     # A VALUE clause is the program stating what a field starts as. That is a
     # default rather than a constraint - a test may still set it - so it seeds
@@ -319,6 +388,7 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
     seeded = dict(program.model.initial)
     seeded.update({k.upper(): v for k, v in (preferred or {}).items()})
     preferred = seeded
+    cap = capability if getattr(capability, "stated", False) else None
     graph, prov = analyse(program)
     entry = (entry or program.paragraph_names[0]).upper()
     target = target.upper()
@@ -525,6 +595,18 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
         # clashes downstream calls a satisfiable chain infeasible, so every
         # alternative gets a turn before the obligation is given up on.
         candidates = [atom] + list(atom.alternatives)
+        if cap is not None and len(candidates) > 1:
+            # `A = SPACES OR A = LOW-VALUES` is two ways to satisfy one
+            # condition and the ladder is free to take either. Taking the one
+            # whose producer the harness can deliver costs nothing the program
+            # requires - the other remains just as valid - and it is the
+            # difference between a plan that can be run and one that cannot.
+            candidates = sorted(
+                candidates,
+                key=lambda c: 1 if any(
+                    _producer_refusal(prov.producer(t.name, at), cap)
+                    for t in (c.lhs, c.rhs) if t.kind == "var" and t.name)
+                else 0)
         settled = False
         failures = []
         for candidate in candidates:
@@ -848,10 +930,100 @@ def build_family(program, target: str, *, entry: str | None = None, via=(),
     return out
 
 
+def plan_representable(program, target: str, *, capability,
+                       entry: str | None = None,
+                       agent_bindings: dict | None = None,
+                       preferred: dict | None = None, extra: list | None = None,
+                       max_routes: int = 4, accept=None) -> Plan:
+    """A plan for ``target`` that the harness can actually replay, if there is one.
+
+    Two mechanisms, in the order they cost anything:
+
+    * **reject before solving.** `precheck` reads the chain's producers and
+      says what the profile will not carry. A route that fails it is skipped
+      without deriving anything, which is the whole saving: the integration
+      that prompted this spent its budget deriving plans that were refused at
+      the harness door.
+    * **prefer a route whose bindings the profile permits.** The shortest way
+      in is not always the one the harness can supply, and `route_options`
+      already enumerates the alternatives ranked by what they commit you to.
+
+    ``accept`` is a second test a route has to pass - `plan_for_branch` uses it
+    to keep the check it already had, that the plan's own state really does
+    make the decision go the way it was asked for. Representable and wrong is
+    not an improvement on unrepresentable and right.
+    """
+    from .dependencies import route_options
+
+    cap = capability
+    if not getattr(cap, "stated", False):
+        return build_plan(program, target, entry=entry, extra=extra,
+                          agent_bindings=agent_bindings, preferred=preferred)
+
+    from .capability import unrepresentable
+
+    attempts: list = []
+
+    def attempt(via) -> Plan | None:
+        refused = precheck(program, target, cap, entry=entry, via=via)
+        if refused:
+            attempts.append((via, refused, None))
+            return None
+        plan = build_plan(program, target, entry=entry, via=list(via),
+                          extra=extra, agent_bindings=agent_bindings,
+                          preferred=preferred, capability=cap)
+        if not plan.chain:
+            return None
+        reasons = unrepresentable(plan, cap)
+        attempts.append((via, [(None, r) for r in reasons], plan))
+        if reasons or (accept is not None and not accept(plan)):
+            return None
+        return plan
+
+    plan = attempt(())
+    if plan is not None:
+        return plan
+
+    graph, prov = analyse(program)
+    start = (entry or program.paragraph_names[0]).upper()
+    for option in route_options(program, graph, prov, start,
+                                target.upper())[:max_routes]:
+        if option["via"] is None:
+            continue
+        plan = attempt((option["via"],))
+        if plan is not None:
+            return plan
+
+    for _via, refusals, candidate in attempts:
+        if candidate is not None:
+            return candidate
+
+    # Every route was refused before solving - and `precheck` is a filter, not
+    # a proof. It can refuse a route whose obligation the solve would have met
+    # without ever binding the producer it objected to, by reaching a write
+    # that establishes the value instead. Measured at zero on a profile
+    # derived from the source and at two targets on a hand-written narrow one,
+    # which is enough to make the point: emitting nothing on the strength of a
+    # filter would lose a usable plan. So derive the base route anyway and let
+    # the finished plan answer. It costs one derivation, and only in the case
+    # where the alternative is being wrong.
+    fallback = build_plan(program, target, entry=entry, extra=extra,
+                          agent_bindings=agent_bindings, preferred=preferred,
+                          capability=cap)
+    if fallback.chain:
+        return fallback
+    if attempts:
+        _via, refusals, _plan = attempts[0]
+        return Plan(target.upper(), [], [], [], [], [], list(refusals))
+    return build_plan(program, target, entry=entry, extra=extra,
+                      agent_bindings=agent_bindings, preferred=preferred,
+                      capability=cap)
+
+
 def plan_for_branch(program, paragraph: str, line: int, direction: bool, *,
                     entry: str | None = None, agent_bindings: dict | None = None,
                     preferred: dict | None = None, max_routes: int = 4,
-                    ordinal: int | None = None):
+                    ordinal: int | None = None, capability=None):
     """A plan that makes one decision go a particular way.
 
     The shortest route to a paragraph is not always a route on which the
@@ -867,10 +1039,6 @@ def plan_for_branch(program, paragraph: str, line: int, direction: bool, *,
 
     extra = obligations_for_branch(program, paragraph, line, direction, ordinal)
     wanted = {v for a in extra for v in a.variables}
-    base = build_plan(program, paragraph, entry=entry, extra=extra,
-                      agent_bindings=agent_bindings, preferred=preferred)
-    if not base.chain:
-        return base
 
     def contested(plan) -> bool:
         """Does the plan's own state fail to satisfy what the branch asked?
@@ -889,6 +1057,22 @@ def plan_for_branch(program, paragraph: str, line: int, direction: bool, *,
             except Exception:                                # noqa: BLE001
                 return True
         return False
+
+    if getattr(capability, "stated", False):
+        # With a profile the route choice has a second criterion - can the
+        # harness supply what this way in needs - and `plan_representable`
+        # applies it with the same route machinery. `contested` travels with
+        # it, because a route the harness can run but that decides the branch
+        # the other way is not the plan that was asked for.
+        return plan_representable(program, paragraph, capability=capability,
+                                  entry=entry, extra=extra,
+                                  agent_bindings=agent_bindings,
+                                  preferred=preferred, max_routes=max_routes,
+                                  accept=lambda plan: not contested(plan))
+    base = build_plan(program, paragraph, entry=entry, extra=extra,
+                      agent_bindings=agent_bindings, preferred=preferred)
+    if not base.chain:
+        return base
 
     if not contested(base):
         return base

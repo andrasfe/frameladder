@@ -49,6 +49,9 @@ Reading order, which is also the dependency order:
 | `layout.py` | physical record layout — offsets and byte lengths |
 | `dependencies.py` | what each frame commits you to in the outside world |
 | `witness.py` | verified states, kept and reused |
+| `capability.py` | what the harness that will run these plans can inject and replay |
+| `replay.py` | the complete ordered outcome series, with every refusal named |
+| `represent.py` | which plans a profile could run, and a proxy profile to measure with |
 | `cli.py` | the toolbox an agent drives |
 
 ## Invariants
@@ -120,6 +123,19 @@ its name looks status-ish.
 
 **Computed, not stored.** The whole index for a 4,236-line program builds in
 81 ms. A persisted graph would buy nothing and cost a second source of truth.
+
+**A harness limitation may pick between witnesses; it may never decide what is
+required.** A capability profile reaches the derivation in exactly two places:
+it orders the alternatives of an `OR` so the deliverable one is tried first,
+and it chooses between routes. Both are choices the program left open. Nothing
+about a profile can relax an obligation, and nothing about it may declare a
+target unreachable — `precheck` refuses a *route*, and when every route has
+been refused the base one is derived anyway so the finished plan gives the
+answer. It agreed with the full solve on all 403 routes it refused under a
+profile derived from the source, and produced 2 false refusals out of 26
+targets under a hand-written narrow one, which is exactly why it skips and
+orders rather than decides. A filter that decides what gets tested has to be
+wrong in the harmless direction.
 
 ## How to work here
 

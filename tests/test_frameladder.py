@@ -2613,3 +2613,412 @@ class TestCapabilityProfile(unittest.TestCase):
         from frameladder.capability import load
         with self.assertRaises(ValueError):
             load({"schema_version": "2.0"})
+
+class TestRepresentability(unittest.TestCase):
+    """Classifying what the harness could run, in the harness's own words."""
+
+    HEADER_SRC = HEADER + """       01  WS-OPEN PIC X VALUE ' '.
+       01  WS-SHUT PIC X VALUE ' '.
+       PROCEDURE DIVISION.
+       RP-MAIN.
+           IF WS-SHUT = 'Y'
+              PERFORM RP-TARGET
+           END-IF
+           PERFORM RP-GATE
+           GO TO RP-DONE
+           .
+       RP-GATE.
+           IF WS-OPEN = 'Y'
+              PERFORM RP-TARGET
+           END-IF
+           GO TO RP-DONE
+           .
+       RP-TARGET.
+           DISPLAY 'X'
+           GO TO RP-DONE
+           .
+       RP-DONE.
+           GOBACK
+           .
+"""
+
+    def _cap(self):
+        from frameladder.capability import Capability
+        return Capability(injectable=frozenset({"WS-OPEN"}), stated=True)
+
+    def test_the_proxy_profile_reads_evidence_not_names(self):
+        from frameladder.ladder import analyse
+        from frameladder.represent import proxy_profile
+        prog = program(TestReplayExport.FILE_SRC)
+        _graph, prov = analyse(prog)
+        profile = proxy_profile(prog, prov)
+        # Compared against '10' in the source, so the harness has something to
+        # aim at; the record field is compared against nothing at all.
+        self.assertTrue(profile.can_inject("WS-FS"))
+        self.assertFalse(profile.can_inject("IN-KEY"))
+        # The SELECT put WS-FS in the file-status channel, which is what makes
+        # the READ replayable - and the record area is not in any channel, so
+        # a mock that carries a status cannot hand it back.
+        self.assertTrue(profile.can_replay("READ:IN-FILE"))
+        self.assertTrue(profile.can_set("READ:IN-FILE", "WS-FS"))
+        self.assertFalse(profile.can_set("READ:IN-FILE", "IN-KEY"))
+
+    def test_an_operation_with_nothing_in_a_status_channel_is_left_out(self):
+        # An empty field set means "any field" in the profile, so an operation
+        # whose outcome is entirely out of the harness's control is left out
+        # rather than registered with nothing - registering it would turn the
+        # strictest case into the most permissive one.
+        #
+        # The residual, measured rather than hidden: when *no* operation in a
+        # program has a status channel the proxy *omits* the section rather
+        # than emptying it, and an absent section states no constraint. The
+        # distinction is deliberate - an empty section would claim the harness
+        # can replay nothing, which the proxy has not earned - so every figure
+        # it produces for such a program is an over-estimate of what would
+        # replay.
+        from frameladder.represent import proxy_profile, stub_outputs_by_operation
+        from frameladder.ladder import analyse
+        prog = program(HEADER + """       01  WS-A PIC X VALUE ' '.
+       PROCEDURE DIVISION.
+       RN-MAIN.
+           CALL 'SUBPROG' USING WS-A
+           IF WS-A = 'Y'
+              PERFORM RN-END
+           END-IF
+           GO TO RN-DONE
+           .
+       RN-END.
+           DISPLAY 'E'
+           GO TO RN-DONE
+           .
+       RN-DONE.
+           GOBACK
+           .
+""")
+        _graph, prov = analyse(prog)
+        self.assertIn("CALL:SUBPROG", stub_outputs_by_operation(prov))
+        profile = proxy_profile(prog, prov)
+        self.assertIsNone(profile.operations)
+        # Documented consequence, not a wish: with nothing stated about
+        # operations the contract answers "yes" rather than "no".
+        self.assertTrue(profile.can_replay("CALL:SUBPROG"))
+
+    def test_precheck_names_the_refusal_before_any_solving(self):
+        from frameladder.ladder import precheck
+        prog = program(self.HEADER_SRC)
+        reasons = [why for _atom, why in
+                   precheck(prog, "RP-TARGET", self._cap())]
+        self.assertEqual(reasons, ["cannot inject WS-SHUT"])
+
+    def test_precheck_says_nothing_when_no_profile_is_stated(self):
+        from frameladder.capability import Capability
+        from frameladder.ladder import precheck
+        prog = program(self.HEADER_SRC)
+        self.assertEqual(precheck(prog, "RP-TARGET", Capability()), [])
+
+    def test_precheck_agrees_with_the_verdict_on_the_finished_plan(self):
+        # The cheap filter and the full solve have to reach the same answer on
+        # the same route, or the saving is bought with a wrong refusal.
+        from frameladder.capability import unrepresentable
+        from frameladder.ladder import precheck
+        prog = program(self.HEADER_SRC)
+        cap = self._cap()
+        plan = build_plan(prog, "RP-TARGET")
+        self.assertEqual([why for _a, why in precheck(prog, "RP-TARGET", cap)],
+                         unrepresentable(plan, cap))
+
+    def test_the_planner_prefers_a_route_the_profile_permits(self):
+        from frameladder.capability import unrepresentable
+        from frameladder.ladder import plan_representable
+        prog = program(self.HEADER_SRC)
+        cap = self._cap()
+        self.assertEqual(build_plan(prog, "RP-TARGET").input_state(),
+                         {"WS-SHUT": "Y"})
+        plan = plan_representable(prog, "RP-TARGET", capability=cap)
+        self.assertEqual(plan.input_state(), {"WS-OPEN": "Y"})
+        self.assertEqual(unrepresentable(plan, cap), [])
+        self.assertIn("RP-GATE", plan.chain)
+
+    def test_an_or_takes_the_branch_the_harness_can_deliver(self):
+        # Both branches satisfy the program equally; only one can be run.
+        prog = program(HEADER + """       01  WS-OPEN PIC X VALUE ' '.
+       01  WS-SHUT PIC X VALUE ' '.
+       PROCEDURE DIVISION.
+       RQ-MAIN.
+           IF WS-SHUT = 'Y' OR WS-OPEN = 'Y'
+              PERFORM RQ-TARGET
+           END-IF
+           GO TO RQ-DONE
+           .
+       RQ-TARGET.
+           DISPLAY 'X'
+           GO TO RQ-DONE
+           .
+       RQ-DONE.
+           GOBACK
+           .
+""")
+        self.assertEqual(build_plan(prog, "RQ-TARGET").input_state(),
+                         {"WS-SHUT": "Y"})
+        self.assertEqual(build_plan(prog, "RQ-TARGET",
+                                    capability=self._cap()).input_state(),
+                         {"WS-OPEN": "Y"})
+
+    def test_a_route_refused_everywhere_is_still_derived_and_then_reported(self):
+        # The filter is not a proof, so losing the plan on its say-so would be
+        # the expensive kind of wrong. The plan comes back, and comes back
+        # carrying the reason it cannot be run.
+        from frameladder.capability import Capability, unrepresentable
+        from frameladder.ladder import plan_representable
+        prog = program(self.HEADER_SRC)
+        cap = Capability(injectable=frozenset({"WS-NOTHING"}), stated=True)
+        plan = plan_representable(prog, "RP-TARGET", capability=cap)
+        self.assertTrue(plan.chain)
+        self.assertEqual(unrepresentable(plan, cap), ["cannot inject WS-SHUT"])
+
+    def test_classify_counts_both_denominators_and_the_reasons(self):
+        from frameladder.represent import classify
+        prog = program(self.HEADER_SRC)
+        report = classify(prog, self._cap(), measure_precheck=True)
+        self.assertEqual(report["emitted"]["plans"], 3)
+        self.assertEqual(report["emitted"]["unrepresentable"], 1)
+        self.assertEqual(report["reason_categories"],
+                         {"cannot inject a variable": 1})
+        self.assertEqual(report["precheck_false_refusals"], [])
+        aware = classify(prog, self._cap(), profile_aware=True)
+        self.assertEqual(aware["emitted"]["unrepresentable"], 0)
+        self.assertGreater(aware["runnable"], report["runnable"])
+
+    def test_an_unstated_profile_classifies_everything_as_representable(self):
+        from frameladder.capability import Capability
+        from frameladder.represent import classify
+        prog = program(self.HEADER_SRC)
+        report = classify(prog, Capability())
+        self.assertEqual(report["emitted"]["unrepresentable"], 0)
+
+    def test_a_branch_plan_takes_a_route_the_profile_permits(self):
+        # The branch planner already retried other routes when the chain
+        # settled the decision the wrong way. With a profile it has a second
+        # criterion, and the first one has to survive: representable and
+        # deciding the wrong way is not an improvement.
+        from frameladder.capability import Capability, unrepresentable
+        from frameladder.coverage import branches_of
+        from frameladder.ladder import plan_for_branch
+        prog = program(HEADER + """       01  WS-OPEN PIC X VALUE ' '.
+       01  WS-SHUT PIC X VALUE ' '.
+       01  WS-PICK PIC X VALUE ' '.
+       PROCEDURE DIVISION.
+       RT-MAIN.
+           IF WS-SHUT = 'Y'
+              PERFORM RT-TARGET
+           END-IF
+           PERFORM RT-GATE
+           GO TO RT-DONE
+           .
+       RT-GATE.
+           IF WS-OPEN = 'Y'
+              PERFORM RT-TARGET
+           END-IF
+           GO TO RT-DONE
+           .
+       RT-TARGET.
+           IF WS-PICK = 'A'
+              DISPLAY 'Y'
+           END-IF
+           GO TO RT-DONE
+           .
+       RT-DONE.
+           GOBACK
+           .
+""")
+        branch = next(b for b in branches_of(prog) if b.paragraph == "RT-TARGET")
+        cap = Capability(injectable=frozenset({"WS-OPEN", "WS-PICK"}),
+                         stated=True)
+        plain = plan_for_branch(prog, branch.paragraph, branch.line, True,
+                                ordinal=branch.ordinal)
+        self.assertEqual(plain.input_state().get("WS-SHUT"), "Y")
+        plan = plan_for_branch(prog, branch.paragraph, branch.line, True,
+                               ordinal=branch.ordinal, capability=cap)
+        self.assertEqual(plan.input_state(),
+                         {"WS-OPEN": "Y", "WS-PICK": "A"})
+        self.assertEqual(unrepresentable(plan, cap), [])
+
+class TestReplayExport(unittest.TestCase):
+    """The series a harness runs, and what happens to what it cannot run."""
+
+    FILE_SRC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INDD
+               ORGANIZATION IS SEQUENTIAL
+               FILE STATUS IS WS-FS.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-REC.
+           05  IN-KEY PIC X(4).
+       WORKING-STORAGE SECTION.
+       01  WS-FS PIC XX VALUE '00'.
+       PROCEDURE DIVISION.
+       RS-MAIN.
+           READ IN-FILE
+           IF WS-FS = '10'
+              PERFORM RS-END
+           END-IF
+           GO TO RS-DONE
+           .
+       RS-END.
+           DISPLAY 'E'
+           GO TO RS-DONE
+           .
+       RS-DONE.
+           GOBACK
+           .
+"""
+
+    ENTRIES = [{"when": {}, "set": {"WS-FS": "00", "IN-KEY": "AAAA"}, "seq": 0},
+               {"when": {}, "set": {"WS-FS": "00", "IN-KEY": "BBBB"}, "seq": 1},
+               {"when": {}, "set": {"WS-FS": "23"}, "seq": 2}]
+
+    def _capability(self, **kw):
+        from frameladder import capability
+        return capability.Capability(**kw)
+
+    def test_nothing_stated_refuses_nothing(self):
+        from frameladder.replay import operation_series
+        series = operation_series("READ:IN-FILE", self.ENTRIES,
+                                  {"WS-FS": "10"}, self._capability())
+        self.assertEqual(series["refusals"], [])
+        self.assertEqual([o["set"]["WS-FS"] for o in series["outcomes"]],
+                         ["00", "00", "23"])
+        self.assertEqual(series["terminal"], {"WS-FS": "10"})
+
+    def test_the_terminal_is_part_of_the_series(self):
+        # A mock returning one fixed status describes a file that never ends,
+        # so the ending has to travel with the outcomes rather than be
+        # inferred by whoever runs them.
+        from frameladder.replay import operation_series
+        series = operation_series("READ:IN-FILE", self.ENTRIES, None,
+                                  self._capability())
+        self.assertIsNone(series["terminal"])
+        self.assertTrue(any("no terminal" in n for n in series["notes"]))
+
+    def test_an_unsettable_field_is_reported_and_its_call_stays_put(self):
+        # Removing the outcome would shift every later one onto an earlier
+        # call, which changes what the plan says without changing what it
+        # claims. The empty delivery keeps the positions honest.
+        from frameladder.capability import Operation
+        from frameladder.replay import operation_series
+        cap = self._capability(
+            operations={"READ:IN-FILE": Operation("READ:IN-FILE",
+                                                  frozenset({"WS-FS"}))},
+            stated=True)
+        series = operation_series("READ:IN-FILE", self.ENTRIES,
+                                  {"WS-FS": "10"}, cap)
+        self.assertEqual([o["call"] for o in series["outcomes"]], [1, 2, 3])
+        self.assertEqual([sorted(o["set"]) for o in series["outcomes"]],
+                         [["WS-FS"], ["WS-FS"], ["WS-FS"]])
+        self.assertIn("READ:IN-FILE cannot set IN-KEY", series["refusals"])
+
+    def test_max_outcomes_truncates_and_says_so(self):
+        from frameladder.capability import Operation
+        from frameladder.replay import operation_series
+        cap = self._capability(
+            operations={"READ:IN-FILE": Operation("READ:IN-FILE",
+                                                  frozenset(), 2)},
+            stated=True)
+        series = operation_series("READ:IN-FILE", self.ENTRIES, None, cap)
+        self.assertEqual(len(series["outcomes"]), 2)
+        self.assertTrue(any("at most 2" in r for r in series["refusals"]))
+
+    def test_an_operation_the_harness_cannot_replay_is_not_silently_empty(self):
+        from frameladder.capability import Operation
+        from frameladder.replay import operation_series
+        cap = self._capability(
+            operations={"READ:OTHER-FILE": Operation("READ:OTHER-FILE")},
+            stated=True)
+        series = operation_series("READ:IN-FILE", self.ENTRIES, None, cap)
+        self.assertFalse(series["replayable"])
+        self.assertEqual(series["refusals"], ["cannot replay READ:IN-FILE"])
+        self.assertEqual(series["outcomes"], [])
+
+    def test_outcomes_are_ordered_by_seq_not_by_dictionary_order(self):
+        from frameladder.replay import operation_series
+        shuffled = [self.ENTRIES[2], self.ENTRIES[0], self.ENTRIES[1]]
+        series = operation_series("READ:IN-FILE", shuffled, None,
+                                  self._capability())
+        self.assertEqual([o["set"]["WS-FS"] for o in series["outcomes"]],
+                         ["00", "00", "23"])
+
+    def test_a_terminal_for_an_operation_with_no_outcomes_still_travels(self):
+        from frameladder.replay import replay_script
+        prog = program(self.FILE_SRC)
+        plan = build_plan(prog, "RS-END")
+        plan.terminals = {"OPEN-INPUT:IN-FILE": {"WS-FS": "35"}}
+        script = replay_script(plan, self._capability(), program=prog)
+        keys = [op["op_key"] for op in script["operations"]]
+        self.assertIn("OPEN-INPUT:IN-FILE", keys)
+
+    def test_a_plan_needing_an_unreplayable_operation_is_refused(self):
+        from frameladder.capability import Operation
+        from frameladder.replay import replay_script
+        prog = program(self.FILE_SRC)
+        plan = build_plan(prog, "RS-END")
+        cap = self._capability(
+            operations={"READ:OTHER-FILE": Operation("READ:OTHER-FILE")},
+            stated=True)
+        script = replay_script(plan, cap, program=prog)
+        self.assertFalse(script["representable"])
+        self.assertIn("cannot replay READ:IN-FILE (needed to set WS-FS)",
+                      script["reasons"])
+
+    def test_an_uninjectable_entry_value_is_listed_rather_than_dropped(self):
+        # The whole point: the value does not quietly disappear from
+        # `input_state` leaving a case that runs and means nothing.
+        from frameladder.replay import replay_script
+        prog = program(TestRepresentability.HEADER_SRC)
+        plan = build_plan(prog, "RP-TARGET")
+        cap = self._capability(injectable=frozenset({"WS-OPEN"}), stated=True)
+        script = replay_script(plan, cap, program=prog)
+        self.assertEqual(script["input_state"], {})
+        self.assertEqual([r["variable"] for r in script["refused_inputs"]],
+                         ["WS-SHUT"])
+        self.assertFalse(script["representable"])
+        self.assertIn("cannot inject WS-SHUT", script["reasons"])
+
+    def test_the_export_carries_a_derived_fault_world(self):
+        # "the operation fails on its second call and succeeds either side"
+        # is an outcome list and there is no other way to state it.
+        from frameladder.ladder import analyse
+        from frameladder.replay import replay_script
+        from frameladder.sequences import fault_worlds
+        prog = program(self.FILE_SRC)
+        _graph, prov = analyse(prog)
+        worlds = fault_worlds(prog, prov, prov.literals, length=3)
+        self.assertTrue(worlds)
+        plan = build_plan(prog, "RS-END")
+        script = replay_script(plan, self._capability(), program=prog,
+                               world=worlds[0])
+        series = script["operations"][0]
+        self.assertEqual(series["op_key"], "READ:IN-FILE")
+        self.assertGreater(len(series["outcomes"]), 1)
+        self.assertTrue(series["terminal"])
+
+
+class TestCapabilityDiscriminators(unittest.TestCase):
+    """Silence about a capability is not a refusal of it."""
+
+    def test_absent_is_unknown_not_no(self):
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0",
+                    "replayable_operations": [{"op_key": "READ:F"}]})
+        self.assertIsNone(cap.discriminates("READ:F"))
+
+    def test_a_harness_can_say_it_only_replays_in_order(self):
+        from frameladder.capability import load
+        cap = load({"schema_version": "1.0",
+                    "replayable_operations": [
+                        {"op_key": "READ:F", "matches_on_state": False}]})
+        self.assertIs(cap.discriminates("READ:F"), False)

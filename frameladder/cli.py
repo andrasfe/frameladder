@@ -27,6 +27,28 @@ def _entry(program, args) -> str:
     return (args.entry or program.paragraph_names[0]).upper()
 
 
+def _capability(args, program=None):
+    """What the harness says it can do, or a proxy, or nothing stated.
+
+    Nothing stated is the default and means "no constraints", which is the
+    behaviour every command had before profiles existed. A proxy is derived
+    from the source and is labelled as one wherever it is used, because a
+    figure measured against a guess about a harness is a figure about the
+    guess.
+    """
+    from .capability import Capability, load
+    path = getattr(args, "capability", None)
+    if path:
+        return load(path), "stated"
+    proxy = getattr(args, "proxy", None)
+    if proxy and program is not None:
+        from .represent import proxy_profile
+        return proxy_profile(program, fields=proxy,
+                             max_outcomes=getattr(args, "max_outcomes", 0) or 0), \
+            "proxy:%s" % proxy
+    return Capability(), "none"
+
+
 def _via(args) -> list:
     return [w.strip().upper() for w in (args.via or "").split(",") if w.strip()]
 
@@ -162,12 +184,23 @@ def cmd_plan(args):
     program = _program(args)
     journal = Journal(args.work_dir)
     target = args.target.upper()
+    capability, _source = _capability(args, program)
     plan = build_plan(program, target, entry=args.entry, via=_via(args),
-                      agent_bindings=_binds(args, journal, target))
+                      agent_bindings=_binds(args, journal, target),
+                      capability=capability)
     payload = plan.to_dict()
+    # A plan that cannot be replayed is not a failure of the derivation, and
+    # it is not a reason to withhold it either - it is a fact the caller has
+    # to know before spending a run on it.
+    from .capability import unrepresentable
+    payload["unrepresentable"] = unrepresentable(plan, capability)
 
     def render(p):
         print("target  %s" % p["target"])
+        if p["unrepresentable"]:
+            print("NOT REPRESENTABLE by the stated harness:")
+            for reason in p["unrepresentable"]:
+                print("   %s" % reason)
         print("chain   %s" % " -> ".join(p["chain"]))
         print("edges   %s" % ",".join(p["edges"]))
         print("\nobligations lifted (%d)" % len(p["obligations"]))
@@ -970,6 +1003,128 @@ def cmd_sweep(args):
     return _emit(payload, args.json, render)
 
 
+def cmd_replay(args):
+    """The whole ordered series a harness runs, with every refusal named."""
+    program = _program(args)
+    journal = Journal(args.work_dir)
+    target = args.target.upper()
+    entry = _entry(program, args)
+    capability, source = _capability(args, program)
+    from .ladder import plan_representable
+    from .replay import replay_script
+    binds = _binds(args, journal, target)
+    if capability.stated and not args.no_profile_aware:
+        plan = plan_representable(program, target, capability=capability,
+                                  entry=args.entry, agent_bindings=binds)
+    else:
+        plan = build_plan(program, target, entry=args.entry, via=_via(args),
+                          agent_bindings=binds, capability=capability)
+
+    world = None
+    if args.world:
+        from .ladder import analyse
+        from .sequences import fault_worlds, sequence_worlds
+        _graph, prov = analyse(program)
+        worlds = (sequence_worlds(program, prov, prov.literals)
+                  + fault_worlds(program, prov, prov.literals))
+        world = next((w for w in worlds if w["name"] == args.world), None)
+        if world is None:
+            return _emit({"error": "no such world", "world": args.world,
+                          "available": [w["name"] for w in worlds]},
+                         args.json,
+                         lambda p: print("no such world: %s\navailable: %s"
+                                         % (p["world"], ", ".join(p["available"]))))
+
+    payload = replay_script(plan, capability, program=program, entry=entry,
+                            world=world)
+    payload["profile"] = source
+
+    def render(p):
+        print("%s -> %s     profile: %s" % (p["entry"], p["target"], p["profile"]))
+        print("solved %s   representable %s"
+              % (p["solved"], "yes" if p["representable"] else "NO"))
+        print("\ninput state (%d)" % len(p["input_state"]))
+        for name, value in sorted(p["input_state"].items()):
+            print("   %-30s := %r" % (name, value))
+        for entry_ in p["refused_inputs"]:
+            print("   %-30s := %r   REFUSED: %s"
+                  % (entry_["variable"], entry_["value"], entry_["why"]))
+        for op in p["operations"]:
+            print("\n%s" % op["op_key"])
+            if not op["replayable"]:
+                print("   NOT REPLAYABLE")
+            for outcome in op["outcomes"]:
+                print("   call %-3d %-40s%s"
+                      % (outcome["call"],
+                         json.dumps(outcome["set"], default=str),
+                         "   when " + json.dumps(outcome["when"], default=str)
+                         if outcome["when"] else ""))
+            print("   then     %s"
+                  % (json.dumps(op["terminal"], default=str)
+                     if op["terminal"] else "(no terminal derived)"))
+        if p["reasons"]:
+            print("\ncannot be replayed (%d):" % len(p["reasons"]))
+            for reason in p["reasons"]:
+                print("   %s" % reason)
+        for note in p["notes"]:
+            print("note: %s" % note)
+    return _emit(payload, args.json, render)
+
+
+def cmd_represent(args):
+    """How much of what the tool emits a harness could actually run."""
+    program = _program(args)
+    capability, source = _capability(args, program)
+    if not capability.stated:
+        payload = {"error": "no capability profile",
+                   "how": "pass --capability FILE, or --proxy status to "
+                          "derive one from the source"}
+        return _emit(payload, args.json,
+                     lambda p: print("%s: %s" % (p["error"], p["how"])))
+    from .represent import PROXY_CAVEAT, classify
+    payload = classify(program, capability, entry=args.entry,
+                       profile_aware=args.profile_aware,
+                       max_routes=args.routes,
+                       measure_precheck=True)
+    payload["profile"] = source
+    payload["injectable_variables"] = len(capability.injectable)
+    payload["replayable_operations"] = len(capability.operations)
+    if source.startswith("proxy"):
+        payload["caveat"] = PROXY_CAVEAT
+
+    def render(p):
+        print("%s   entry %s   profile %s%s"
+              % (p["program"], p["entry"], p["profile"],
+                 "   (profile-aware planning)" if p["profile_aware"] else ""))
+        print("   %d injectable variables, %d replayable operations"
+              % (p["injectable_variables"], p["replayable_operations"]))
+        for label in ("emitted", "solved"):
+            row = p[label]
+            print("   %-8s plans %4d   unrepresentable %4d  %5.1f%%"
+                  % (label, row["plans"], row["unrepresentable"], row["pct"]))
+        print("   solved AND representable %4d   (the comparable figure: "
+              "refusing a route also makes a plan unsolved)" % p["runnable"])
+        if p["reason_categories"]:
+            print("\n   why, by category")
+            for name, count in p["reason_categories"].items():
+                print("      %-38s %5d" % (name, count))
+        if p["precheck_false_refusals"]:
+            print("\n   precheck refused %d route(s) the full solve found "
+                  "representable: %s"
+                  % (len(p["precheck_false_refusals"]),
+                     ", ".join(p["precheck_false_refusals"][:6])))
+        bad = [r for r in p["rows"] if not r["representable"]]
+        if bad:
+            print("\n   the first %d, with reasons"
+                  % min(args.limit, len(bad)))
+            for row in bad[: args.limit]:
+                print("      %-34s %s" % (row["target"],
+                                          "; ".join(row["reasons"][:2])))
+        if p.get("caveat"):
+            print("\n   %s" % p["caveat"])
+    return _emit(payload, args.json, render)
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -1008,6 +1163,10 @@ def build_parser():
                         "and only used where the program itself says nothing")
     p.add_argument("--entry", help="paragraph to start from (default: the first)")
     p.add_argument("--work-dir", help="directory for the journal")
+    p.add_argument("--capability", metavar="FILE",
+                   help="what the harness that will run these plans can "
+                        "inject and replay; without one nothing is assumed "
+                        "and no plan is refused")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1132,6 +1291,41 @@ def build_parser():
 
     sw = sub.add_parser("sweep", help="plan and verify every reachable target")
     sw.set_defaults(func=cmd_sweep)
+
+    rp = sub.add_parser("replay", help="the complete ordered outcome series "
+                                       "for one target, ready to run")
+    rp.add_argument("target")
+    rp.add_argument("--via")
+    rp.add_argument("--bind", action="append", metavar="VAR=VALUE")
+    rp.add_argument("--world", metavar="NAME",
+                    help="use a derived sequence world instead of the plan's "
+                         "own outcomes, e.g. READ:F=10@2")
+    rp.add_argument("--proxy", nargs="?", const="status",
+                    choices=["status", "outputs"],
+                    help="derive a capability profile from the source when "
+                         "the harness has not stated one; a proxy, and "
+                         "labelled as one")
+    rp.add_argument("--max-outcomes", type=int, default=0,
+                    help="outcomes per operation the harness can hold, for a "
+                         "derived profile; 0 states no limit")
+    rp.add_argument("--no-profile-aware", action="store_true",
+                    help="derive the plan without letting the profile pick "
+                         "the route, to see what the harness would refuse")
+    rp.set_defaults(func=cmd_replay)
+
+    rr = sub.add_parser("represent", help="which plans the harness could run, "
+                                          "and why the rest could not")
+    rr.add_argument("--proxy", nargs="?", const="status",
+                    choices=["status", "outputs"],
+                    help="derive a capability profile from the source when "
+                         "the harness has not stated one")
+    rr.add_argument("--max-outcomes", type=int, default=0)
+    rr.add_argument("--profile-aware", action="store_true",
+                    help="let the planner reject before solving and prefer "
+                         "routes the profile permits")
+    rr.add_argument("--routes", type=int, default=4)
+    rr.add_argument("--limit", type=int, default=12)
+    rr.set_defaults(func=cmd_represent)
 
     b = sub.add_parser("bind", help="record a decision the agent made")
     b.add_argument("--bind", action="append", required=True, metavar="VAR=VALUE")

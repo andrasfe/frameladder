@@ -44,6 +44,14 @@ class Operation:
     op_key: str
     fields: frozenset = frozenset()      # payload fields it can set, empty = any
     max_outcomes: int = 0                # 0 = no stated limit
+    # Can the harness pick an outcome by looking at program state, or does it
+    # only replay an ordered list? A plan tells two invocations of one verb
+    # apart by a discriminator - "the READ whose key is X returns not-found" -
+    # and a harness that cannot match on state will deliver those in order and
+    # ignore the condition, which is a different test from the one planned.
+    # `None` means the harness did not say; the planner reports such outcomes
+    # rather than refusing them, because silence is not a no.
+    matches_on_state: bool | None = None
 
     def accepts(self, name: str) -> bool:
         return not self.fields or name.upper() in self.fields
@@ -112,6 +120,18 @@ class Capability:
         op = self.operations.get((op_key or "").upper())
         return bool(op) and op.accepts(_base(name))
 
+    def discriminates(self, op_key: str) -> bool | None:
+        """Whether the harness can select an outcome by program state.
+
+        Three answers, not two. `None` is "the profile did not say", and a
+        planner must not read it as a refusal - 188 of 819 plans measured on
+        this corpus carry a discriminated outcome, and refusing them all on
+        silence would throw away a quarter of the work for a claim nobody
+        made.
+        """
+        op = (self.operations or {}).get((op_key or "").upper())
+        return op.matches_on_state if op else None
+
     def outcome_limit(self, op_key: str) -> int:
         op = (self.operations or {}).get((op_key or "").upper())
         return op.max_outcomes if op else 0
@@ -172,10 +192,12 @@ def load(path_or_dict) -> Capability:
         key = str(entry.get("op_key", "")).upper()
         if not key:
             continue
+        matches = entry.get("matches_on_state")
         operations[key] = Operation(
             key,
             frozenset(str(f).upper() for f in entry.get("fields") or ()),
-            int(entry.get("max_outcomes") or 0))
+            int(entry.get("max_outcomes") or 0),
+            None if matches is None else bool(matches))
 
     uncovered = tuple(
         Direction(str(d.get("paragraph", "")).upper(),
