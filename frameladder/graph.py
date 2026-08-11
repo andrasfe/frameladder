@@ -455,9 +455,7 @@ def build_graph(program) -> dict:
     """
     graph: dict = {}
     alters: list = []
-    ranges: list = []
     order = program.paragraph_names
-    position = {name: i for i, name in enumerate(order)}
 
     for para in program.paragraphs:
         sites: list = []
@@ -491,7 +489,6 @@ def build_graph(program) -> dict:
                     # it.
                     _sites.append(CallSite(pname, parts[0], line,
                                            list(guards), edge))
-                    ranges.append((parts[0], parts[-1]))
                 elif parts:
                     _sites.append(CallSite(pname, parts[0], line,
                                            list(guards), edge))
@@ -546,24 +543,21 @@ def build_graph(program) -> dict:
             graph[name].append(CallSite(name, nxt, para.get("line_end", 0),
                                         guards, "fallthrough"))
 
-    # Stitch each performed range, so its endpoint is reachable *through* the
-    # range rather than around it. Ordinary fall-through covers most of this
-    # already; what it cannot cover is a paragraph inside the range that
-    # always escapes - the `GO TO <range>-EXIT` idiom - where control does
-    # continue within the range and a plain fall-through edge is correctly
-    # withheld. Without these, dropping the endpoint edge above would make
-    # the exit paragraph unreachable instead of merely honest.
-    for start, end in ranges:
-        first, last = position.get(start), position.get(end)
-        if first is None or last is None or last <= first:
-            continue
-        for i in range(first, last):
-            name, nxt = order[i], order[i + 1]
-            if name in graph and not any(s.callee == nxt for s in graph[name]):
-                graph[name].append(
-                    CallSite(name, nxt,
-                             program.paragraphs[i].get("line_end", 0),
-                             [], "range"))
+    # Nothing further is added for a performed range. The caller gets an edge
+    # to the range *entry* only; flow from there to the rest of the range is
+    # ordinary fall-through, which the loop above already models - and models
+    # better, because it withholds the edge from a paragraph that always
+    # escapes, and a `GO TO` inside the range has its own edge already.
+    #
+    # Two wrong answers were tried first and both are instructive. An edge
+    # straight to the range *endpoint* lets a plan reach an exit paragraph
+    # without taking on one obligation from the range. Stitching each
+    # paragraph in the range to the next asserts that control always continues
+    # from A to the paragraph after it - true only when the range was entered
+    # by this THRU, and false when a plain `PERFORM A` returns to its caller.
+    # Chains routed through those edges cannot be walked at all, and on a
+    # program built out of ranges that is most of them: 539 of 559 failures
+    # entered the first frame and stopped, on chains up to fourteen long.
     return graph
 
 

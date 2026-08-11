@@ -97,14 +97,14 @@ class TestParser(unittest.TestCase):
         self.assertEqual(self.p.model.pic["WS-KEY"], "X(4)")
         self.assertEqual(self.p.model.initial["WS-FLAG"], "N")
 
-    def test_thru_perform_enters_the_range_it_does_not_jump_to_the_end(self):
-        # This asserted the opposite until the semantics were corrected.
-        # `PERFORM B-DEEP THRU B-EXIT` runs the whole range; an edge straight
-        # to B-EXIT makes the endpoint look independently callable, and the
-        # planner then reaches an exit paragraph without taking on one
-        # obligation from the range that was supposed to run. On a program
-        # built out of THRU ranges that is most of the call graph: it removed
-        # 37 such edges from COTRTLIC alone.
+    def test_thru_perform_enters_the_range_at_its_start(self):
+        # `PERFORM B-DEEP THRU B-EXIT` enters at B-DEEP. An edge straight to
+        # B-EXIT makes the endpoint independently callable, so a plan reaches
+        # an exit paragraph without taking on one obligation from the range -
+        # 37 such edges on one program alone. Flow onward through the range is
+        # ordinary fall-through, which the graph already models and models
+        # better, because it withholds the edge where control does not in fact
+        # continue.
         g = graph.build_graph(self.p)
         callees = {s.callee for s in g["A-MAIN"]}
         self.assertIn("B-DEEP", callees)
