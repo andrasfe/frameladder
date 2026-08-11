@@ -1375,7 +1375,8 @@ _RUN_STAGES = ("target_not_reached", "decision_not_observed", "wrong_direction",
                "step_limit", "loop_limit", "verified")
 
 
-def _verify_direction(program, plan, branch, direction: bool, entry: str):
+def _verify_direction(program, plan, branch, direction: bool, entry: str,
+                      sink: dict | None = None):
     """Did this plan actually take the decision the way it was asked to?
 
     Returns one of the run dispositions and a sentence for the histogram.
@@ -1419,7 +1420,28 @@ def _verify_direction(program, plan, branch, direction: bool, entry: str):
                                    % (branch.paragraph, branch.ordinal,
                                       sorted(seen)[0]))
     if branch.paragraph not in trace.entered_set:
-        return "target_not_reached", ("never entered %s" % branch.paragraph)
+        # How far along its *own chain* did the run get? On both corpora the
+        # answer is nearly all of it - the modal shapes are 2/3, 1/2, 3/4 - so
+        # the failure sits in the guard admitting the last hop rather than
+        # anywhere along the route. That distribution is the whole diagnosis
+        # for the largest disposition, and it costs one pass over a list.
+        chain = list(getattr(plan, "chain", ()) or ())
+        reached = 0
+        for frame in chain:
+            if frame in trace.entered_set:
+                reached += 1
+            else:
+                break
+        missing = chain[reached] if reached < len(chain) else ""
+        if sink is not None and chain:
+            sink["reached"] = reached
+            sink["chain"] = len(chain)
+            sink["missing"] = missing
+        detail = "never entered %s" % branch.paragraph
+        if chain:
+            detail = ("reached %d/%d of the chain; first missing frame %s"
+                      % (reached, len(chain), missing or "-"))
+        return "target_not_reached", detail
     return "decision_not_observed", ("entered %s but ordinal %d was never "
                                      "evaluated" % (branch.paragraph,
                                                     branch.ordinal))
@@ -1485,6 +1507,13 @@ def cmd_export(args):
     # fifteen. This counts how often a refusal was answered by a second route
     # rather than by giving up.
     rerouted = [0]
+    # The diagnosis for `target_not_reached`, aggregated. `reach_profile` and
+    # `last_hop_failures` are counts and carry no identifiers, so they survive
+    # a sanitising pass; `first_missing_frames` names paragraphs and is kept
+    # separate so it can be dropped.
+    reach_profile: dict = {}
+    missing_frames: dict = {}
+    last_hop = [0]
 
     def note(bucket: str, text: str) -> None:
         key = "%s: %s" % (bucket, text)
@@ -1572,8 +1601,17 @@ def cmd_export(args):
             # it, or evaluate it the other way, or stop on a limit before
             # arriving. Counting those as successes is how a witness comes
             # back green having covered nothing.
+            probe: dict = {}
             verdict, detail = _verify_direction(program, plan, branch,
-                                                direction, entry)
+                                                direction, entry, sink=probe)
+            if probe.get("chain"):
+                shape = "%d/%d" % (probe["reached"], probe["chain"])
+                reach_profile[shape] = reach_profile.get(shape, 0) + 1
+                if probe["reached"] == probe["chain"] - 1:
+                    last_hop[0] += 1
+                if probe.get("missing"):
+                    missing_frames[probe["missing"]] = \
+                        missing_frames.get(probe["missing"], 0) + 1
             counts[verdict] += 1
             if verdict != "verified":
                 note(verdict, detail)
@@ -1606,6 +1644,11 @@ def cmd_export(args):
         "work_list": resolution.summary(),
         "attempted": attempted, "counts": counts,
         "rerouted_after_refusal": rerouted[0],
+        "reach_profile": dict(sorted(reach_profile.items(),
+                                     key=lambda kv: -kv[1])[:20]),
+        "last_hop_failures": last_hop[0],
+        "first_missing_frames": dict(sorted(missing_frames.items(),
+                                            key=lambda kv: -kv[1])[:20]),
         "unaccounted": unaccounted,
         "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])[:20]),
         "exported": rows,
@@ -1646,6 +1689,15 @@ def cmd_export(args):
             # whole point of the section.
             print("      %-26s %5d   ACCOUNTING BUG"
                   % ("unaccounted", p["unaccounted"]))
+        if p["last_hop_failures"]:
+            print("\n   of the plans that never reached their target, %d "
+                  "missed only the LAST hop" % p["last_hop_failures"])
+            print("   how far along their own chain they got:")
+            for shape, count in list(p["reach_profile"].items())[:8]:
+                print("      %-10s %5d" % (shape, count))
+        if p["rerouted_after_refusal"]:
+            print("\n   %d refusals answered by a second route"
+                  % p["rerouted_after_refusal"])
         if p["reasons"]:
             print("\n   why")
             for reason, count in p["reasons"].items():

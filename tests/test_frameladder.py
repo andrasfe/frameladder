@@ -3945,3 +3945,62 @@ class TestOccurrenceIdentity(unittest.TestCase):
         from frameladder.layout import occurrence_span
         p = program(self.SRC)
         self.assertIsNone(occurrence_span(p.model, "WS-OK"))
+
+
+class TestReachProfile(unittest.TestCase):
+    """How far along its own chain a failing plan actually got."""
+
+    SRC = HEADER + """       01  WS-A PIC X.
+       01  WS-B PIC X.
+       PROCEDURE DIVISION.
+       RP-MAIN.
+           IF WS-A = 'A'
+              PERFORM RP-MID
+           END-IF
+           GOBACK
+           .
+       RP-MID.
+           IF WS-B = 'B'
+              PERFORM RP-DEEP
+           END-IF
+           GOBACK
+           .
+       RP-DEEP.
+           CONTINUE
+           .
+"""
+
+    def test_the_sink_records_the_reached_prefix(self):
+        # The distribution is the whole diagnosis for the largest
+        # disposition: a run that gets 2/3 of the way failed at the guard
+        # admitting the last hop, and one that gets 1/3 never got going.
+        # Those want completely different fixes.
+        from frameladder.cli import _verify_direction
+        from frameladder.coverage import branches_of
+        from frameladder.ir import Plan
+        prog = program(self.SRC)
+        branch = [b for b in branches_of(prog) if b.paragraph == "RP-DEEP"] or \
+            [b for b in branches_of(prog) if b.paragraph == "RP-MID"]
+        empty = Plan(target="RP-MID", chain=["RP-MAIN", "RP-MID"], edges=[],
+                     atoms=[], bindings=[], rendezvous=[], open_obligations=[])
+        sink: dict = {}
+        verdict, detail = _verify_direction(prog, empty, branch[0], True,
+                                            "RP-MAIN", sink=sink)
+        self.assertEqual(verdict, "target_not_reached")
+        self.assertEqual(sink["chain"], 2)
+        self.assertEqual(sink["reached"], 1)      # RP-MAIN entered, RP-MID not
+        self.assertEqual(sink["missing"], "RP-MID")
+        self.assertIn("1/2", detail)
+
+    def test_the_sink_is_optional(self):
+        from frameladder.cli import _verify_direction
+        from frameladder.coverage import branches_of
+        from frameladder.ir import Plan
+        prog = program(self.SRC)
+        branch = branches_of(prog)[0]
+        empty = Plan(target="RP-MID", chain=["RP-MAIN"], edges=[], atoms=[],
+                     bindings=[], rendezvous=[], open_obligations=[])
+        verdict, _detail = _verify_direction(prog, empty, branch, True,
+                                             "RP-MAIN")
+        self.assertIn(verdict, ("target_not_reached", "verified",
+                                "wrong_direction", "decision_not_observed"))
