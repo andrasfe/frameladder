@@ -682,11 +682,24 @@ class Provenance:
                         trace=(var, group, fill.source), inferred=True)
 
     def blocking_writes(self, var: str, op: str, value) -> list:
-        """Conditional writes that would violate ``var op value`` if run."""
+        """Conditional writes that would violate ``var op value`` if run.
+
+        `SET <88> TO TRUE` counts here for the same reason it counts in
+        `establishing_writes`: after the attribution fix it carries the value
+        it writes. Accepting it there and not here was an asymmetry with no
+        argument behind it - the same statement that can *supply* a value can
+        destroy one - and it was expensive. A conditional `SET ... TO
+        LOW-VALUES` early in the mainline reset a field the plan had bound at
+        entry, the ladder never derived a guard to steer around it because it
+        was not a MOVE, and the run then failed the very condition that
+        admits it to the target. That is the shape of the largest disposition
+        on both corpora: the plan walks its whole chain and misses the last
+        hop.
+        """
         from .ir import holds
         out = []
         for w in self.writes_to(var):
-            if not w.conditional or w.kind != "MOVE":
+            if not w.conditional or w.kind not in ("MOVE", "SET"):
                 continue
             src = parse_term(w.source)
             if src.kind == "const" and not holds(src.value, op, value):
