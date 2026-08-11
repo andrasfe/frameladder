@@ -170,6 +170,33 @@ value generation earned most of it back honestly. When a construct is
 unparsed, check whether it became a settable name before believing any
 number that depends on it.
 
+**Trace feedback pays only if the harness gets *further* than the
+interpreter, and here it does not.** The Specter request asked for
+re-planning from the compiled program's first missing frame. Built and
+measured: frame-rooted search reaches 11.7% of wanted directions against
+9.1% entry-rooted on CardDemo, 22.4% against 13.9% elsewhere. But two
+ablations gut the claim.
+
+*The frames add no reach.* Seeding on **every paragraph**, with no report at
+all, reaches 179/786 off-corpus against the frame-rooted 176. What a report
+buys is *which of your own seeds are worth running* - an ordering, not new
+ground.
+
+*The premise had no headroom.* Over the seven GnuCOBOL-runnable programs the
+interpreter reports **53** chain frames reached and the real compiled run
+**13**: the actual program is *shallower*, because it abends on absent
+files. A reported frame is only a new resume point if the harness reached
+somewhere the interpreter cannot, and on this corpus it never does. On an
+estate with real data behind the mocks that may invert - which is precisely
+why it is written down as a condition rather than a verdict.
+
+*And it conflicts with targeting only uncovered directions.* Telling the
+planner to skip what the harness already covers collapses an entry-rooted
+search (168 directions to 36) while a frame-rooted one is unaffected (215 to
+212). The directions a shallow search climbs *through* are the ones already
+owned; closing them removes its ladder. Requests 1 and 4 of that enhancement
+pull against each other, and only a search that starts deep can have both.
+
 **A spot check is not a measurement, and saying "measured at zero" when it
 was three programs is worse than saying nothing.** A commit here claimed a
 provenance change was "measured at zero on both corpora"; it was checked on
