@@ -122,6 +122,7 @@ class Slot:
     digits: int = 0
     signed: bool = False
     separate: str = ""         # "" | "LEADING" | "TRAILING"
+    justified: bool = False    # JUSTIFIED RIGHT: align on the field's right
     dims: tuple = ()           # ((stride, count), ...), outermost first
 
     @property
@@ -211,6 +212,10 @@ def encode(slot: Slot, value) -> bytes:
         else:
             body = "" if value is None else str(value)
         raw = body.encode(CODEC, "replace")
+        if slot.justified:
+            # JUSTIFIED RIGHT pads in front and truncates from the left -
+            # both the other way round from an ordinary alphanumeric move.
+            return raw[-n:] if len(raw) >= n else b" " * (n - len(raw)) + raw
         return raw[:n] if len(raw) >= n else raw + b" " * (n - len(raw))
 
     units = _scaled(value, slot.scale, slot.digits)
@@ -399,6 +404,7 @@ class Layout:
                     scale=dec if category != "alnum" else 0,
                     digits=whole + dec, signed=pic.upper().startswith("S"),
                     separate=separate,
+                    justified=name in getattr(self.model, "justified", ()),
                     dims=self._dims(name, occurrences))
 
     def _dims(self, name: str, occurrences: dict) -> tuple:

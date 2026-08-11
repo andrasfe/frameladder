@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from .ir import _QUOTED_RUN
+
 # --------------------------------------------------------------------------
 # Source reading
 # --------------------------------------------------------------------------
@@ -61,8 +63,24 @@ def read_lines(path: str) -> list[Line]:
 
 _DECL = re.compile(r"^\s*(\d\d)\s+([A-Z0-9][A-Z0-9-]*)\b(.*)$", re.I)
 _PIC_IN = re.compile(r"\bPIC(?:TURE)?\s+(?:IS\s+)?(\S+)", re.I)
-_VALUE_IN = re.compile(r"\bVALUE\s+(?:IS\s+)?('[^']*'|\"[^\"]*\"|[A-Z0-9+-]+)", re.I)
-_OCCURS = re.compile(r"\bOCCURS\s+(\d+)", re.I)
+# `VALUE ALL '-'` fills the field with that character, however wide it is.
+# Matched as a bare word the initial value becomes the three letters "ALL",
+# so a field the program compares against a row of dashes never holds one.
+_VALUE_IN = re.compile(
+    r"\bVALUE\s+(?:IS\s+)?(ALL\s+'[^']*'|ALL\s+\"[^\"]*\"|'[^']*'|\"[^\"]*\"|"
+    r"[A-Z0-9+-]+)", re.I)
+_VALUE_ALL = re.compile(r"^ALL\s+(.*)$", re.I)
+# JUSTIFIED aligns a move on the right of the receiver, so the padding lands
+# in front of the data and a long sending item loses its *left* end. Ignored,
+# both go the other way and a right-aligned field never matches. A hyphen is
+# a word character in a COBOL name, so `\b` would find JUST inside
+# `WS-JUST-PAID`; the clause is only the bare word.
+_JUSTIFIED = re.compile(r"(?<![A-Z0-9-])(?:JUSTIFIED|JUST)(?![A-Z0-9-])", re.I)
+# `OCCURS 1 TO 50 TIMES DEPENDING ON N` reserves fifty entries; the counter
+# decides how many are *current*, not how many exist. Reading the first
+# number gives the table one element, so every reference past the first is
+# out of range and every offset after the table is wrong by the difference.
+_OCCURS = re.compile(r"\bOCCURS\s+(\d+)(?:\s+TO\s+(\d+))?", re.I)
 # A table's KEY clause is what makes `SEARCH ALL` a binary search rather than
 # a scan: it names the fields the occurrences are ordered on and which way.
 # Without it the verb has nothing to bisect on, so every SEARCH ALL either
@@ -292,6 +310,7 @@ class DataModel:
     usage: dict = field(default_factory=dict)             # field -> COMP-3/BINARY/...
     redefines: dict = field(default_factory=dict)         # field -> field it overlays
     sign: dict = field(default_factory=dict)              # field -> LEADING/TRAILING[ SEPARATE]
+    justified: set = field(default_factory=set)           # fields aligned on the right
     origin: dict = field(default_factory=dict)            # field -> file it was declared in
     copybooks: list = field(default_factory=list)         # members actually COPYed
     file_status: dict = field(default_factory=dict)       # file -> status variable
@@ -338,6 +357,7 @@ class DataModel:
         self.usage.update(other.usage)
         self.redefines.update(other.redefines)
         self.sign.update(other.sign)
+        self.justified.update(other.justified)
         self.origin.update(other.origin)
         self.condition_names.update(other.condition_names)
         self.file_status.update(other.file_status)
@@ -424,12 +444,25 @@ def parse_data_division(path: str) -> DataModel:
                 # containing the ten letters "LOW-VALUES". Storing the text
                 # makes every later comparison against it false.
                 from .ir import parse_term as _pt
-                term = _pt(v.group(1))
-                model.initial[name] = (term.value if term.kind == "const"
-                                       else v.group(1).strip("'\""))
+                raw = v.group(1)
+                repeat = _VALUE_ALL.match(raw)
+                if repeat:
+                    unit = _pt(repeat.group(1))
+                    body = "" if unit.value is None else str(unit.value)
+                    from .layout import byte_length
+                    try:
+                        width = byte_length(model.pic.get(name, ""))
+                    except Exception:                            # noqa: BLE001
+                        width = 0
+                    model.initial[name] = ((body * width)[:width]
+                                           if width and body else body)
+                else:
+                    term = _pt(raw)
+                    model.initial[name] = (term.value if term.kind == "const"
+                                           else raw.strip("'\""))
             o = _OCCURS.search(rest)
             if o:
-                model.occurs[name] = int(o.group(1))
+                model.occurs[name] = int(o.group(2) or o.group(1))
                 found = occurs_keys(rest)
                 if found:
                     model.keys[name] = found
@@ -446,6 +479,9 @@ def parse_data_division(path: str) -> DataModel:
             rd = _REDEFINES.search(rest)
             if rd:
                 model.redefines[name] = rd.group(1).upper()
+            # A VALUE literal can contain the word too, and it is data there.
+            if _JUSTIFIED.search(_QUOTED_RUN.sub("''", rest)):
+                model.justified.add(name)
             sg = _SIGN.search(rest)
             if sg:
                 model.sign[name] = (sg.group(1).upper()
@@ -626,8 +662,9 @@ class _Parser:
         self.t = tokens
         self.i = 0
 
-    def peek(self) -> str:
-        return self.t[self.i].word.upper() if self.i < len(self.t) else ""
+    def peek(self, ahead: int = 0) -> str:
+        at = self.i + ahead
+        return self.t[at].word.upper() if at < len(self.t) else ""
 
     def done(self) -> bool:
         return self.i >= len(self.t)
@@ -702,6 +739,18 @@ class _Parser:
 
     def statement(self) -> dict | None:
         word = self.peek()
+        # `EXIT PERFORM` is one statement whose second word is also a verb, so
+        # the boundary rule splits it into a bare EXIT followed by an inline
+        # PERFORM that swallows the rest of the loop body. Everything after
+        # the early exit then runs inside a loop of its own.
+        if word == "EXIT" and self.peek(1) == "PERFORM":
+            head = self.t[self.i]
+            self.i += 2
+            cycle = self.peek() == "CYCLE"
+            if cycle:
+                self.i += 1
+            return node("EXIT_PERFORM_CYCLE" if cycle else "EXIT_PERFORM",
+                        [head], {}, [])
         if word == "IF":
             return self.if_statement()
         if word == "EVALUATE":
@@ -785,8 +834,13 @@ class _Parser:
         text = "PERFORM " + " ".join(w.word for w in words)
 
         # PERFORM <name> [THRU <name>] - a call, unless a loop clause follows.
+        # `PERFORM WS-COUNT TIMES` opens with an identifier and is a loop, not
+        # a call: read as `PERFORM <paragraph>` the parser goes looking for a
+        # paragraph named after the counter, finds none, and the body that
+        # followed becomes ordinary statements that run exactly once.
         if words and upper[0] not in ("UNTIL", "VARYING", "WITH", "TEST") \
-                and not re.match(r"^\d+$", upper[0]):
+                and not re.match(r"^\d+$", upper[0]) \
+                and "TIMES" not in upper:
             target = words[0].word.upper()
             attrs: dict[str, Any] = {"target": target}
             if "THRU" in upper or "THROUGH" in upper:
@@ -958,9 +1012,33 @@ class _Parser:
                 attrs["destination"] = m.group(2).upper()
         elif verb == "SET":
             joined = " ".join(w.word for w in words)
-            m = re.match(r"([A-Z0-9-]+)\s+TO\s+(\S+)", joined, re.I)
+            # `SET IX UP BY 1` is the only way an index moves without a
+            # SEARCH, and `SET A B TO 1` sets both.  Recognising only the
+            # single `TO` form leaves an index frozen wherever it was, so
+            # every table reference through it reads the same occurrence.
+            def _receiver_names(raw: str) -> list:
+                names = [n.upper() for n in re.split(r"[,\s]+", raw.strip()) if n]
+                # `SET ADDRESS OF X TO ...` is a pointer form whose receiver is
+                # not a list of names; taking the last word keeps the previous
+                # behaviour rather than inventing two extra variables.
+                if all(re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", n) for n in names):
+                    return names
+                return names[-1:] if names else []
+
+            m = re.match(r"(.+?)\s+(UP|DOWN)\s+BY\s+(\S+)", joined, re.I)
             if m:
-                attrs["name"], attrs["value"] = m.group(1).upper(), m.group(2).upper()
+                names = _receiver_names(m.group(1))
+                attrs["names"] = names
+                attrs["name"] = names[0] if names else ""
+                attrs["direction"] = m.group(2).upper()
+                attrs["amount"] = m.group(3).upper().strip(".")
+            else:
+                m = re.match(r"(.+?)\s+TO\s+(\S+)", joined, re.I)
+                if m:
+                    names = _receiver_names(m.group(1))
+                    attrs["names"] = names
+                    attrs["name"] = names[0] if names else ""
+                    attrs["value"] = m.group(2).upper().strip(".")
         kind = {"GOBACK": "GOBACK", "STOP": "STOP", "EXIT": "EXIT"}.get(verb, verb)
         if children:
             return {"type": kind, "text": text, "line_start": head.line,
@@ -977,6 +1055,14 @@ class _Parser:
                 kind = "EXIT_PARAGRAPH"
             elif first == "PROGRAM":
                 kind = "EXIT_PROGRAM"
+            elif first == "PERFORM":
+                # `EXIT PERFORM` leaves the inline loop and `EXIT PERFORM
+                # CYCLE` skips to its next iteration. Read as the no-op both
+                # run the rest of the body, so a loop written to stop early
+                # runs to its bound and whatever it was accumulating is off.
+                kind = ("EXIT_PERFORM_CYCLE"
+                        if len(words) > 1 and words[1].word.upper() == "CYCLE"
+                        else "EXIT_PERFORM")
         return {"type": kind, "text": text, "line_start": head.line,
                 "line_end": words[-1].line if words else head.line,
                 "attributes": attrs, "children": []}

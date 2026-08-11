@@ -441,6 +441,14 @@ class _NextTask(Exception):
     """`EXEC CICS RETURN TRANSID(...)`: this task ends, another one starts."""
 
 
+class _ExitPerform(Exception):
+    """`EXIT PERFORM` - leave the innermost inline PERFORM."""
+
+
+class _ExitPerformCycle(Exception):
+    """`EXIT PERFORM CYCLE` - end this iteration of it."""
+
+
 class _ExitParagraph(Exception):
     """`EXIT PARAGRAPH` / `EXIT SECTION`: leave this paragraph, keep running."""
 
@@ -756,6 +764,20 @@ class Interpreter:
             sign = 1
         return int(total) if ok else default
 
+    def _sending_value(self, text: str):
+        """The value of an operand that may be a literal *or* an identifier.
+
+        `Term.value` is only ever set for a constant, so any place that reads
+        it directly - SET, PERFORM VARYING's FROM and BY - silently stores
+        None the moment the program writes a variable there instead of a
+        number. None is not a COBOL value: it compares equal to nothing and
+        arithmetic on it is skipped, so the loop or the index stops moving.
+        """
+        term = parse_term(text)
+        if term.kind == "const":
+            return term.value
+        return self.value_of(term)
+
     def _slice(self, term, value) -> str:
         text = self._text_of(term.name, value)
         start = self._as_int(term.refmod[0], 1)
@@ -847,6 +869,8 @@ class Interpreter:
             return _integer_of_date(int(number(0)))
         if name == "DATE-OF-INTEGER":
             return _date_of_integer(int(number(0)))
+        if name == "REVERSE":
+            return text(0)[::-1]
         if name == "ORD":
             body = text(0)
             return ord(body[0]) + 1 if body else 0
@@ -1057,6 +1081,11 @@ class Interpreter:
             return value
         if "X" in spec or "A" in spec:
             text = value if isinstance(value, str) else str(value)
+            # JUSTIFIED RIGHT aligns on the receiver's right-hand end: the
+            # padding goes in front and an over-long sending item loses its
+            # left characters, both the opposite way round from the default.
+            if name.upper() in getattr(self.model, "justified", ()):
+                return text[-width:] if len(text) > width else text.rjust(width)
             return text[:width] if len(text) > width else text
         if isinstance(value, str) and not value.strip().lstrip("+-").isdigit():
             return value                     # not a number; leave it alone
@@ -1406,7 +1435,11 @@ class Interpreter:
                 self._loop(condition, children, para, depth, line, ordinal,
                            bool(attrs.get("test_after")))
                 return
-            self.block(children, para, depth)
+            times = attrs.get("times")
+            if times:
+                self._times(times, children, para, depth, line, ordinal)
+                return
+            self._cycle(children, para, depth)
             return
 
         if kind in ("GO_TO", "GOTO"):
@@ -1431,6 +1464,12 @@ class Interpreter:
 
         if kind == "EXIT_PARAGRAPH":
             raise _ExitParagraph()
+
+        if kind == "EXIT_PERFORM":
+            raise _ExitPerform()
+
+        if kind == "EXIT_PERFORM_CYCLE":
+            raise _ExitPerformCycle()
 
         if kind == "ALTER":
             altered, destination = attrs.get("altered"), attrs.get("destination")
@@ -1482,15 +1521,35 @@ class Interpreter:
             return
 
         if kind == "SET":
-            name, raw = attrs.get("name"), attrs.get("value")
-            if name and raw:
-                entry = self.model.condition_names.get(name.upper())
-                if entry and raw.upper() == "TRUE":
-                    parent, values = entry
-                    if values:
-                        self.assign(parent, parse_term(values[0]).value)
-                else:
-                    self.assign(name, parse_term(raw).value)
+            names = attrs.get("names") or ([attrs.get("name")]
+                                           if attrs.get("name") else [])
+            raw = attrs.get("value")
+            direction = attrs.get("direction")
+            if names and direction:
+                # `SET IX UP BY 2` steps the index. Ignored, the index keeps
+                # the occurrence the last SET or SEARCH left it at, so every
+                # reference through it reads that one entry for the rest of
+                # the run.
+                step = self._operand_number(attrs.get("amount") or "1")
+                for name in names:
+                    current = self._operand_number(name)
+                    self.assign(name, int(current
+                                          + (step if direction == "UP" else -step)))
+                return
+            if names and raw:
+                for name in names:
+                    entry = self.model.condition_names.get(name.upper())
+                    if entry and raw.upper() == "TRUE":
+                        parent, values = entry
+                        if values:
+                            self.assign(parent, parse_term(values[0]).value)
+                        continue
+                    # The sending operand is an identifier as often as it is a
+                    # literal - `SET IX TO WS-SAVED-IX`, `SET WS-N TO IX`.
+                    # Reading only `Term.value` stores None for every one of
+                    # those, and a field holding None compares equal to
+                    # nothing the program ever tests.
+                    self.assign(name, self._sending_value(raw))
             return
 
         # A conditional phrase belongs to more than the I/O verbs: `ADD ... ON
@@ -1512,6 +1571,7 @@ class Interpreter:
             return
 
         if kind == "UNSTRING":
+            self._unstring(stmt)
             self._maybe_phrases(stmt, children, para, depth, line, ordinal)
             return
 
@@ -1525,7 +1585,9 @@ class Interpreter:
 
         from .provenance import STUB_KINDS, op_key
         if kind in STUB_KINDS:
+            self._record_transfer(kind, stmt, before=True)
             self._external(stmt, para, line)
+            self._record_transfer(kind, stmt, before=False)
             if children and any(c.get("type") == "PHRASE" for c in children):
                 self._phrases(stmt, children, para, depth, line, ordinal)
             elif children:
@@ -1541,10 +1603,34 @@ class Interpreter:
     _AT_END = {"10", "46", 10, 46}
     _INVALID_KEY = {"21", "22", "23", "24", 21, 22, 23, 24}
 
+    # Whether the statement that just ran raised its exception condition -
+    # size error, overflow. None means "no model", which is what every verb
+    # without one leaves behind.
+    _raised = None
+
+    def _too_wide(self, name: str, value) -> bool:
+        """Does an arithmetic result have more integer digits than fit?"""
+        from .layout import digits_of
+        text = (name or "").strip()
+        if not text:
+            return False
+        term = parse_term(text)
+        base = term.name if term.kind == "var" else text.split("(")[0].strip()
+        spec = (self.model.pic_of(base) or "").upper()
+        if not spec or "X" in spec or "A" in spec:
+            return False
+        try:
+            whole, _decimals = digits_of(spec)
+            return whole > 0 and abs(float(value)) >= 10 ** whole
+        except (TypeError, ValueError):
+            return False
+
     def _maybe_phrases(self, stmt, children, para: str, depth: int, line: int,
                        ordinal: int) -> None:
         if children and any(c.get("type") == "PHRASE" for c in children):
             self._phrases(stmt, children, para, depth, line, ordinal)
+        else:
+            self._raised = None
 
     def _phrases(self, stmt, children, para: str, depth: int, line: int,
                  ordinal: int) -> None:
@@ -1563,6 +1649,7 @@ class Interpreter:
         value = self._stored(status) if status else None
         at_end = value in self._AT_END
         invalid = value in self._INVALID_KEY
+        raised, self._raised = self._raised, None
         for arm in children:
             if arm.get("type") != "PHRASE":
                 continue
@@ -1571,11 +1658,17 @@ class Interpreter:
                 taken = at_end if phrase == "at_end" else not at_end
             elif phrase in ("invalid_key", "not_invalid_key"):
                 taken = invalid if phrase == "invalid_key" else not invalid
+            elif raised is not None and ("size_error" in phrase
+                                         or "overflow" in phrase):
+                # The verb that just ran said whether the condition fired:
+                # a result too wide for its receiver, or a STRING that ran off
+                # the end of one. Both are decisions the program takes, and
+                # both used to be settled in favour of the quiet arm.
+                taken = raised if not phrase.startswith("not_") else not raised
             else:
-                # ON SIZE ERROR / OVERFLOW / EXCEPTION: the interpreter has no
-                # model of the failure, so the non-error arm is the one taken
-                # and the error arm is reported as unmodelled rather than
-                # quietly run.
+                # EXCEPTION and anything else the interpreter has no model of:
+                # the non-error arm is the one taken and the error arm is
+                # reported as unmodelled rather than quietly run.
                 taken = phrase.startswith("not_")
                 if not taken and "%s:%s" % (para, phrase) not in self.trace.approximations:
                     self.trace.approximations.append("%s:%s" % (para, phrase))
@@ -1610,6 +1703,28 @@ class Interpreter:
                 if name in self._supplied:
                     self.state[name] = self._supplied[name]
                     self._note(name, None)
+
+    _WRITE_FROM = re.compile(r"^(?:WRITE|REWRITE|RELEASE)\s+(\S+)\s+FROM\s+"
+                             r"([A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?)", re.I)
+
+    def _record_transfer(self, kind: str, stmt, before: bool) -> None:
+        """The implicit MOVE that `WRITE ... FROM` carries.
+
+        `WRITE rec FROM ws` moves the working copy into the record area and
+        then writes it, which is how a program keeps the two apart. Dropped,
+        the record area still holds whatever it held before, so a program
+        that inspects it - or a REDEFINES over it - sees the previous record.
+
+        The other half, `READ ... INTO`, is deliberately not done here: the
+        read stub already delivers its payload straight to the INTO target
+        (`sequences.read_targets`), and moving the record area over it
+        afterwards would overwrite the record the world just supplied.
+        """
+        if not before or kind not in ("WRITE", "REWRITE", "RELEASE"):
+            return
+        m = self._WRITE_FROM.match(norm(stmt.get("text", "")))
+        if m:
+            self.assign(m.group(1), self._sending_value(m.group(2)))
 
     def _external(self, stmt, para: str, line: int) -> None:
         """Deliver the planned outcome for one external operation."""
@@ -1746,6 +1861,41 @@ class Interpreter:
                         out[term.name] = self.value_of(term)
         return out
 
+    def _cycle(self, children, para: str, depth: int) -> bool:
+        """Run one iteration of an inline loop; False means stop looping.
+
+        `EXIT PERFORM CYCLE` ends the iteration, `EXIT PERFORM` ends the loop.
+        """
+        try:
+            self.block(children, para, depth)
+        except _ExitPerformCycle:
+            pass
+        except _ExitPerform:
+            return False
+        return True
+
+    def _times(self, clause: str, children, para: str, depth: int, line: int,
+               ordinal: int = -1):
+        """`PERFORM n TIMES` runs the body n times, not once.
+
+        The count is evaluated once, on entry: a body that assigns to the
+        same field does not shorten its own loop. Ignoring the phrase runs
+        everything the loop accumulates exactly one time, and every branch
+        that tests the total is decided on that.
+        """
+        m = re.match(r"(.*?)\s+TIMES\b", norm(clause), re.I)
+        try:
+            total = int(self._operand_number(m.group(1).strip())) if m else 0
+        except (TypeError, ValueError):
+            total = 0
+        done = 0
+        while done < min(total, MAX_LOOP):
+            if not self._cycle(children, para, depth):
+                break
+            done += 1
+        self.trace.guards.append(GuardEvent(para, line, "PERFORM_TIMES",
+                                            norm(clause), done > 0, {}, ordinal))
+
     def _loop(self, condition: str, children, para: str, depth: int, line: int,
               ordinal: int = -1, test_after: bool = False):
         count = 0
@@ -1753,11 +1903,12 @@ class Interpreter:
         # condition is ever looked at. Treated as the default TEST BEFORE, a
         # loop that always executes becomes one that may never execute, and
         # whatever it was counting is still zero at the branch below it.
+        running = True
         if test_after:
-            self.block(children, para, depth)
+            running = self._cycle(children, para, depth)
             count += 1
-        while count < MAX_LOOP and not self.evaluate(condition):
-            self.block(children, para, depth)
+        while running and count < MAX_LOOP and not self.evaluate(condition):
+            running = self._cycle(children, para, depth)
             count += 1
         self.trace.guards.append(GuardEvent(para, line, "PERFORM_UNTIL", condition,
                                             count > 0, self._snapshot(condition),
@@ -1782,8 +1933,8 @@ class Interpreter:
         def level(index: int) -> None:
             var, start, by, until = phrases[index]
             var = var.upper()
-            self.assign(var, parse_term(start).value)
-            step = parse_term(by).value
+            self.assign(var, self._sending_value(start))
+            step = self._sending_value(by)
             count = 0
             while count < MAX_LOOP and budget[0] > 0 and not self.evaluate(until):
                 budget[0] -= 1
@@ -1791,7 +1942,10 @@ class Interpreter:
                     level(index + 1)
                 else:
                     entered[0] = True
-                    self.block(children, para, depth)
+                    try:
+                        self.block(children, para, depth)
+                    except _ExitPerformCycle:
+                        pass
                 try:
                     self.assign(var, float(self.value_of(parse_term(var)))
                                 + float(step))
@@ -1799,7 +1953,12 @@ class Interpreter:
                     break
                 count += 1
 
-        level(0)
+        try:
+            level(0)
+        except _ExitPerform:
+            # `EXIT PERFORM` leaves the whole inline PERFORM, every AFTER
+            # level of it, without stepping the loop variables again.
+            pass
         self.trace.guards.append(GuardEvent(para, line, "PERFORM_VARYING",
                                             phrases[0][3], entered[0],
                                             self._snapshot(phrases[0][3]),
@@ -1827,7 +1986,39 @@ class Interpreter:
         except (TypeError, ValueError):
             return 0.0
 
-    def _store_number(self, name: str, value: float, rounded: bool = False):
+    @staticmethod
+    def _round(value: float, decimals: int, mode: str) -> float:
+        """COBOL's ROUNDED, which is not Python's `round`.
+
+        The standard's default is NEAREST-AWAY-FROM-ZERO: a half goes away
+        from zero, so 2.5 is 3 and -2.5 is -3. Python's `round` is
+        NEAREST-EVEN, which makes 2.5 come out 2 - a value the compiler never
+        produces, on the one operation a rounded COMPUTE exists to control.
+        `ROUNDED MODE IS ...` names the other modes explicitly.
+        """
+        import math
+        scale = 10.0 ** decimals
+        scaled = value * scale
+        sign = -1.0 if scaled < 0 else 1.0
+        body = abs(scaled)
+        if mode == "TRUNCATION":
+            out = math.floor(body)
+        elif mode == "NEAREST-EVEN":
+            out = abs(round(scaled))
+        elif mode == "NEAREST-TOWARD-ZERO":
+            out = math.ceil(body - 0.5)
+        elif mode == "TOWARD-GREATER":
+            return math.ceil(scaled - 1e-9) / scale
+        elif mode == "TOWARD-LESSER":
+            return math.floor(scaled + 1e-9) / scale
+        elif mode == "AWAY-FROM-ZERO":
+            out = math.ceil(body - 1e-9)
+        else:                                    # NEAREST-AWAY-FROM-ZERO
+            out = math.floor(body + 0.5 + 1e-9)
+        return sign * out / scale
+
+    def _store_number(self, name: str, value: float, rounded: bool = False,
+                      mode: str = ""):
         """Write an arithmetic result, respecting the receiver's PIC.
 
         `DIVIDE 10 BY 4 GIVING R` where R is PIC 9(3) is 2, not 2.5. Keeping
@@ -1846,9 +2037,10 @@ class Interpreter:
         except Exception:                                        # noqa: BLE001
             decimals = None
         if pic and not decimals:
-            value = round(value) if rounded else float(int(value))
+            value = (self._round(value, 0, mode) if rounded
+                     else float(int(value)))
         elif rounded and decimals:
-            value = round(value, decimals)
+            value = self._round(value, decimals, mode)
         self.assign(base, value, index=index)
 
     _RECEIVER = None
@@ -1877,6 +2069,34 @@ class Interpreter:
         text = re.split(r"\b(?:ON\s+SIZE\s+ERROR|NOT\s+ON\s+SIZE\s+ERROR)\b",
                         text, maxsplit=1, flags=re.I)[0].strip()
         rounded = bool(re.search(r"\bROUNDED\b", text, re.I))
+        # `ROUNDED MODE IS TRUNCATION` names the rounding rule. Left in the
+        # text its three words parse as three more receivers, so the result
+        # is written to fields called MODE, IS and TRUNCATION and the real
+        # receiver keeps its old value.
+        mode = ""
+        m = re.search(r"\bROUNDED\s+MODE\s+IS\s+([A-Z-]+)", text, re.I)
+        if m:
+            mode = m.group(1).upper()
+            text = text[:m.start()] + " ROUNDED " + text[m.end():]
+
+        # A result too wide for its receiver, or a division by zero, raises the
+        # size-error condition. Where the statement handles it the receiver is
+        # left alone and the handler runs; where it does not, the standard
+        # leaves the result undefined and the compiler truncates, so the old
+        # behaviour is what matches it. Only the guarded case changes, and it
+        # is the one whose two arms were both being scored the same way.
+        guarded = any(c.get("type") == "PHRASE"
+                      and "size_error" in (c.get("attributes") or {}).get("phrase", "")
+                      for c in (stmt.get("children") or []))
+        self._raised = False
+
+        def store(name, value, rnd=None):
+            if self._too_wide(name, value):
+                self._raised = True
+                if guarded:
+                    return
+            self._store_number(name, value, rounded if rnd is None else rnd, mode)
+
         try:
             if kind == "COMPUTE":
                 m = re.match(r"COMPUTE\s+(.*?)\s*=\s*(.*)$", text, re.I)
@@ -1884,7 +2104,7 @@ class Interpreter:
                     return
                 value = self.number_of(m.group(2))
                 for name in self._receivers(m.group(1)):
-                    self._store_number(name, value, rounded)
+                    store(name, value)
                 return
 
             if kind == "ADD":
@@ -1895,14 +2115,14 @@ class Interpreter:
                                  for o in self._receivers(m.group(1)))
                              + self._operand_number(m.group(2)))
                     for name in self._receivers(m.group(3)):
-                        self._store_number(name, total, rounded)
+                        store(name, total)
                     return
                 m = re.match(r"ADD\s+(.*?)\s+GIVING\s+(.*)$", text, re.I)
                 if m:
                     total = sum(self._operand_number(o)
                                 for o in self._receivers(m.group(1)))
                     for name in self._receivers(m.group(2)):
-                        self._store_number(name, total, rounded)
+                        store(name, total)
                     return
                 m = re.match(r"ADD\s+(.*?)\s+TO\s+(.*)$", text, re.I)
                 if m:
@@ -1911,9 +2131,7 @@ class Interpreter:
                     # `ADD 1 TO A B` adds to *each* receiver; treating only
                     # the first as one means every later counter stays put.
                     for name in self._receivers(m.group(2)):
-                        self._store_number(name,
-                                           self._operand_number(name) + addend,
-                                           rounded)
+                        store(name, self._operand_number(name) + addend)
                     return
                 return
 
@@ -1925,16 +2143,14 @@ class Interpreter:
                              - sum(self._operand_number(o)
                                    for o in self._receivers(m.group(1))))
                     for name in self._receivers(m.group(3)):
-                        self._store_number(name, total, rounded)
+                        store(name, total)
                     return
                 m = re.match(r"SUBTRACT\s+(.*?)\s+FROM\s+(.*)$", text, re.I)
                 if m:
                     amount = sum(self._operand_number(o)
                                  for o in self._receivers(m.group(1)))
                     for name in self._receivers(m.group(2)):
-                        self._store_number(name,
-                                           self._operand_number(name) - amount,
-                                           rounded)
+                        store(name, self._operand_number(name) - amount)
                     return
                 return
 
@@ -1945,15 +2161,13 @@ class Interpreter:
                     product = (self._operand_number(m.group(1))
                                * self._operand_number(m.group(2)))
                     for name in self._receivers(m.group(3)):
-                        self._store_number(name, product, rounded)
+                        store(name, product)
                     return
                 m = re.match(r"MULTIPLY\s+(.*?)\s+BY\s+(.*)$", text, re.I)
                 if m:
                     factor = self._operand_number(m.group(1))
                     for name in self._receivers(m.group(2)):
-                        self._store_number(name,
-                                           self._operand_number(name) * factor,
-                                           rounded)
+                        store(name, self._operand_number(name) * factor)
                     return
                 return
 
@@ -1969,21 +2183,24 @@ class Interpreter:
                                    self._operand_number(m.group(3)))
                     top, bottom = ((left, right) if m.group(2).upper() == "BY"
                                    else (right, left))
+                    if not bottom:
+                        self._raised = True
                     quotient = top / bottom if bottom else 0.0
                     for name in self._receivers(m.group(4)):
-                        self._store_number(name, quotient, rounded)
+                        if bottom or not guarded:
+                            store(name, quotient)
                     if remainder:
-                        self._store_number(remainder,
-                                           top - bottom * int(quotient))
+                        store(remainder, top - bottom * int(quotient), False)
                     return
                 m = re.match(r"DIVIDE\s+(.*?)\s+INTO\s+(.*)$", text, re.I)
                 if m:
                     divisor = self._operand_number(m.group(1))
+                    if not divisor:
+                        self._raised = True
                     for name in self._receivers(m.group(2)):
                         top = self._operand_number(name)
-                        self._store_number(name,
-                                           top / divisor if divisor else 0.0,
-                                           rounded)
+                        if divisor or not guarded:
+                            store(name, top / divisor if divisor else 0.0)
                     return
                 return
         except (TypeError, ValueError, ZeroDivisionError, OverflowError):
@@ -2026,10 +2243,135 @@ class Interpreter:
                 stop = self.value_of(parse_term(delimiter))
                 stop = "" if stop is None else str(stop)
                 out.append(body.split(stop)[0] if stop else body)
-        joined = "".join(out)
         name = target.split("(")[0].strip().upper()
         width = self._width(name)
-        self.assign(name, joined[:width] if width else joined)
+        joined = "".join(out)
+        # WITH POINTER says where in the receiver to start, and it is left
+        # holding one past the last character stored - which is how a program
+        # assembles a line in several statements. Ignored, every STRING
+        # overwrites the receiver from byte one and the earlier pieces are
+        # gone.
+        pointer = re.search(r"\bWITH\s+POINTER\s+([A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?)",
+                            norm(stmt.get("text", "")), re.I)
+        start = 0
+        if pointer:
+            start = int(self._operand_number(pointer.group(1))) - 1
+        # Overflow is a decision, not a diagnostic: it fires when the pointer
+        # is outside the receiver or the sources do not fit in what is left.
+        self._raised = bool(start < 0 or (width and start >= width)
+                            or (width and start + len(joined) > width))
+        if start < 0 or (width and start >= width):
+            return                        # nothing is transferred
+        current = self._text_of(name, self._stored(name))
+        if width:
+            current = current.ljust(width)[:width]
+        room = (width - start) if width else len(joined)
+        body = joined[:room]
+        assembled = current[:start] + body + current[start + len(body):]
+        self.assign(name, assembled[:width] if width else assembled)
+        if pointer:
+            self.assign(pointer.group(1).strip(), start + len(body) + 1)
+
+    _UNSTRING_HEAD = re.compile(r"UNSTRING\s+(\S+)(.*)$", re.I)
+
+    def _unstring(self, stmt) -> None:
+        """UNSTRING splits one sending item across several receivers.
+
+        Skipped, every receiver keeps whatever it held - normally spaces - so
+        each field the program went on to test has one reachable value. The
+        verb is how a delimited record, a screen field or a CICS commarea is
+        taken apart, and the fields it produces are exactly the ones later
+        conditions turn on.
+        """
+        import re as _re
+        text = norm(stmt.get("text", ""))
+        text = _re.split(r"\b(?:ON\s+OVERFLOW|NOT\s+ON\s+OVERFLOW|END-UNSTRING)\b",
+                         text, maxsplit=1, flags=_re.I)[0].strip()
+        m = self._UNSTRING_HEAD.match(text)
+        if not m:
+            return
+        source_text, rest = m.group(1), m.group(2)
+        term = parse_term(source_text)
+        value = self.value_of(term)
+        body = (self._text_of(term.name, value)
+                if term.kind == "var" and not term.refmod and not term.func
+                else ("" if value is None else str(value)))
+
+        delimiters: list = []
+        d = _re.match(r"\s*DELIMITED\s+BY\s+(.*?)\s+INTO\s+(.*)$", rest, _re.I)
+        if d:
+            for piece in _re.split(r"\s+OR\s+", d.group(1), flags=_re.I):
+                piece = piece.strip()
+                piece = _re.sub(r"^ALL\s+", "", piece, flags=_re.I).strip()
+                one = self._sending_value(piece)
+                one = "" if one is None else str(one)
+                if piece.upper() in ("SPACE", "SPACES"):
+                    one = " "
+                if one:
+                    delimiters.append(one)
+            rest = d.group(2)
+        else:
+            d = _re.match(r"\s*INTO\s+(.*)$", rest, _re.I)
+            if not d:
+                return
+            rest = d.group(1)
+
+        pointer_name = tally_name = ""
+        p = _re.search(r"\bWITH\s+POINTER\s+(\S+)", rest, _re.I)
+        if p:
+            pointer_name = p.group(1)
+        t = _re.search(r"\bTALLYING\s+IN\s+(\S+)", rest, _re.I)
+        if t:
+            tally_name = t.group(1)
+        rest = _re.split(r"\bWITH\s+POINTER\b|\bTALLYING\s+IN\b", rest,
+                         maxsplit=1, flags=_re.I)[0]
+
+        # `INTO A COUNT IN C1 B DELIMITER IN D2 C` - each receiver may be
+        # followed by its own DELIMITER IN and COUNT IN.
+        receivers: list = []
+        words = [w for w in _re.split(r"[,\s]+", rest.strip()) if w]
+        index = 0
+        while index < len(words):
+            word = words[index]
+            if word.upper() in ("DELIMITER", "COUNT") and receivers:
+                which = 1 if word.upper() == "DELIMITER" else 2
+                if index + 2 < len(words) and words[index + 1].upper() == "IN":
+                    receivers[-1][which] = words[index + 2]
+                    index += 3
+                    continue
+            receivers.append([word, "", ""])
+            index += 1
+        if not receivers:
+            return
+
+        at = int(self._operand_number(pointer_name)) - 1 if pointer_name else 0
+        if at < 0 or at >= len(body):
+            self._raised = True           # pointer outside the sending item
+            return
+        taken = 0
+        for name, delim_name, count_name in receivers:
+            if at >= len(body):
+                break
+            if delimiters:
+                hits = [(body.find(d, at), d) for d in delimiters]
+                hits = [(i, d) for i, d in hits if i >= 0]
+                cut, hit = min(hits) if hits else (len(body), "")
+            else:
+                cut, hit = min(len(body), at + max(1, self._width(name))), ""
+            field = body[at:cut]
+            self.assign(name, self._fit(name.upper(), field))
+            if delim_name:
+                self.assign(delim_name, hit)
+            if count_name:
+                self.assign(count_name, len(field))
+            at = cut + len(hit)
+            taken += 1
+        if tally_name:
+            # TALLYING counts up from what the field already held.
+            self.assign(tally_name, self._operand_number(tally_name) + taken)
+        if pointer_name:
+            self.assign(pointer_name, at + 1)
+        self._raised = at < len(body)     # characters left with no receiver
 
     # -- SEARCH ------------------------------------------------------------
     def _table_of(self, name: str) -> str:
@@ -2322,8 +2664,19 @@ class Interpreter:
         """
         import re
         text = norm(stmt.get("text", ""))
-        # REPLACING/THRU phrases change *what* it writes, not that it writes.
-        text = re.split(r"\bREPLACING\b", text, maxsplit=1, flags=re.I)[0]
+        # REPLACING names a category and a value: `REPLACING NUMERIC BY 7`
+        # leaves every alphanumeric field alone and puts 7 in the numeric
+        # ones. Dropped, the statement clears fields the program meant to
+        # keep and sets the rest to the wrong value.
+        replacing: list = []
+        parts = re.split(r"\bREPLACING\b", text, maxsplit=1, flags=re.I)
+        if len(parts) > 1:
+            for m in re.finditer(
+                    r"\b(ALPHANUMERIC-EDITED|NUMERIC-EDITED|ALPHANUMERIC|"
+                    r"ALPHABETIC|NUMERIC|NATIONAL)(?:\s+DATA)?\s+BY\s+(\S+)",
+                    parts[1], re.I):
+                replacing.append((m.group(1).upper(), self._sending_value(m.group(2))))
+        text = parts[0]
         body = re.sub(r"^INITIALIZE\s+", "", text, flags=re.I)
         for name in self._receivers(body):
             name = name.split("(")[0].strip().upper()
@@ -2334,11 +2687,27 @@ class Interpreter:
             for field in (children or [name]):
                 if field in self._pinned:
                     continue
+                spec = (self.model.pic_of(field) or "").upper()
+                numeric = bool(spec) and "9" in spec and "X" not in spec
+                if replacing:
+                    # Only the named categories are written; everything else
+                    # keeps what it held.
+                    want = "NUMERIC" if numeric else "ALPHANUMERIC"
+                    chosen = [v for c, v in replacing if c.startswith(want[:5])]
+                    if not chosen:
+                        continue
+                    self.assign(field, chosen[0])
+                    continue
+                # FILLER occupies bytes and has no name a program can write,
+                # and INITIALIZE leaves it exactly as it was. Clearing it
+                # blanks bytes the record still holds, which a group read or
+                # a REDEFINES then sees.
+                if self._is_filler(field):
+                    continue
                 if self._blank(field):
                     self._note(field, None)
                     continue
-                spec = (self.model.pic_of(field) or "").upper()
-                blank = 0 if spec and "9" in spec and "X" not in spec else " "
+                blank = 0 if numeric else " "
                 self.state[field.upper()] = blank
                 self._note(field, None)
             if not children and name not in self._pinned \
@@ -2347,6 +2716,12 @@ class Interpreter:
                 self.state[name] = (0 if spec and "9" in spec and "X" not in spec
                                     else " ")
                 self._note(name, None)
+
+    @staticmethod
+    def _is_filler(name: str) -> bool:
+        """FILLER occupies bytes and carries no name a statement can reach."""
+        upper = (name or "").upper()
+        return upper == "FILLER" or upper.startswith("FILLER#")
 
     def _blank(self, name: str) -> bool:
         """Clear one field to its category's zero, every occurrence of it.

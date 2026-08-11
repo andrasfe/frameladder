@@ -76,9 +76,27 @@ AID_VALUES = {
 }
 
 
+_QUOTED_RUN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
 def norm(text: str) -> str:
-    """Conditions arrive folded across source lines; flatten them first."""
-    return re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
+    """Conditions arrive folded across source lines; flatten them first.
+
+    Everything outside a quoted literal is whitespace-insensitive and
+    everything inside one is not. Collapsing runs of spaces indiscriminately
+    shortens `MOVE '   ' TO X` and `IF X = '  A00B'` by a character each
+    time, so a comparison against an edit mask, a blank key or any literal
+    with two spaces in it is decided against a literal the program does not
+    contain.
+    """
+    text = (text or "").replace("\n", " ")
+    out, at = [], 0
+    for m in _QUOTED_RUN.finditer(text):
+        out.append(re.sub(r"\s+", " ", text[at:m.start()]))
+        out.append(m.group(0))
+        at = m.end()
+    out.append(re.sub(r"\s+", " ", text[at:]))
+    return "".join(out).strip()
 
 
 @dataclass(frozen=True)
@@ -170,7 +188,20 @@ _LENGTH_OF = re.compile(r"^LENGTH\s+OF\s+([A-Z0-9][A-Z0-9-]*(?:\s*\(.*\))?)$", r
 
 def _split_args(text: str) -> list:
     """Top-level comma split, so `MOD(A, B)` is two arguments and
-    `TRIM(X(1:N))` is one."""
+    `TRIM(X(1:N))` is one.
+
+    The standard makes a space as good a separator as a comma, and the
+    reference manuals write it that way: `FUNCTION MAX(A B C)`,
+    `FUNCTION MOD(A B)`, `FUNCTION TRIM(X TRAILING)`.  Split on the comma
+    alone and every one of those is a single argument named after the whole
+    text, which no field carries - so MAX returns 0, MOD returns 0, and the
+    condition testing the result has one reachable direction.
+
+    An argument may also be an arithmetic expression, and there the space is
+    a separator *inside* one argument (`MOD(A + 1, 3)`).  The two are told
+    apart by the rule COBOL already relies on elsewhere: an arithmetic
+    operator has to stand alone, so a piece containing one is left whole.
+    """
     out, depth, buf = [], 0, []
     for ch in text:
         depth += (ch == "(") - (ch == ")")
@@ -180,7 +211,44 @@ def _split_args(text: str) -> list:
         else:
             buf.append(ch)
     out.append("".join(buf))
-    return [p.strip() for p in out if p.strip()]
+    pieces = [p.strip() for p in out if p.strip()]
+    split: list = []
+    for piece in pieces:
+        words = _top_level_words(piece)
+        if (len(words) > 1 and not any(w in _ARITH_OPS for w in words)
+                and not _LENGTH_OF.match(piece)):
+            split.extend(words)
+        else:
+            split.append(piece)
+    return split
+
+
+def _top_level_words(text: str) -> list:
+    """Whitespace split that keeps brackets and quotes together."""
+    out, depth, quote, buf = [], 0, "", []
+    for ch in text:
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch.isspace() and depth == 0:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
 
 
 def _split_refmod(text: str):
@@ -290,10 +358,32 @@ def parse_term(text: str) -> Term:
         # `WS-CELL(I, J)` and `WS-CELL(I J)` are the same reference. Split on
         # the comma alone and a two-dimensional table collapses to its first
         # row, because the whole "I J" evaluates to no number at all.
+        # A subscript may itself be an expression - `WS-E(IX + 1)` is the
+        # ordinary way to look at the next entry - and an arithmetic operator
+        # must stand alone in COBOL, so the same whitespace that separates two
+        # dimensions also separates the three tokens of one. Split naively,
+        # a one-dimensional table is read as three-dimensional and the
+        # reference falls back to occurrence 1.
         return Term("var", name=head,
-                    index=tuple(s for s in re.split(r"[,\s]+", m.group(2).strip())
-                                if s))
+                    index=tuple(_merge_subscript_operators(
+                        [s for s in re.split(r"[,\s]+", m.group(2).strip()) if s])))
     return Term("var", name=upper)
+
+
+def _merge_subscript_operators(parts: list) -> list:
+    out: list = []
+    pending = False
+    for part in parts:
+        if pending:
+            out[-1] = out[-1] + " " + part
+            pending = part in _ARITH_OPS
+            continue
+        if part in _ARITH_OPS and out:
+            out[-1] = out[-1] + " " + part
+            pending = True
+            continue
+        out.append(part)
+    return out
 
 
 _ARITH_OPS = {"+", "-", "*", "/", "**"}
@@ -320,6 +410,15 @@ def arith_tokens(text: str) -> list:
                 and tokens[index + 1].upper() == "OF"):
             merged.append(" ".join(tokens[index:index + 3]))
             index += 3
+            continue
+        # `FUNCTION MAX(A B)` is one operand written as two tokens, and the
+        # bracket merge below only ever joins a bracket to the token in front
+        # of it. Left split, `FUNCTION` is a field nobody declares and the
+        # expression evaluates to whatever that default is - so a COMPUTE
+        # over an intrinsic writes 0 and every test on the result is fixed.
+        if tokens[index].upper() == "FUNCTION" and index + 1 < len(tokens):
+            merged.append("FUNCTION " + tokens[index + 1])
+            index += 2
             continue
         # `WS-TOTAL (I) + 1` is a subscripted operand, not a name multiplied
         # by a bracket: COBOL has no implicit multiplication, so a `(` that
@@ -499,7 +598,15 @@ def holds(left: Any, op: str, right: Any) -> bool:
             except (TypeError, ValueError):
                 left, right = str(left).strip(), str(right).strip()
         elif isinstance(left, str):
-            left, right = left.strip(), right.strip()
+            # Two alphanumeric operands are compared byte for byte after the
+            # shorter is padded on the *right* with spaces. Stripping both
+            # ends instead makes leading blanks invisible, so `'  ABC'` and
+            # `'ABC'` compare equal - a field that a JUSTIFIED move, an
+            # editing PIC or a right-aligned screen field filled cannot then
+            # be told apart from one that was not, and the ordering
+            # comparisons on it come out backwards.
+            width = max(len(left), len(right))
+            left, right = left.ljust(width), right.ljust(width)
         return {"=": left == right, "!=": left != right, ">": left > right,
                 "<": left < right, ">=": left >= right, "<=": left <= right}[op]
     except (TypeError, KeyError):

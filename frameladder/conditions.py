@@ -152,6 +152,7 @@ def class_condition(text: str, negate: bool, origin: str):
                   Term("const", value=m.group(3).upper()), origin)]]
 
 
+_ALSO = re.compile(r"\s+ALSO\s+", re.I)
 _WHEN_RANGE = re.compile(r"^(.+?)\s+(?:THRU|THROUGH)\s+(.+)$", re.I)
 _LEADING_RELATION = re.compile(
     r"^\s*(" + "|".join(_relation_pattern(r) for r in _RELATIONS) + r")\s*(.*)$",
@@ -165,6 +166,28 @@ def when_condition(subject: str, value: str) -> str:
     left out; pasted into ``subject = value`` both become a comparison
     against a phrase, which is false for every value the subject can hold.
     """
+    # `EVALUATE A ALSO B / WHEN 1 ALSO 3` is two independent comparisons that
+    # must both hold, and the subjects pair with the values by position.
+    # Pasted together whole it becomes `A ALSO B = 1 ALSO 3`, which is one
+    # comparison against a phrase - so the arm's result is decided by whatever
+    # a name called "B" happens to hold and the second subject is never
+    # tested at all.
+    subjects = _ALSO.split(norm(subject))
+    values = _ALSO.split(norm(value))
+    if len(subjects) > 1 and len(values) == len(subjects):
+        parts = []
+        for one_subject, one_value in zip(subjects, values):
+            if one_value.strip().upper() in ("ANY", "OTHER"):
+                continue                  # matches whatever the subject holds
+            one = when_condition(one_subject.strip(), one_value.strip())
+            # A `FALSE` subject asks for the arm's condition *not* to hold.
+            # The single-subject spelling is negated by the caller, which
+            # cannot see a FALSE that is only one of several subjects.
+            if one_subject.strip().upper() == "FALSE":
+                one = "NOT (%s)" % one
+            parts.append("(%s)" % one)
+        return " AND ".join(parts) if parts else "1 = 1"
+
     body = norm(value)
     on_truth = norm(subject).upper() in ("TRUE", "FALSE")
     negated = False
@@ -239,20 +262,18 @@ def _condition_atoms(condition: str, negate: bool = False,
     text = norm(condition)
     if not text:
         return [[]]
-    while text.upper().startswith("NOT "):
-        rest = text[4:].strip()
-        # NOT binds tighter than AND and OR, so `NOT A AND B` is
-        # `(NOT A) AND B`. Absorbing the NOT into everything that follows
-        # inverts the sense of the whole expression whenever a top-level
-        # operator comes after it -- and since the splits below recurse,
-        # leaving the NOT in place lets it be applied to its own operand.
-        # `NOT (A OR B)` is unaffected: the operator is inside the parens,
-        # so neither split sees it here.
-        if len(split_top(rest, "OR")) > 1 or len(split_top(rest, "AND")) > 1:
+    # Stripping a NOT can uncover a bracket and stripping a bracket can
+    # uncover a NOT, so neither pass is enough on its own: `(NOT (A = 1))`
+    # leaves `NOT (A = 1)` sitting in front of a comparison matcher that
+    # reads it as a field called "NOT (A" - an atom no program can satisfy,
+    # in a conjunction that is then permanently false.
+    while True:
+        before = text
+        text, negate = _strip_not(text, negate)
+        while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):
+            text = text[1:-1].strip()
+        if text == before:
             break
-        text, negate = rest, not negate
-    while text.startswith("(") and text.endswith(")") and balanced(text[1:-1]):
-        text = text[1:-1].strip()
 
     shaped = class_condition(text, negate, origin)
     if shaped is not None:
@@ -297,3 +318,20 @@ def _condition_atoms(condition: str, negate: bool = False,
     lhs = parse_term(lhs_text)
     return [[Atom(lhs, op, parse_term(r), origin)]
             for r in split_top(rhs_text, "OR")]
+
+
+def _strip_not(text: str, negate: bool):
+    """Peel leading NOTs off a condition, flipping the sense each time."""
+    while text.upper().startswith("NOT "):
+        rest = text[4:].strip()
+        # NOT binds tighter than AND and OR, so `NOT A AND B` is
+        # `(NOT A) AND B`. Absorbing the NOT into everything that follows
+        # inverts the sense of the whole expression whenever a top-level
+        # operator comes after it -- and since the splits recurse, leaving
+        # the NOT in place lets it be applied to its own operand.
+        # `NOT (A OR B)` is unaffected: the operator is inside the parens,
+        # so neither split sees it here.
+        if len(split_top(rest, "OR")) > 1 or len(split_top(rest, "AND")) > 1:
+            break
+        text, negate = rest, not negate
+    return text, negate
