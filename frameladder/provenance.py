@@ -134,6 +134,13 @@ def stub_outputs(text: str) -> list[str]:
     flat = norm(text)
     if re.search(r"\bEXEC\s+(CICS|SQL|DLI)\b", flat, re.I):
         out: list[str] = []
+        if re.search(r"\bEXEC\s+DLI\b", flat, re.I):
+            # Every DL/I call sets the DIB status, named in the block or not
+            # - the same implicit channel EXEC SQL has in SQLCODE. Without
+            # this no writer is recorded for DIBSTAT, so every WHEN arm on
+            # it looks unproducible and the whole retrieval loop after it is
+            # dark.
+            out.append("DIBSTAT")
         if re.search(r"\bEXEC\s+SQL\b", flat, re.I):
             # Every SQL statement sets SQLCODE whether it mentions it or not;
             # it is the DB2 equivalent of a file status and the thing every
@@ -267,6 +274,7 @@ class Provenance:
         return out
 
     def _index(self):
+        names = frozenset(self.model.condition_names)
         for para in self.program.paragraphs:
             def visit(stmt, pname, guards, induction, literals):
                 kind = stmt.get("type", "")
@@ -365,7 +373,7 @@ class Provenance:
                                 self._add(g.upper(), Writer(pname, line, kind,
                                                             source=text,
                                                             guards=tuple(guards)))
-            walk_guarded(para, visit)
+            walk_guarded(para, visit, names)
 
     def _is_payload(self, var: str) -> bool:
         return any(w.kind == "STUB" for w in self.writers.get(var.upper(), []))
@@ -385,12 +393,13 @@ class Provenance:
 
     def _harvest_literals(self):
         from .ir import norm as _norm
+        names = frozenset(self.model.condition_names)
 
         def take(text):
             """Every literal a condition compares a field against."""
             if not text:
                 return
-            for alts in condition_atoms(text):
+            for alts in condition_atoms(text, names=names):
                 for atom in alts:
                     # `IS NUMERIC` says what shape the value has, not what it
                     # is. Filing "NUMERIC" as a candidate value hands the

@@ -36,7 +36,14 @@ SQLCODE = [0, 100, -911, -803, -805, -811, -904, -180, -305, -501, -104]
 # CICS EIBRESP. 0 is NORMAL; the rest are the conditions programs HANDLE.
 CICS_RESP = [0, 13, 12, 22, 17, 84, 16, 44, 18, 27, 70, 80]
 
-_FAMILIES = {"file": FILE_STATUS, "sql": SQLCODE, "cics": CICS_RESP}
+# DL/I. The DIB status code: two characters, spaces for success. GE is
+# segment-not-found, GB end-of-database - the two every retrieval loop
+# handles - then the not-open/invalid families programs test explicitly.
+# Fixed by IMS the way HTTP status codes are fixed; not a naming guess.
+DLI_STATUS = ["  ", "GE", "GB", "II", "AD", "DA", "AM", "GK", "GA"]
+
+_FAMILIES = {"file": FILE_STATUS, "sql": SQLCODE, "cics": CICS_RESP,
+             "dli": DLI_STATUS}
 
 
 def channel_of(var: str, model, op_key: str = "") -> str | None:
@@ -53,6 +60,11 @@ def channel_of(var: str, model, op_key: str = "") -> str | None:
         return "sql"
     if op_key.startswith("EXEC:SQL"):
         return "sql"
+    # DIBSTAT is the DL/I interface block's status field, an exact platform
+    # name like SQLCODE - every EXEC DLI sets it whether the block names it
+    # or not.
+    if upper == "DIBSTAT" or op_key.startswith("EXEC:DLI"):
+        return "dli"
     # The source names its own response channel in a `RESP(...)` operand.
     # This used to match on a `-RESP` suffix, directly contradicting the
     # docstring above it: a field is a status field because the program put
