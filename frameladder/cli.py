@@ -1880,6 +1880,113 @@ def cmd_export(args):
     return _emit(payload, args.json, render)
 
 
+def cmd_witnesses(args):
+    """Harvest a witness per direction from every run the battery makes.
+
+    The run set is the export battery - every derived plan, under every I/O
+    world, from its own state and each overlay - plus the derived sequence and
+    fault worlds. The difference from `export` is the accounting: every run
+    credits *every* direction its trace took, so nothing a run demonstrates is
+    thrown away. Runs are deduplicated by their full recipe first - 563
+    corpus targets ask for only 189 distinct states, so most of the battery
+    would otherwise be re-running a run it already credited.
+    """
+    program = _program(args)
+    entry = _entry(program, args)
+    capability, _source = _capability(args, program)
+    from .conformance_defaults import WORLDS, io_defaults
+    from .coverage import branches_of
+    from .interpreter import Interpreter
+    from .ladder import analyse, plan_for_branch
+    from .ledger import Ledger, _freeze, missing
+    from .sequences import fault_worlds, sequence_worlds
+
+    ledger = Ledger()
+    seen_runs: set = set()
+    total = 2 * len(branches_of(program))
+    overlay_pool = _overlay_pool(program, capability)
+
+    def run(state, world, stubs, terminals, source):
+        key = (_freeze(state or {}), world, _freeze(stubs or {}),
+               _freeze(terminals or {}))
+        if key in seen_runs:
+            return
+        seen_runs.add(key)
+        try:
+            interp = Interpreter(program, dict(state or {}), stubs=stubs,
+                                 terminals=terminals,
+                                 defaults=io_defaults(program, world))
+            trace = interp.run(entry)
+        except Exception:                                    # noqa: BLE001
+            return
+        ledger.credit(trace, state or {}, world, stubs, terminals, source)
+
+    # 1. Every plan, even one with an open obligation: an unsolved plan still
+    #    runs, and running the 804 unsolved measured +122 verified. The solver
+    #    got as far as it could; the run finds out what that buys.
+    for branch in branches_of(program):
+        for direction in (True, False):
+            try:
+                plan = plan_for_branch(program, branch.paragraph, branch.line,
+                                       direction, entry=args.entry,
+                                       ordinal=branch.ordinal)
+            except Exception:                                # noqa: BLE001
+                continue
+            if not plan.chain:
+                continue
+            states = [plan.input_state()]
+            states += _overlay_states(plan, overlay_pool, args.overlays,
+                                      seed=args.seed)
+            for world in WORLDS:
+                for state in states:
+                    run(state, world, plan.stub_plan(), plan.terminals,
+                        "plan:%s:%s" % (branch.paragraph, direction))
+
+    # 2. The derived outside worlds: N records then end-of-file, and the
+    #    fault at one position in the series. These are recipes in their own
+    #    right and reach code no per-direction plan reaches.
+    _graph, prov = analyse(program)
+    worlds = sequence_worlds(program, prov, prov.literals) +         fault_worlds(program, prov, prov.literals)
+    for spec in worlds:
+        states = [{}] + [{n: _rng_choice(v, args.seed + i) for n, v in
+                          overlay_pool.items()}
+                         for i in range(max(0, args.overlays))]
+        for state in states:
+            run(state, spec["world"], spec["stubs"], spec["terminals"],
+                "world:%s" % spec["name"])
+
+    gaps = missing(program, ledger)
+    payload = {"program": program.name, "entry": entry,
+               "directions_total": total,
+               "witnessed": len(ledger.witnesses),
+               "witness_pct": round(ledger.coverage(total), 1),
+               "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
+               "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
+                            "kind": b.kind, "direction": d,
+                            "condition": b.condition, "line": b.line}
+                           for b, d in gaps[: args.limit or len(gaps)]]}
+    if args.out:
+        ledger.write(args.out, program.name)
+        payload["written"] = args.out
+
+    def render(p):
+        print("%s   %d/%d directions witnessed  (%.1f%%)   %d runs"
+              % (p["program"], p["witnessed"], p["directions_total"],
+                 p["witness_pct"], p["runs"]))
+        if p["missing"]:
+            print("   first missing:")
+            for row in p["missing"][:10]:
+                print("      %-28s ord=%-3d %-6s %s   %s"
+                      % (row["paragraph"], row["ordinal"], row["kind"],
+                         row["direction"], row["condition"][:40]))
+    return _emit(payload, args.json, render)
+
+
+def _rng_choice(values, seed):
+    import random
+    return random.Random(seed).choice(values)
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -2096,6 +2203,16 @@ def build_parser():
                     help="rank the N capability additions that would unblock "
                          "the most refused plans; 0 to skip")
     rr.set_defaults(func=cmd_represent)
+
+    wt = sub.add_parser("witnesses", help="a witness per direction from "
+                                         "every run the battery makes")
+    wt.add_argument("--out", metavar="FILE")
+    wt.add_argument("--overlays", type=int, default=2)
+    wt.add_argument("--seed", type=int, default=7)
+    wt.add_argument("--limit", type=int, default=40)
+    wt.add_argument("--proxy", nargs="?", const="status",
+                    choices=["status", "outputs"])
+    wt.set_defaults(func=cmd_witnesses)
 
     dr = sub.add_parser("directions", help="how a harness's work list lands "
                                            "on this program's decisions")
