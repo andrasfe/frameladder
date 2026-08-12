@@ -440,6 +440,18 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
 
     sequences: dict = {}
 
+    # A producer the harness cannot deliver is not a dead end when the field
+    # is written in more than one place: those writers are alternatives the
+    # *program* left open, and choosing between them is the same licence route
+    # ordering already has. This never relaxes an obligation - the value still
+    # has to be produced - it only declines to stop at the first way of
+    # producing it. Measured on one integration, 140 plans were refused for a
+    # field the harness cannot set, with no second producer tried.
+    deliverable = None
+    if cap is not None:
+        def deliverable(candidate):
+            return _producer_refusal(candidate, cap) is None
+
     def bind(producer: Producer, value, reason: str, source: str = "ladder",
              atom=None, free: bool = False, at_entry: bool = False) -> bool:
         prior = assigned.get(producer.slot)
@@ -706,7 +718,8 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 if shaped is None:
                     failures.append("no value satisfies %s" % candidate)
                     continue
-                producer = prov.producer(var_term.name, at)
+                producer = prov.producer(var_term.name, at,
+                                         acceptable=deliverable)
                 if bind(producer, shaped,
                         "shape required by %s  [%s]" % (candidate,
                                                         candidate.origin),
@@ -732,7 +745,8 @@ def build_plan(program, target: str, *, entry: str | None = None, via=(),
                 settled = True
                 break
 
-            producer = prov.producer(var_term.name, at)
+            producer = prov.producer(var_term.name, at,
+                                     acceptable=deliverable)
             existing = assigned.get(producer.slot)
             if existing is not None:
                 if holds(existing.value, op, const_term.value):

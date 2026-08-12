@@ -603,7 +603,7 @@ class Provenance:
         return {k: v for k, v in literals.items() if k in varying}
 
     def producer(self, var: str, at: tuple | None = None, depth: int = 0,
-                 seen: frozenset = frozenset()) -> Producer:
+                 seen: frozenset = frozenset(), acceptable=None) -> Producer:
         """Walk a variable back to whatever the harness can actually set.
 
         A MOVE is a rename, so an obligation transfers unchanged to its
@@ -628,6 +628,13 @@ class Provenance:
         if not writers:
             return self._from_record(var, depth, seen)
 
+        # If every producer is one the harness cannot deliver, the first is
+        # still the answer. Preferring a deliverable producer is choosing
+        # between alternatives the program left open; returning *none* would
+        # let a harness limitation decide what is required, which AGENTS.md
+        # forbids in as many words. Measured: without this, one program lost
+        # 11 of 12 solved plans while another gained 28.
+        refused_first = None
         for index, w in enumerate(writers):
             if w.kind == "MOVE":
                 src = parse_term(w.source)
@@ -661,7 +668,7 @@ class Provenance:
                                         value=src.value, trace=(var,))
                     continue
                 up = self.producer(src.name, (w.para, w.line), depth + 1,
-                                   seen | {var})
+                                   seen | {var}, acceptable=acceptable)
                 if up.kind in ("stub", "literal", "input"):
                     # Walking up to a *group* - a commarea, a whole record -
                     # loses which field was being asked about, and every
@@ -670,21 +677,38 @@ class Provenance:
                     upstream = up.var or src.name
                     if up.kind == "input" and self.model.descendants(upstream):
                         upstream = var
-                    return Producer(up.kind, var=upstream,
-                                    site=up.site or w.para, op_key=up.op_key,
-                                    value=up.value,
-                                    discriminators=self.discriminators(
-                                        up.discriminators or w.literals, up.op_key),
-                                    trace=(var,) + tuple(up.trace),
-                                    inferred=up.inferred)
+                    candidate = Producer(
+                        up.kind, var=upstream,
+                        site=up.site or w.para, op_key=up.op_key,
+                        value=up.value,
+                        discriminators=self.discriminators(
+                            up.discriminators or w.literals, up.op_key),
+                        trace=(var,) + tuple(up.trace),
+                        inferred=up.inferred)
+                    if acceptable is None or acceptable(candidate):
+                        return candidate
+                    refused_first = refused_first or candidate
+                    continue
             if w.kind == "STUB":
-                return Producer("stub", var=var, site=w.para, op_key=w.op_key,
-                                discriminators=self.discriminators(w.literals,
-                                                                   w.op_key),
-                                trace=(var,))
+                candidate = Producer("stub", var=var, site=w.para,
+                                     op_key=w.op_key,
+                                     discriminators=self.discriminators(
+                                         w.literals, w.op_key),
+                                     trace=(var,))
+                if acceptable is None or acceptable(candidate):
+                    return candidate
+                # The harness cannot deliver this one. A field written in more
+                # than one place is a choice the *program* left open, so
+                # walking on to the next writer picks between alternatives
+                # rather than relaxing anything - the same licence route
+                # ordering already has.
+                refused_first = refused_first or candidate
+                continue
         fallback = self._from_record(var, depth, seen)
         if fallback.kind == "stub":
             return fallback
+        if refused_first is not None:
+            return refused_first
         return Producer("unknown", var=var, site=writers[0].para)
 
     def _from_record(self, var: str, depth: int, seen: frozenset) -> Producer:

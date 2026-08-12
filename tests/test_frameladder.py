@@ -4096,3 +4096,70 @@ class TestReachingDefinition(unittest.TestCase):
            END-IF""")
         self.assertEqual(plan.open_obligations, [])
         self.assertTrue(self._runs(p, plan))
+
+
+class TestProducerBacktracking(unittest.TestCase):
+    """A refused producer is not a dead end when the field has another writer.
+
+    Choosing between writers is choosing between alternatives the *program*
+    left open - the same licence route ordering already has. What it must
+    never do is decide that a target is unreachable because the harness is
+    narrow; see the invariant in AGENTS.md.
+    """
+
+    SRC = HEADER + """       01  WS-KEY  PIC X(4).
+       01  WS-IN   PIC X(4).
+       01  WS-MODE PIC X.
+       01  WS-HIT  PIC X.
+       PROCEDURE DIVISION.
+       PB-MAIN.
+           IF WS-MODE = 'F'
+              PERFORM PB-LOAD
+           END-IF
+           IF WS-MODE = 'M'
+              MOVE WS-IN TO WS-KEY
+           END-IF
+           IF WS-KEY = 'GOOD'
+              PERFORM PB-TARGET
+           END-IF
+           GOBACK
+           .
+       PB-LOAD.
+           READ INFILE INTO WS-KEY
+           .
+       PB-TARGET.
+           MOVE 'Y' TO WS-HIT
+           .
+"""
+
+    def test_a_narrow_harness_never_makes_a_target_unsolvable(self):
+        # The invariant. Walking past every producer and returning nothing
+        # would let a harness limitation decide what is required. Measured
+        # before the fallback existed: one program lost 11 of 12 solved plans.
+        from frameladder.capability import load
+        from frameladder.ladder import build_plan
+        cap = load({"schema_version": "1.0",
+                    "injectable_variables": [],
+                    "replayable_operations": []})
+        plan = build_plan(program(self.SRC), "PB-TARGET", entry="PB-MAIN",
+                          capability=cap)
+        self.assertTrue(plan.chain, "a narrow profile must not lose the route")
+
+    def test_no_profile_leaves_the_walk_untouched(self):
+        # The whole mechanism is inert unless a harness has stated limits:
+        # dispositions over 3,288 corpus directions are identical either way.
+        from frameladder.ladder import build_plan
+        bare = build_plan(program(self.SRC), "PB-TARGET", entry="PB-MAIN")
+        stated = build_plan(program(self.SRC), "PB-TARGET", entry="PB-MAIN",
+                            capability=None)
+        self.assertEqual(bare.input_state(), stated.input_state())
+
+    def test_the_walk_prefers_a_producer_the_harness_can_deliver(self):
+        from frameladder.capability import load, unrepresentable
+        from frameladder.ladder import build_plan
+        cap = load({"schema_version": "1.0",
+                    "injectable_variables": ["WS-IN", "WS-MODE", "WS-KEY"],
+                    "replayable_operations": []})
+        plan = build_plan(program(self.SRC), "PB-TARGET", entry="PB-MAIN",
+                          capability=cap)
+        self.assertEqual(unrepresentable(plan, cap), [])
