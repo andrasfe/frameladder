@@ -134,6 +134,13 @@ def stub_outputs(text: str) -> list[str]:
     flat = norm(text)
     if re.search(r"\bEXEC\s+(CICS|SQL|DLI)\b", flat, re.I):
         out: list[str] = []
+        if re.search(r"\bEXEC\s+DLI\b", flat, re.I):
+            # Every DL/I call sets the DIB status, named in the block or not
+            # - the same implicit channel EXEC SQL has in SQLCODE. Without
+            # this no writer is recorded for DIBSTAT, so every WHEN arm on
+            # it looks unproducible and the whole retrieval loop after it is
+            # dark.
+            out.append("DIBSTAT")
         if re.search(r"\bEXEC\s+SQL\b", flat, re.I):
             # Every SQL statement sets SQLCODE whether it mentions it or not;
             # it is the DB2 equivalent of a file status and the thing every
