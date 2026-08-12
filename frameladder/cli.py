@@ -1375,8 +1375,16 @@ _RUN_STAGES = ("target_not_reached", "decision_not_observed", "wrong_direction",
                "step_limit", "loop_limit", "verified")
 
 
+# How much a run got done, worst last. A plan is exported together with the
+# world and entry state it was best under, so the disposition has to describe
+# that pair rather than an arbitrary one of them.
+_HOW_FAR = ("verified", "wrong_direction", "decision_not_observed",
+            "target_not_reached", "loop_limit", "step_limit",
+            "planner_exception")
+
+
 def _verify_direction(program, plan, branch, direction: bool, entry: str,
-                      sink: dict | None = None):
+                      sink: dict | None = None, worlds=("bare",), states=()):
     """Did this plan actually take the decision the way it was asked to?
 
     Returns one of the run dispositions and a sentence for the histogram.
@@ -1388,26 +1396,77 @@ def _verify_direction(program, plan, branch, direction: bool, entry: str,
     decision is identified the same way everywhere else in this repository:
     paragraph, ordinal within that paragraph, kind. Line is not enough,
     because COPY expansion puts several decisions on one.
+
+    **A plan pins the slots its obligations reached and leaves the rest.**
+    That is true on the input axis, where `coverage --overlays` has always
+    filled the remainder, and it is equally true on the I/O axis, where every
+    operation the plan did not pin took the `bare` world - files absent - on
+    every single run. `bare` is the right default for the conformance
+    harnesses, which compare against GnuCOBOL with no data files staged, and
+    it is the wrong one for a batch program, whose first act is to open its
+    files and abend if that failed.
+
+    So the free slots are searched rather than defaulted: ``worlds`` names the
+    I/O worlds to try and ``states`` the entry states, and the first pair that
+    takes the direction wins. Measured over the 3,288 CardDemo directions,
+    `bare` alone verifies 804; the three worlds verify 938 and two overlays
+    verify 991, and together 1,127 - 1,161 once the worlds also answer the
+    EXEC axis. The world gain is entirely on the ten programs that declare a
+    file - 191/578 to 325/578 - and exactly zero on the other nineteen, which
+    is the mechanism saying what it is.
+
+    Both defaults reproduce the previous behaviour exactly, so a caller that
+    wants one run in `bare` still gets one run in `bare`. The pair that won is
+    written to ``sink`` so the exported candidate can carry it; a candidate
+    that says nothing about which world it needs is a candidate the harness
+    will run in the wrong one.
     """
+    best = None
+    for world in (worlds or ("bare",)):
+        for index, state in enumerate((None,) + tuple(states)):
+            outcome = _verify_once(program, plan, branch, direction, entry,
+                                   world, state)
+            if best is None or (_HOW_FAR.index(outcome[0])
+                                < _HOW_FAR.index(best[0])):
+                best = outcome + (world, index)
+            if best[0] == "verified":
+                break
+        if best is not None and best[0] == "verified":
+            break
+    verdict, detail, probe, world, index = best
+    if sink is not None:
+        sink.update(probe)
+        sink["world"] = world
+        sink["state_index"] = index
+    return verdict, detail
+
+
+def _verify_once(program, plan, branch, direction: bool, entry: str,
+                 world: str, state: dict | None):
+    """One run, and what it says. Returns ``(verdict, detail, probe)``."""
     from .interpreter import MAX_STEPS, Interpreter
     from .conformance_defaults import io_defaults
 
+    probe: dict = {}
     try:
-        interp = Interpreter(program, plan.input_state(),
+        interp = Interpreter(program,
+                             plan.input_state() if state is None else state,
                              stubs=plan.stub_plan(), terminals=plan.terminals,
-                             defaults=io_defaults(program, "bare"))
+                             defaults=io_defaults(program, world))
         trace = interp.run(entry)
     except Exception as exc:                                 # noqa: BLE001
-        return "planner_exception", "interpreter raised %s" % type(exc).__name__
+        return ("planner_exception",
+                "interpreter raised %s" % type(exc).__name__, probe)
 
     # Limits first: a run that stopped early did not decline to take the
     # direction, it never got the chance, and calling that a wrong direction
     # would send someone to fix the solver instead of the budget.
     if trace.runaway:
-        return "loop_limit", "loop did not terminate in %s" % trace.runaway
+        return ("loop_limit", "loop did not terminate in %s" % trace.runaway,
+                probe)
     if trace.steps >= MAX_STEPS:
-        return "step_limit", ("ran out of statement budget (%d) before the "
-                              "decision" % MAX_STEPS)
+        return ("step_limit", "ran out of statement budget (%d) before the "
+                              "decision" % MAX_STEPS, probe)
 
     key = (branch.paragraph, branch.ordinal, branch.kind)
     seen = {bool(g.result) for g in trace.guards
@@ -1415,10 +1474,9 @@ def _verify_direction(program, plan, branch, direction: bool, entry: str,
                 _KIND_OF_GUARD.get(g.kind, g.kind)) == key}
     if seen:
         if bool(direction) in seen:
-            return "verified", ""
-        return "wrong_direction", ("%s ordinal %d went only %s"
-                                   % (branch.paragraph, branch.ordinal,
-                                      sorted(seen)[0]))
+            return "verified", "", probe
+        return ("wrong_direction", "%s ordinal %d went only %s"
+                % (branch.paragraph, branch.ordinal, sorted(seen)[0]), probe)
     if branch.paragraph not in trace.entered_set:
         # How far along its *own chain* did the run get? On both corpora the
         # answer is nearly all of it - the modal shapes are 2/3, 1/2, 3/4 - so
@@ -1433,18 +1491,17 @@ def _verify_direction(program, plan, branch, direction: bool, entry: str,
             else:
                 break
         missing = chain[reached] if reached < len(chain) else ""
-        if sink is not None and chain:
-            sink["reached"] = reached
-            sink["chain"] = len(chain)
-            sink["missing"] = missing
+        if chain:
+            probe["reached"] = reached
+            probe["chain"] = len(chain)
+            probe["missing"] = missing
         detail = "never entered %s" % branch.paragraph
         if chain:
             detail = ("reached %d/%d of the chain; first missing frame %s"
                       % (reached, len(chain), missing or "-"))
-        return "target_not_reached", detail
-    return "decision_not_observed", ("entered %s but ordinal %d was never "
-                                     "evaluated" % (branch.paragraph,
-                                                    branch.ordinal))
+        return "target_not_reached", detail, probe
+    return ("decision_not_observed", "entered %s but ordinal %d was never "
+            "evaluated" % (branch.paragraph, branch.ordinal), probe)
 
 
 # The interpreter names a loop by the verb it saw, `branches_of` by what it
@@ -1474,6 +1531,65 @@ def _obligation_text(obligation) -> str:
     return "no value derived for %s" % joined
 
 
+def _overlay_pool(program, capability=None) -> dict:
+    """Values for the slots a plan leaves free, from the program's own words.
+
+    Every literal the source compares a field against, plus the one value it
+    compares against nothing - without a complement, a field tested only for
+    SPACES has a single reachable state and the negative direction of its own
+    comparison cannot be reached by any draw. This is the same pool
+    `cmd_coverage` builds; it is here because a plan pins only the slots its
+    obligations reached and the export path had never filled the rest.
+
+    Filtered through the profile, because an overlay the harness cannot inject
+    is a value that will be dropped in projection - and a plan that verified
+    *because of* a dropped value is precisely the silent failure
+    :mod:`frameladder.capability` exists to stop.
+    """
+    from .heuristics import complement_value
+    from .ladder import analyse
+
+    try:
+        _graph, prov = analyse(program)
+    except Exception:                                        # noqa: BLE001
+        return {}
+    pool: dict = {}
+    for name, values in (getattr(prov, "literals", {}) or {}).items():
+        if not values:
+            continue
+        if capability is not None and getattr(capability, "stated", False) \
+                and not capability.can_inject(name):
+            continue
+        ordered = sorted(values, key=repr)
+        other = complement_value(name, program.model.pic_of(name), ordered)
+        if other is not None:
+            ordered = ordered + [other]
+        pool[name] = ordered
+    return pool
+
+
+def _overlay_states(plan, pool: dict, count: int, seed: int = 0) -> list:
+    """``count`` entry states that keep every value the plan derived and fill
+    the remaining slots from the pool.
+
+    Seeded, so the same command gives the same states every time: an exported
+    candidate whose input state changes between runs is not a test.
+    """
+    if not pool or count <= 0:
+        return []
+    import random
+
+    fixed = plan.input_state()
+    rng = random.Random(seed)
+    out = []
+    for _ in range(count):
+        state = {n: rng.choice(v) for n, v in sorted(pool.items())
+                 if n not in fixed}
+        state.update(fixed)
+        out.append(state)
+    return out
+
+
 def cmd_export(args):
     """Plan every uncovered direction the harness asked for, and account for
     every one that did not make it.
@@ -1489,10 +1605,13 @@ def cmd_export(args):
     capability, source = _capability(args, program)
     entry = _entry(program, args)
     from .capability import unrepresentable
+    from .conformance_defaults import io_defaults, WORLDS
     from .coverage import branches_of
     from .ladder import plan_for_branch, plan_representable, precheck
     from .replay import replay_script
 
+    worlds = WORLDS if getattr(args, "worlds", True) else ("bare",)
+    overlay_pool = _overlay_pool(program, capability)
     resolution = capability.resolve_uncovered(program)
     wanted = resolution.wanted
     counts = {stage: 0 for stage in _STAGES}
@@ -1514,6 +1633,11 @@ def cmd_export(args):
     reach_profile: dict = {}
     missing_frames: dict = {}
     last_hop = [0]
+    # Which of the free slots the verification actually had to spend. Both are
+    # counts of *attempts*, not of successes, so a run that never needed
+    # anything but `bare` says so.
+    world_used: dict = {}
+    overlaid = [0]
 
     def note(bucket: str, text: str) -> None:
         key = "%s: %s" % (bucket, text)
@@ -1602,8 +1726,15 @@ def cmd_export(args):
             # arriving. Counting those as successes is how a witness comes
             # back green having covered nothing.
             probe: dict = {}
+            states = _overlay_states(plan, overlay_pool, args.overlays,
+                                     seed=args.seed)
             verdict, detail = _verify_direction(program, plan, branch,
-                                                direction, entry, sink=probe)
+                                                direction, entry, sink=probe,
+                                                worlds=worlds, states=states)
+            world_used[probe.get("world", "bare")] = \
+                world_used.get(probe.get("world", "bare"), 0) + 1
+            if verdict == "verified" and probe.get("state_index"):
+                overlaid[0] += 1
             if probe.get("chain"):
                 shape = "%d/%d" % (probe["reached"], probe["chain"])
                 reach_profile[shape] = reach_profile.get(shape, 0) + 1
@@ -1621,8 +1752,18 @@ def cmd_export(args):
                    "condition": branch.condition, "line": branch.line}
             rows.append(row)
             if args.out:
-                script = replay_script(plan, capability, program=program,
-                                       entry=entry)
+                # The world and the entry state that took the direction are
+                # part of the candidate, not context the reader is expected to
+                # infer. A script that says nothing about which world it needs
+                # is a script the harness will run in the wrong one, and it
+                # will come back green having covered nothing.
+                index = probe.get("state_index", 0)
+                script = replay_script(
+                    plan, capability, program=program, entry=entry,
+                    io_world=probe.get("world", "bare"),
+                    io_defaults=io_defaults(program,
+                                            probe.get("world", "bare")),
+                    entry_state=states[index - 1] if index else None)
                 script["direction"] = row
                 scripts.append(script)
             if args.limit and counts["verified"] >= args.limit:
@@ -1644,6 +1785,12 @@ def cmd_export(args):
         "work_list": resolution.summary(),
         "attempted": attempted, "counts": counts,
         "rerouted_after_refusal": rerouted[0],
+        "free_slots": {"worlds_offered": list(worlds),
+                       "best_world": dict(sorted(world_used.items(),
+                                                 key=lambda kv: -kv[1])),
+                       "overlays_offered": args.overlays,
+                       "overlay_pool": len(overlay_pool),
+                       "verified_by_an_overlay": overlaid[0]},
         "reach_profile": dict(sorted(reach_profile.items(),
                                      key=lambda kv: -kv[1])[:20]),
         "last_hop_failures": last_hop[0],
@@ -1698,6 +1845,14 @@ def cmd_export(args):
         if p["rerouted_after_refusal"]:
             print("\n   %d refusals answered by a second route"
                   % p["rerouted_after_refusal"])
+        free = p["free_slots"]
+        print("\n   free slots: %d overlay(s) from a pool of %d, %d "
+              "direction(s) took one" % (free["overlays_offered"],
+                                         free["overlay_pool"],
+                                         free["verified_by_an_overlay"]))
+        print("   best I/O world per direction: %s"
+              % (", ".join("%s %d" % kv for kv in free["best_world"].items())
+                 or "none run"))
         if p["reasons"]:
             print("\n   why")
             for reason, count in p["reasons"].items():
@@ -1945,7 +2100,22 @@ def build_parser():
     ex.add_argument("--no-precheck", dest="precheck", action="store_false",
                     help="solve every target even when the route is already "
                          "known to need something the harness cannot carry")
-    ex.set_defaults(func=cmd_export, precheck=True)
+    # The free slots a plan leaves behind, on both axes. Defaults on, because
+    # `bare` with no overlay is one point in the space and the plans were
+    # never checked anywhere else: measured over CardDemo's 3,288 directions,
+    # 804 verify at that point and 1,161 across the space.
+    ex.add_argument("--bare-only", dest="worlds", action="store_false",
+                    help="verify only in the `bare` I/O world instead of "
+                         "every one; a plan pins the operations its "
+                         "obligations reached and the rest take the world")
+    ex.add_argument("--overlays", type=int, default=2, metavar="N",
+                    help="entry states per plan that fill the slots the "
+                         "obligations left free, drawn from the program's own "
+                         "literals; 0 uses only what the plan derived")
+    ex.add_argument("--seed", type=int, default=0,
+                    help="seed for the overlay draws, so a candidate's input "
+                         "state is the same on every run")
+    ex.set_defaults(func=cmd_export, precheck=True, worlds=True)
 
     b = sub.add_parser("bind", help="record a decision the agent made")
     b.add_argument("--bind", action="append", required=True, metavar="VAR=VALUE")

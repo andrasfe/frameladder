@@ -398,6 +398,114 @@ Sampling saturates early — 100 draws gets within a point of 1,500 — so the
 default is small on purpose. Ranking it above `--routes` retries would be the
 wrong lesson: what makes the union work is that the two are uncorrelated.
 
+## A plan pins some slots and leaves the rest, on both axes
+
+The four mechanisms above all live in `coverage`. `export` — the path a
+harness actually consumes, and the one that produces the "N planned, 0
+verified" report an integration sees — had none of them. `_verify_direction`
+ran each plan exactly once, in the `bare` world, with only the values the
+obligations reached. That is one point in the space, and the plans had never
+been checked anywhere else.
+
+Measured over CardDemo's 3,288 branch directions, through `cmd_export` rather
+than a copy of it:
+
+| verification | verified | share |
+|---|---:|---:|
+| one run, `bare`, no overlay (before) | 804 | 24.5% |
+| three I/O worlds only | 938 | 28.5% |
+| two free-input overlays only | 991 | 30.1% |
+| both, plus the EXEC axis (now) | **1,161** | **35.3%** |
+
+Re-measured off-corpus - the two `app-*` applications, `app-vsam-mq`, and
+three programs by unrelated authors including a scrambled production-derived
+one, 13 programs and 2,182 directions - **888 -> 962 (40.7% -> 44.1%)**. The
+smaller gain is the mechanism again: ten of those thirteen declare no file,
+so only the input axis can move them. `loop_limit` falls 333 -> 252 and
+`step_limit` 62 -> 0 on that corpus, and 191 -> 0 on CardDemo, because a
+`PERFORM UNTIL end-of-file` over an indexed file that answers 35 forever is a
+runaway loop and in no other world is it one.
+
+Three things about that number are worth more than the number.
+
+**The two axes are almost independent and they compose.** Holding the EXEC
+axis out so the three variants are the same code: +134 and +187 separately,
++323 together. Same shape the README already reports for the four `coverage`
+mechanisms. The remaining +34 to 1,161 is the EXEC axis plus a different
+ordering of the overlay pool.
+
+**The I/O world is worth everything on batch and exactly zero on CICS.** The
++134 is 191→325 on the ten programs that declare a `SELECT`, and 613→613 on
+the other nineteen. That is not a bias to correct for; it is the mechanism
+saying what it is. A batch program's first act is to open its files and abend
+if that failed, so in `bare` it runs four paragraphs: an empty state enters
+4/17 of CBACT01C and 6/27 of CBTRN02C, against 17/17 and 25/27 across the
+worlds. Pooled paragraph reach over the corpus goes 214/570 to 318/570.
+
+**The world model only spoke about files.** 120 of CardDemo's 218 external
+operations are `EXEC`, and 19 of its 29 programs declare no `SELECT` at all,
+so `io_defaults` returned `{}` and all three worlds were the identical run.
+The non-`bare` worlds now answer the EXEC axis too, from `faults.channel_of`,
+which is evidence — a `FILE STATUS IS`, a `RESP` operand, `SQLCODE` — and
+never a name. Worth +10 on its own here, and it is the only part of the
+mechanism that can reach a program whose I/O is all SQL or DL/I.
+
+**Where it stops.** `faults.channel_of` knows three channels - a SELECT's
+`FILE STATUS`, `SQLCODE`, a CICS `RESP` operand - and DL/I is not one of
+them. On the one batch IMS+DB2 program available, `CBPAUP0C`, the whole gain
+(5 -> 13 of 52) came from the input axis and the world axis was worth zero,
+because its status comes back in the PCB mask of a `CALL 'CBLTDLI'` and
+provenance records two stub outputs for the entire program. A `dli` channel
+would be evidence in exactly the sense the other three are - the CALL names
+its PCB - and it is the piece missing for an estate whose I/O is DL/I rather
+than VSAM. It is written down rather than built because one program is not a
+measurement.
+
+The world that verified a direction is exported with the candidate
+(`io_world`, `io_defaults` in the replay script) and refused through
+`can_replay` when the harness cannot stage it. A candidate verified with the
+files present and replayed with them absent abends at its first OPEN and
+comes back green having covered nothing, which is the failure
+`frameladder.capability` exists to stop; leaving the world implicit was the
+same defect one axis over.
+
+`--bare-only --overlays=0` reproduces the previous behaviour exactly, and the
+conformance harnesses are untouched: they call their own `io_defaults`, and
+`bare` is unchanged on both axes.
+
+## The shape of a derivation-based failure, measured
+
+Three numbers from a sweep of all 3,288 directions, each recorded per
+direction rather than pooled after the fact.
+
+**Success halves with every frame of chain.** Verified share by chain length:
+45.5% at 1, 36.9% at 2, 16.5% at 3, 9.5% at 4, and **0 of 261** at 5 or more.
+Excluding the one program that dominates the deep tail it is 45.5 / 37.2 /
+21.6 / 13.7 / 0. The same gradient on paragraphs: of the ones no run ever
+enters, the discriminator is not depth itself but guards on the way in — 121
+of 141 paragraphs with no guard on the route are entered, against 62 of 217
+with five or more.
+
+**A run covers far more than the direction it was built for.** Median 54
+directions per run, p90 92, max 355. The 2,484 runs a sweep makes see 1,941
+distinct directions between them while the tool credits itself with 804, and
+336 of those runs reproduce the whole union. Crediting what a run actually
+observed and skipping directions already covered would build 1,911 plans
+instead of 3,288 — **42% of the planning budget goes to directions an
+already-built plan had covered.** Nothing about the union is new coverage;
+what is wrong is the accounting and the budget, not the reach.
+
+**Two search ideas were built and measured, and both are close to zero.**
+Trying the next `k` route options whenever a plan solves but fails to reach —
+today `plan_for_branch` reroutes only when the obligations come back
+*contested* — is **+38 of 3,288**. Offering the entry state of a verified
+direction as `preferred` to directions sharing its chain prefix, which is what
+`witness.WitnessStore` was built for and which is imported by nothing outside
+its own unit tests, is **+1**. Neither is worth the code; both are recorded
+because "the boring thing won" is the useful part. The 69% of unreached plans
+that miss only the *last* hop are the same finding open item 0 already names,
+arrived at from the run side.
+
 ## Reporting honestly
 
 Paragraph coverage is close to free on this corpus: an empty state already

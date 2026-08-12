@@ -135,20 +135,32 @@ def operation_series(op_key: str, entries, terminal=None,
 
 
 def replay_script(plan, capability=None, *, program=None, entry: str = "",
-                  world: dict | None = None) -> dict:
+                  world: dict | None = None, io_world: str = "",
+                  io_defaults: dict | None = None,
+                  entry_state: dict | None = None) -> dict:
     """Everything one test needs, and every reason it cannot be run.
 
     ``world`` accepts a sequence world from :mod:`frameladder.sequences` -
     "this operation fails on its second call and succeeds either side" is an
     outcome list and there is no other way to say it - and replaces the plan's
     own operation series with it.
+
+    ``io_world`` and ``io_defaults`` say what the *unplanned* operations do:
+    the plan pins the ones its obligations reached and every other one takes
+    whatever the environment gives it. Leaving that implicit is the same class
+    of silent loss this module exists to stop - a plan verified with the files
+    present, replayed with them absent, abends at its first OPEN and reports
+    covering nothing. ``entry_state`` likewise replaces the plan's own state
+    when a free-slot overlay is what took the direction, so what is exported
+    is the state that was actually run.
     """
     cap = _cap(capability)
     stubs = dict((world or {}).get("stubs") or plan.stub_plan())
     terminals = dict((world or {}).get("terminals") or plan.terminals or {})
 
     inputs, refused_inputs = {}, []
-    for name, value in plan.input_state().items():
+    for name, value in (entry_state if entry_state is not None
+                        else plan.input_state()).items():
         if cap.can_inject(name):
             inputs[name] = value
         else:
@@ -163,7 +175,22 @@ def replay_script(plan, capability=None, *, program=None, entry: str = "",
     for key in sorted(set(terminals) - set(stubs)):
         operations.append(operation_series(key, (), terminals[key], cap))
 
+    # The environment behind the operations the plan did not pin. Refused the
+    # same way an outcome is: a harness that cannot drive an operation cannot
+    # put it in this world either, and it should be told rather than left to
+    # discover it.
+    environment, refused_env = {}, []
+    for key, values in sorted((io_defaults or {}).items()):
+        if cap.can_replay(key):
+            environment[key] = dict(values)
+        else:
+            refused_env.append("cannot replay %s, so the %s world cannot be "
+                               "set up for it" % (key, io_world or "chosen"))
+
     reasons = list(unrepresentable(plan, cap))
+    for reason in refused_env:
+        if reason not in reasons:
+            reasons.append(reason)
     for entry_ in refused_inputs:
         if entry_["why"] not in reasons:
             reasons.append(entry_["why"])
@@ -187,6 +214,9 @@ def replay_script(plan, capability=None, *, program=None, entry: str = "",
         "target": plan.target,
         "entry": (entry or (plan.chain[0] if plan.chain else "")).upper(),
         "world": (world or {}).get("name", ""),
+        "io_world": io_world,
+        "io_defaults": environment,
+        "overlaid": entry_state is not None,
         "solved": plan.solved,
         "representable": not reasons,
         "reasons": reasons,
