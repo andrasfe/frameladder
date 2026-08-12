@@ -2997,6 +2997,142 @@ class TestDirectionVerification(unittest.TestCase):
         self.assertEqual(_KIND_OF_GUARD.get("PERFORM_VARYING"), "LOOP")
 
 
+class TestVerificationWorld(unittest.TestCase):
+    """A plan is verified in a world, and `bare` is not the only honest one.
+
+    The shape of batch COBOL: open the files, abend if that failed, then loop.
+    Under `bare` the files are absent, so an indexed OPEN INPUT gives 35, the
+    program abends in its prologue, and every decision past it is unreachable
+    no matter what the plan binds. Verification ran only in `bare` while
+    `coverage` had been running every plan in every world since the worlds
+    were named - so the two disagreed about what the same plan reached, and
+    the disagreement was reported as a fact about the solver.
+
+    Measured on the ten CardDemo batch programs: 202 of the 222 plans that
+    stopped short did so on `CEE3ABD`, and 190 of them had entered exactly one
+    frame of their own chain. Corpus-wide the change is 804 -> 938 verified.
+    """
+
+    SRC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INFILE
+                  ORGANIZATION IS INDEXED
+                  ACCESS MODE IS SEQUENTIAL
+                  RECORD KEY IS IN-KEY
+                  FILE STATUS IS WS-ST.
+       DATA DIVISION.
+       FILE SECTION.
+       FD  IN-FILE.
+       01  IN-REC.
+           05  IN-KEY PIC X(8).
+       WORKING-STORAGE SECTION.
+       01  WS-ST PIC XX.
+       01  WS-EOF PIC X VALUE 'N'.
+       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       WV-MAIN.
+           OPEN INPUT IN-FILE
+           IF WS-ST NOT = '00'
+              PERFORM WV-ABEND
+           END-IF
+           PERFORM WV-WORK
+           GOBACK
+           .
+       WV-ABEND.
+           CALL 'CEE3ABD'
+           .
+       WV-WORK.
+           IF WS-A = 'A'
+              MOVE 'Z' TO WS-A
+           END-IF
+           GOBACK
+           .
+"""
+
+    def _branch(self, prog):
+        from frameladder.coverage import branches_of
+        hits = [b for b in branches_of(prog) if b.paragraph == "WV-WORK"]
+        return hits[0]
+
+    def _plan(self, prog, branch):
+        from frameladder.ladder import plan_for_branch
+        return plan_for_branch(prog, "WV-WORK", branch.line, True,
+                               entry="WV-MAIN", ordinal=branch.ordinal)
+
+    def test_bare_alone_cannot_reach_past_a_failed_open(self):
+        # Not a fact about the plan: the run never got the chance.
+        from frameladder.cli import _verify_direction
+        prog = program(self.SRC)
+        branch = self._branch(prog)
+        verdict, detail = _verify_direction(
+            prog, self._plan(prog, branch), branch, True, "WV-MAIN",
+            worlds=("bare",))
+        self.assertEqual(verdict, "target_not_reached")
+        self.assertIn("CEE3ABD", detail)
+
+    def test_a_world_where_the_files_open_verifies_the_same_plan(self):
+        from frameladder.cli import _verify_direction
+        prog = program(self.SRC)
+        branch = self._branch(prog)
+        sink = {}
+        verdict, _detail = _verify_direction(
+            prog, self._plan(prog, branch), branch, True, "WV-MAIN",
+            sink=sink)
+        self.assertEqual(verdict, "verified")
+        # And it says which world, because a witness that needs the files to
+        # open is a witness the harness has to be told about.
+        self.assertEqual(sink.get("world"), "populated")
+
+    def test_bare_is_tried_first_so_a_witness_asks_for_the_least(self):
+        # Ordering is meaning here: the cheapest world that works is the one
+        # reported, so nothing demands staged data it does not need.
+        from frameladder.cli import _verify_direction
+        from frameladder.conformance_defaults import WORLDS
+        from frameladder.coverage import branches_of
+        from frameladder.ladder import plan_for_branch
+        self.assertEqual(WORLDS[0], "bare")
+        prog = program(TestDirectionVerification.SRC)
+        branch = [b for b in branches_of(prog)
+                  if b.paragraph == "DV-INNER"][0]
+        plan = plan_for_branch(prog, "DV-INNER", branch.line, True,
+                               entry="DV-MAIN", ordinal=branch.ordinal)
+        sink = {}
+        verdict, _detail = _verify_direction(prog, plan, branch, True,
+                                             "DV-MAIN", sink=sink)
+        self.assertEqual(verdict, "verified")
+        self.assertEqual(sink.get("world"), "bare")
+
+    def test_the_world_never_overrides_what_the_plan_forced(self):
+        # The free/forced invariant, applied to the outside world: defaults
+        # fill only operations the plan planned no outcome for. A world that
+        # could overwrite a planned status would let a convenience contradict
+        # something the program requires.
+        from frameladder.interpreter import Interpreter
+        from frameladder.conformance_defaults import io_defaults
+        prog = program(self.SRC)
+        stubs = {"OPEN-INPUT:IN-FILE": [{"when": {}, "set": {"WS-ST": "35"},
+                                         "seq": 0, "inferred": False}]}
+        trace = Interpreter(prog, {}, stubs=stubs,
+                            defaults=io_defaults(prog, "populated")
+                            ).run("WV-MAIN")
+        self.assertIn("WV-ABEND", trace.entered_set,
+                      "a planned failure must survive a populated world")
+
+    def test_every_world_is_a_declared_world(self):
+        from frameladder.conformance_defaults import WORLDS
+        from frameladder.cli import _REACH_RANK
+        self.assertEqual(set(WORLDS), {"bare", "populated", "empty"})
+        # The rank exists to pick which run to *report*; it must never be able
+        # to promote something to verified, which the guard event alone
+        # decides. So verified is strictly the top and nothing ties with it.
+        self.assertEqual(max(_REACH_RANK, key=_REACH_RANK.get), "verified")
+        self.assertEqual(sum(1 for v in _REACH_RANK.values()
+                             if v == _REACH_RANK["verified"]), 1)
+
+
 class TestRefusalKinds(unittest.TestCase):
     """A refusal's *kind* is what says who fixes it."""
 
