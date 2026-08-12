@@ -2029,6 +2029,22 @@ def cmd_witnesses(args):
                 run(state, spec["world"], spec["stubs"], spec["terminals"],
                     "reentry:%s|world:%s" % (name, spec["name"]))
 
+    # 2.3 The greedy repair loop, over every long first-match WHEN cascade
+    #     with missing directions. The battery's own recipes are its bases:
+    #     it runs the best one, reads which validation arm fired, repairs
+    #     that one field from the edit's own evidence, and reruns to a
+    #     fixpoint - then spoils one field at a time off the passing state.
+    #     Before the stub and frontier phases on purpose: every recipe it
+    #     witnesses is a base the stub search can stage against and a seed
+    #     the lift can extend.
+    repair_report = None
+    if args.repair:
+        from .repair import repair as _repair
+        repair_report = _repair(
+            program, prov, ledger, run, entry=entry, budget=args.repair,
+            defaults_for=lambda w: io_defaults(program, w),
+            on_witness=lift_seeds.append)
+
     # 2.5 The staged stub search, worked backward from what is still
     #     missing: which operation writes the tested field (provenance),
     #     which codes the arms name (the program's own DFHRESP list, OTHER
@@ -2104,6 +2120,9 @@ def cmd_witnesses(args):
     if stub_report is not None:
         stub_report["reproduction"] = _stub_reproduction(program, entry,
                                                          ledger, io_defaults)
+    if repair_report is not None:
+        repair_report["reproduction"] = _stub_reproduction(
+            program, entry, ledger, io_defaults, prefix="repair:")
 
     gaps = missing(program, ledger)
     payload = {"program": program.name, "entry": entry,
@@ -2112,6 +2131,7 @@ def cmd_witnesses(args):
                "witness_pct": round(ledger.coverage(total), 1),
                "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
                "lift": lift_report,
+               "repair": repair_report,
                "stub_search": stub_report,
                "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
                             "kind": b.kind, "direction": d,
@@ -2125,6 +2145,15 @@ def cmd_witnesses(args):
         print("%s   %d/%d directions witnessed  (%.1f%%)   %d runs"
               % (p["program"], p["witnessed"], p["directions_total"],
                  p["witness_pct"], p["runs"]))
+        if p.get("repair"):
+            rr = p["repair"]
+            rep = rr["reproduction"]
+            print("   repair: %d runs, %d cascades (%d passed), "
+                  "%d arms repaired, %d spoiled, %d stalled, "
+                  "reproduction %d/%d (%.1f%%)"
+                  % (rr["runs"], rr["cascades"], rr["passed"],
+                     rr["repaired_arms"], rr["spoiled"], len(rr["stalled"]),
+                     rep["reproduced"], rep["witnesses"], rep["rate_pct"]))
         if p.get("stub_search"):
             ss = p["stub_search"]
             rep = ss["reproduction"]
@@ -2154,10 +2183,11 @@ def _rng_choice(values, seed):
     return random.Random(seed).choice(values)
 
 
-def _stub_reproduction(program, entry: str, ledger, io_defaults) -> dict:
-    """Re-run every stub-search witness from its stored recipe, and count.
+def _stub_reproduction(program, entry: str, ledger, io_defaults,
+                       prefix: str = "stub:") -> dict:
+    """Re-run every witness of one phase from its stored recipe, and count.
 
-    The phase only ever credits through a fresh interpreter run of the exact
+    The phases only ever credit through a fresh interpreter run of the exact
     recipe stored, so this *should* be 100% - which is precisely why it is
     measured rather than asserted: a recipe that stops reproducing means the
     staging drifted from what the ledger records, and that defect class is
@@ -2169,7 +2199,7 @@ def _stub_reproduction(program, entry: str, ledger, io_defaults) -> dict:
     took: dict = {}
     report = {"witnesses": 0, "reproduced": 0, "rate_pct": 0.0}
     for key, recipe in ledger.witnesses.items():
-        if not recipe.source.startswith("stub:"):
+        if not recipe.source.startswith(prefix):
             continue
         report["witnesses"] += 1
         if recipe not in took:
@@ -2417,6 +2447,12 @@ def build_parser():
                     help="up to N frontier-search runs after the battery, "
                          "each replayed through a fresh interpreter before "
                          "its directions are credited; 0 disables")
+    wt.add_argument("--repair", type=int, default=200, metavar="N",
+                    help="up to N greedy cascade-repair runs: from the best "
+                         "recipe the ledger holds, repair the one validation "
+                         "field whose arm fired, rerun, iterate to an "
+                         "all-valid pass, then spoil one field per run; "
+                         "0 disables")
     wt.add_argument("--stub-search", type=int, default=600, metavar="N",
                     dest="stub_search",
                     help="up to N staged stub-outcome runs, worked backward "

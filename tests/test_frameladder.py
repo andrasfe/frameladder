@@ -5194,3 +5194,195 @@ class TestReentry(unittest.TestCase):
                  for entry in spec["stubs"]["EXEC:CICS:READ"]}
         self.assertIn(13, codes)                      # the compared fault
         self.assertNotIn(19, codes)                   # never a whole table
+
+
+class TestNestedFunctionArguments(unittest.TestCase):
+    """`FUNCTION LENGTH(FUNCTION TRIM(X))` - the inner call is one argument
+    written as two words. Split apart, the carrier of the whole call became
+    a variable literally named FUNCTION, and the blank-check built on it
+    fired however the field was set - which is how a repaired screen field
+    kept reading as blank."""
+
+    def test_inner_call_is_one_argument_and_the_carrier_is_the_field(self):
+        term = ir.parse_term("FUNCTION LENGTH(FUNCTION TRIM(WS-X(1:WS-L)))")
+        self.assertEqual(term.name, "WS-X")
+        self.assertEqual(term.func, "LENGTH")
+
+    def test_the_condition_evaluates_on_the_fields_value(self):
+        prog = program(HEADER + """       01 WS-X PIC X(8).
+       01 WS-LEN PIC 9(2) VALUE 3.
+       01 WS-F PIC X VALUE 'V'.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           IF WS-X(1:WS-LEN) EQUAL LOW-VALUES
+           OR WS-X(1:WS-LEN) EQUAL SPACES
+           OR FUNCTION LENGTH(FUNCTION TRIM(
+              WS-X(1:WS-LEN))) = 0
+              MOVE 'B' TO WS-F
+           ELSE
+              MOVE 'N' TO WS-F
+           END-IF
+           GOBACK
+           .
+""")
+        for value, expected in (("", "B"), ("AAA", "N"), ("   ", "B")):
+            interp = Interpreter(prog, {"WS-X": value})
+            interp.run("MAIN-PARA")
+            self.assertEqual(interp.state.get("WS-F"), expected,
+                             "WS-X=%r" % value)
+
+
+class TestCascadeRepair(unittest.TestCase):
+    """The greedy repair loop: run the best recipe, repair the one field
+    whose validation arm fired, rerun, iterate to an all-valid pass, then
+    spoil one field per run off the passing state."""
+
+    SRC = HEADER + """       01 WS-FLAGS.
+          05 WS-F-A PIC X VALUE SPACE.
+             88 F-A-OK VALUE LOW-VALUES.
+             88 F-A-BAD VALUE '0'.
+             88 F-A-BLANK VALUE 'B'.
+          05 WS-F-B PIC X VALUE SPACE.
+             88 F-B-OK VALUE LOW-VALUES.
+             88 F-B-BAD VALUE '0'.
+             88 F-B-BLANK VALUE 'B'.
+          05 WS-F-C PIC X VALUE SPACE.
+             88 F-C-OK VALUE LOW-VALUES.
+             88 F-C-BAD VALUE '0'.
+             88 F-C-BLANK VALUE 'B'.
+       01 WS-F-D PIC X VALUE 'Z'.
+          88 F-D-BAD VALUE '0'.
+       01 IN-A PIC X(2).
+       01 IN-B PIC X(2).
+       01 IN-C PIC X(2).
+       01 WS-CUR PIC 9 VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE 'V' TO WS-F-D
+           PERFORM EDIT-A
+           PERFORM EDIT-B
+           PERFORM EDIT-C
+           PERFORM CURSOR-PARA
+           GOBACK
+           .
+       EDIT-A.
+           SET F-A-OK TO TRUE
+           IF IN-A EQUAL SPACES OR IN-A EQUAL LOW-VALUES
+              SET F-A-BLANK TO TRUE
+           ELSE
+              IF IN-A IS NOT NUMERIC
+                 SET F-A-BAD TO TRUE
+              END-IF
+           END-IF
+           .
+       EDIT-B.
+           SET F-B-OK TO TRUE
+           IF IN-B EQUAL SPACES OR IN-B EQUAL LOW-VALUES
+              SET F-B-BLANK TO TRUE
+           ELSE
+              IF IN-B IS NOT NUMERIC
+                 SET F-B-BAD TO TRUE
+              END-IF
+           END-IF
+           .
+       EDIT-C.
+           SET F-C-OK TO TRUE
+           IF IN-C EQUAL SPACES OR IN-C EQUAL LOW-VALUES
+              SET F-C-BLANK TO TRUE
+           ELSE
+              IF IN-C IS NOT NUMERIC
+                 SET F-C-BAD TO TRUE
+              END-IF
+           END-IF
+           .
+       CURSOR-PARA.
+           EVALUATE TRUE
+               WHEN F-A-BAD
+                   MOVE 1 TO WS-CUR
+               WHEN F-A-BLANK
+                   MOVE 2 TO WS-CUR
+               WHEN F-B-BAD
+                   MOVE 3 TO WS-CUR
+               WHEN F-B-BLANK
+                   MOVE 4 TO WS-CUR
+               WHEN F-C-BAD
+                   MOVE 5 TO WS-CUR
+               WHEN F-C-BLANK
+                   MOVE 6 TO WS-CUR
+               WHEN F-D-BAD
+                   MOVE 7 TO WS-CUR
+               WHEN OTHER
+                   MOVE 0 TO WS-CUR
+           END-EVALUATE
+           .
+"""
+
+    def _repaired(self, budget=200):
+        from frameladder import repair as repair_mod
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.ladder import analyse
+        from frameladder.ledger import Ledger
+        prog = program(self.SRC)
+        _graph, prov = analyse(prog)
+        ledger = Ledger()
+
+        def run(state, world, stubs, terminals, source):
+            interp = Interpreter(prog, dict(state or {}), stubs=stubs,
+                                 terminals=terminals,
+                                 defaults=io_defaults(prog, world))
+            trace = interp.run("MAIN-PARA")
+            return ledger.credit(trace, state or {}, world, stubs,
+                                 terminals, source)
+
+        run({}, "populated", None, None, "seed")     # the all-blank base
+        stats = repair_mod.repair(
+            prog, prov, ledger, run, entry="MAIN-PARA", budget=budget,
+            defaults_for=lambda w: io_defaults(prog, w))
+        return prog, ledger, stats
+
+    def test_the_cascade_is_indexed(self):
+        from frameladder import repair as repair_mod
+        prog = program(self.SRC)
+        found = repair_mod.cascades(prog)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["para"], "CURSOR-PARA")
+        self.assertEqual(len(found[0]["arms"]), 8)
+
+    def test_the_ascent_fells_the_deep_arms_and_the_pass(self):
+        _prog, ledger, stats = self._repaired()
+        covered = ledger.covered()
+        self.assertTrue(stats["passed"] >= 1)
+        # The blank base fires the first BLANK arm; every deeper arm needs
+        # the fields before it repaired. The loop must witness them all,
+        # both ways.
+        for ordinal in (1, 3, 5, 7, 9, 11):          # F-A..F-C arms
+            self.assertIn(("CURSOR-PARA", ordinal, "WHEN", True), covered,
+                          "arm ordinal %d True missing" % ordinal)
+            self.assertIn(("CURSOR-PARA", ordinal, "WHEN", False), covered,
+                          "arm ordinal %d False missing" % ordinal)
+
+    def test_the_unreachable_arm_is_reported_not_absorbed(self):
+        # F-D-BAD needs WS-F-D = '0' and the only writer is an
+        # unconditional MOVE 'V': no evidence chain reaches an input, and
+        # the honest answer is a stalled row, not silence.
+        _prog, ledger, stats = self._repaired()
+        self.assertNotIn(("CURSOR-PARA", 13, "WHEN", True),
+                         ledger.covered())
+        stalled = [row for row in stats["stalled"] if row["ordinal"] == 13]
+        self.assertTrue(stalled)
+
+    def test_every_repair_witness_reproduces_from_its_stored_recipe(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.lift import direction_key
+        prog, ledger, _stats = self._repaired()
+        for key, recipe in ledger.witnesses.items():
+            if not recipe.source.startswith("repair:"):
+                continue
+            payload = recipe.payload()
+            interp = Interpreter(prog, dict(payload["input_state"]),
+                                 stubs=payload["stubs"],
+                                 terminals=payload["terminals"],
+                                 defaults=io_defaults(prog,
+                                                      payload["world"]))
+            trace = interp.run("MAIN-PARA")
+            self.assertIn(key, {direction_key(g) for g in trace.guards})

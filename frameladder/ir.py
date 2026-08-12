@@ -244,7 +244,22 @@ def _split_args(text: str) -> list:
             split.extend(words)
         else:
             split.append(piece)
-    return split
+    # A nested call is one argument written as two words: in `FUNCTION
+    # LENGTH(FUNCTION TRIM(X))` the inner argument splits into `FUNCTION`
+    # and `TRIM(X)`, the first parses as a variable nobody declares, and
+    # the carrier of the whole call becomes that phantom - so the condition
+    # tests a field no value ever reaches. Same re-join the statement
+    # tokenizer already does.
+    merged: list = []
+    index = 0
+    while index < len(split):
+        if split[index].upper() == "FUNCTION" and index + 1 < len(split):
+            merged.append(split[index] + " " + split[index + 1])
+            index += 2
+        else:
+            merged.append(split[index])
+            index += 1
+    return merged
 
 
 def _top_level_words(text: str) -> list:
