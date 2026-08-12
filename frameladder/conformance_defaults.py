@@ -14,20 +14,93 @@ So the worlds are named and enumerated, and the coverage runner draws from
 all of them. `bare` stays the default because the conformance harnesses
 compare against GnuCOBOL running with no data files present, and they must
 keep modelling exactly that.
+
+The worlds used to speak only about files, which left most of the corpus with
+nothing to say: 120 of the 218 external operations on CardDemo are `EXEC`,
+and 19 of its 29 programs declare no `SELECT` at all, so `io_defaults`
+returned an empty dict and all three worlds were the identical run. The
+non-`bare` worlds therefore also answer the EXEC axis, from evidence only - a
+variable is offered a status code when `faults.channel_of` finds the *source*
+put it in that channel (a `FILE STATUS IS`, a `RESP` operand, `SQLCODE`),
+never because of how it is spelled. Measured on CardDemo that is worth +10
+verified directions on its own and it is the only part of the mechanism that
+can reach a program whose I/O is all SQL or DL/I.
 """
 
 from __future__ import annotations
 
 WORLDS = ("bare", "populated", "empty")
 
+# Per status channel, the code meaning "it worked" and the code meaning "it
+# ran and found nothing" - the two outcomes the worlds are named after. Both
+# are read out of `faults`, which holds them as fixed platform vocabulary
+# rather than as a guess about any one program.
+_CHANNEL_OK = {"file": "00", "sql": 0, "cics": 0}
+_CHANNEL_NIL = {"file": "10", "sql": 100, "cics": 13}
+
+
+def exec_channels(program) -> dict:
+    """``op_key -> {status variable: channel}`` for operations no SELECT
+    speaks for.
+
+    Computed once per program and cached on it, the same way `analyse` and
+    `external_reach` are: a sweep asks for this once per direction and
+    rebuilding the provenance index each time is the difference between a
+    seconds-long job and a minutes-long one.
+    """
+    cached = getattr(program, "_exec_channels", None)
+    if cached is not None:
+        return cached
+    from .faults import channel_of
+    from .ladder import analyse
+
+    spoken_for = set(_file_defaults(program, "bare"))
+    out: dict = {}
+    try:
+        _graph, prov = analyse(program)
+    except Exception:                                            # noqa: BLE001
+        prov = None
+    for var, writers in (getattr(prov, "writers", {}) or {}).items():
+        for w in writers:
+            key = (getattr(w, "op_key", "") or "").upper()
+            if getattr(w, "kind", "") != "STUB" or not key:
+                continue
+            if key in spoken_for:
+                continue
+            channel = channel_of(var, program.model, key)
+            if channel:
+                out.setdefault(key, {})[var.upper()] = channel
+    try:
+        program._exec_channels = out
+    except AttributeError:
+        pass
+    return out
+
 
 def io_defaults(program, world: str = "bare") -> dict:
     """Per-operation status codes for one of :data:`WORLDS`.
 
-    ``bare``       - the files are not there. An indexed OPEN INPUT gives 35.
-    ``populated``  - everything opens and every READ delivers a record.
-    ``empty``      - everything opens and every READ is immediately at end.
+    ``bare``       - the files are not there. An indexed OPEN INPUT gives 35,
+                     and the EXEC axis is left alone, because that is what the
+                     conformance harnesses compare against.
+    ``populated``  - everything opens, every READ delivers a record, and every
+                     EXEC reports success.
+    ``empty``      - everything opens, every READ is immediately at end, and
+                     every EXEC reports that it found nothing.
     """
+    out = _file_defaults(program, world)
+    if world == "bare":
+        return out
+    table = _CHANNEL_OK if world == "populated" else _CHANNEL_NIL
+    for key, channels in exec_channels(program).items():
+        slot = dict(out.get(key, {}))
+        for var, channel in channels.items():
+            slot[var] = table[channel]
+        out[key] = slot
+    return out
+
+
+def _file_defaults(program, world: str) -> dict:
     out: dict = {}
     for f, status in program.model.file_status.items():
         indexed = program.model.organization.get(f, "").startswith("INDEX")

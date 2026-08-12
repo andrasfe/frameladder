@@ -556,6 +556,35 @@ This is the single largest correction in the tool's history and, as usual
 here, it *lowered* every number that was previously reported. See
 `AGENTS.md`, "A settled obligation must be bound or reported".
 
+### A plan leaves slots free, and the free ones were never tried
+
+Every one of those runs was made at the same single point: the `bare` I/O
+world, and only the values the obligations happened to reach. A plan pins the
+operations and the fields its obligations touched and leaves everything else
+to whatever the environment gives it — and `bare` means the files are not
+there, so a batch program opens them, abends, and runs four paragraphs.
+
+`export` now searches those free slots instead of defaulting them: each plan
+is offered the three I/O worlds and, by default, two entry states that fill
+the untouched fields from the program's own literals. The first pair that
+takes the requested direction wins, and **the pair is exported with the
+candidate** — a plan verified with the files present and replayed with them
+absent covers nothing and says nothing about why.
+
+Same 3,288 directions, same plans:
+
+| verification | verified |
+|---|---:|
+| one run, `bare`, no overlay (`--bare-only --overlays=0`) | 804 (24.5%) |
+| I/O worlds only | 938 (28.5%) |
+| free-input overlays only | 991 (30.1%) |
+| both (the default) | **1,161 (35.3%)** |
+
+The world half is worth 191→325 on the ten programs that declare a `SELECT`
+and **exactly zero** on the other nineteen — it is a batch mechanism, and it
+says so. The overlay half is the reverse. They compose because they are
+uncorrelated, which is the same reason `--sample` earns its place above.
+
 ### Accounting for every target that did not make it
 
 "268 attempted, 1 exported" is not a diagnosis. A target that could not be
@@ -1281,6 +1310,6 @@ Stated rather than hidden; each is reported in the output when it bites.
 ## Tests
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q     # 260 unit tests, self-contained
+python3 -m pytest tests/test_frameladder.py -q     # 279 unit tests, self-contained
 python3 tests/parser_agreement.py                  # parser vs reference ASTs
 ```

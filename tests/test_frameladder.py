@@ -3071,16 +3071,23 @@ class TestVerificationWorld(unittest.TestCase):
             prog, self._plan(prog, branch), branch, True, "WV-MAIN",
             worlds=("bare",))
         self.assertEqual(verdict, "target_not_reached")
-        self.assertIn("CEE3ABD", detail)
+        # Why it stopped, which is the discriminator between this defect and
+        # the last-hop guard problem. The sentence carries the reach profile;
+        # the stop reason rides in the sink.
+        sink = {}
+        _verify_direction(prog, self._plan(prog, branch), branch, True,
+                          "WV-MAIN", sink=sink, worlds=("bare",))
+        self.assertIn("CEE3ABD", str(sink.get("stopped", "")) + detail)
 
     def test_a_world_where_the_files_open_verifies_the_same_plan(self):
         from frameladder.cli import _verify_direction
         prog = program(self.SRC)
         branch = self._branch(prog)
         sink = {}
+        from frameladder.conformance_defaults import WORLDS
         verdict, _detail = _verify_direction(
             prog, self._plan(prog, branch), branch, True, "WV-MAIN",
-            sink=sink)
+            sink=sink, worlds=WORLDS)
         self.assertEqual(verdict, "verified")
         # And it says which world, because a witness that needs the files to
         # open is a witness the harness has to be told about.
@@ -3123,14 +3130,14 @@ class TestVerificationWorld(unittest.TestCase):
 
     def test_every_world_is_a_declared_world(self):
         from frameladder.conformance_defaults import WORLDS
-        from frameladder.cli import _REACH_RANK
+        from frameladder.cli import _HOW_FAR as _REACH_RANK
         self.assertEqual(set(WORLDS), {"bare", "populated", "empty"})
         # The rank exists to pick which run to *report*; it must never be able
         # to promote something to verified, which the guard event alone
         # decides. So verified is strictly the top and nothing ties with it.
-        self.assertEqual(max(_REACH_RANK, key=_REACH_RANK.get), "verified")
-        self.assertEqual(sum(1 for v in _REACH_RANK.values()
-                             if v == _REACH_RANK["verified"]), 1)
+        self.assertEqual(_REACH_RANK[0], "verified")   # best first
+        self.assertEqual(_REACH_RANK.count("verified"), 1)
+        self.assertEqual(len(set(_REACH_RANK)), len(_REACH_RANK))
 
 
 class TestRefusalKinds(unittest.TestCase):
@@ -4356,3 +4363,284 @@ class TestProducerBacktracking(unittest.TestCase):
         plan = build_plan(program(self.SRC), "PB-TARGET", entry="PB-MAIN",
                           capability=cap)
         self.assertEqual(unrepresentable(plan, cap), [])
+class TestFreeIOSlots(unittest.TestCase):
+    """A plan pins the operations its obligations reached; the rest take the
+    world, and `bare` was the only world the verification path ever tried.
+
+    Measured over CardDemo's 3,288 branch directions, `bare` alone verifies
+    804 and the three worlds verify 938 - all of the difference on the ten
+    programs that declare a file, and exactly zero on the other nineteen.
+    """
+
+    SRC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       ENVIRONMENT DIVISION.
+       INPUT-OUTPUT SECTION.
+       FILE-CONTROL.
+           SELECT IN-FILE ASSIGN TO INF
+               ORGANIZATION IS INDEXED
+               ACCESS MODE IS SEQUENTIAL
+               RECORD KEY IS IN-KEY
+               FILE STATUS IS WS-ST.
+       DATA DIVISION.
+       FILE SECTION.
+       FD IN-FILE.
+       01 IN-REC.
+          05 IN-KEY  PIC X(4).
+       WORKING-STORAGE SECTION.
+       01 WS-ST  PIC X(2).
+       01 WS-EOF PIC X(1) VALUE 'N'.
+       PROCEDURE DIVISION.
+       FIO-MAIN.
+           OPEN INPUT IN-FILE
+           PERFORM UNTIL WS-EOF = 'Y'
+              READ IN-FILE
+                 AT END MOVE 'Y' TO WS-EOF
+              END-READ
+           END-PERFORM
+           GOBACK
+           .
+"""
+
+    def _bits(self):
+        # The `AT END` of the read loop, which is the shape of batch COBOL and
+        # the one decision no entry state can reach: the value that decides it
+        # comes from the READ, and the plan pins no outcome for it. It is a
+        # free I/O slot in exactly the sense a slot no obligation touched is a
+        # free input slot.
+        from frameladder.coverage import branches_of
+        prog = program(self.SRC)
+        branch = [b for b in branches_of(prog) if b.kind == "PHRASE"][0]
+        return prog, branch
+
+    def test_bare_alone_cannot_reach_the_end_of_an_indexed_file(self):
+        # An indexed READ with no data staged gives 35, not 10, so `AT END`
+        # never fires and the direction is reported as taken the other way.
+        from frameladder.cli import _verify_direction
+        from frameladder.ladder import plan_for_branch
+        prog, branch = self._bits()
+        plan = plan_for_branch(prog, branch.paragraph, branch.line, True,
+                               entry="FIO-MAIN", ordinal=branch.ordinal)
+        self.assertFalse(plan.stub_plan(), "the plan pins no outcome here")
+        verdict, _detail = _verify_direction(prog, plan, branch, True,
+                                             "FIO-MAIN")
+        self.assertEqual(verdict, "wrong_direction")
+
+    def test_offering_the_worlds_reaches_it(self):
+        from frameladder.cli import _verify_direction
+        from frameladder.conformance_defaults import WORLDS
+        from frameladder.ladder import plan_for_branch
+        prog, branch = self._bits()
+        plan = plan_for_branch(prog, branch.paragraph, branch.line, True,
+                               entry="FIO-MAIN", ordinal=branch.ordinal)
+        sink: dict = {}
+        verdict, _detail = _verify_direction(prog, plan, branch, True,
+                                             "FIO-MAIN", sink=sink,
+                                             worlds=WORLDS)
+        self.assertEqual(verdict, "verified")
+        # Which world it took is part of the answer: a candidate that does not
+        # say so is one the harness will stage the wrong way.
+        self.assertEqual(sink["world"], "empty")
+
+    def test_the_other_direction_still_needs_the_other_world(self):
+        # Both directions of one decision, and no single world gives both.
+        # That is the mechanism stated as a property rather than a count.
+        from frameladder.cli import _verify_direction
+        from frameladder.conformance_defaults import WORLDS
+        from frameladder.ladder import plan_for_branch
+        prog, branch = self._bits()
+        plan = plan_for_branch(prog, branch.paragraph, branch.line, False,
+                               entry="FIO-MAIN", ordinal=branch.ordinal)
+        sink: dict = {}
+        verdict, _detail = _verify_direction(prog, plan, branch, False,
+                                             "FIO-MAIN", sink=sink,
+                                             worlds=WORLDS)
+        self.assertEqual(verdict, "verified")
+        self.assertNotEqual(sink["world"], "empty")
+
+    def test_the_default_is_still_one_run_in_bare(self):
+        # Every existing caller, and the conformance harnesses that compare
+        # against GnuCOBOL with no files staged, must see what they saw.
+        import inspect
+        from frameladder.cli import _verify_direction
+        signature = inspect.signature(_verify_direction)
+        self.assertEqual(signature.parameters["worlds"].default, ("bare",))
+        self.assertEqual(signature.parameters["states"].default, ())
+
+
+class TestExecAxisWorlds(unittest.TestCase):
+    """`io_defaults` spoke only about files, so a program with no SELECT got an
+    empty dict and all three worlds were the identical run - 19 of CardDemo's
+    29 programs, and 120 of its 218 external operations."""
+
+    SRC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 SQLCODE PIC S9(9) COMP.
+       PROCEDURE DIVISION.
+       EX-MAIN.
+           EXEC SQL SELECT A INTO :SQLCODE FROM T END-EXEC
+           IF SQLCODE = 100
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+"""
+
+    def test_bare_says_nothing_about_an_exec(self):
+        from frameladder.conformance_defaults import io_defaults
+        prog = program(self.SRC)
+        self.assertEqual(io_defaults(prog, "bare"), {})
+
+    def test_the_empty_world_gives_sql_its_not_found_code(self):
+        from frameladder.conformance_defaults import io_defaults
+        prog = program(self.SRC)
+        found = io_defaults(prog, "empty")
+        self.assertTrue(found, "the EXEC axis should not be silent")
+        self.assertTrue(any(v.get("SQLCODE") == 100 for v in found.values()))
+
+    def test_the_populated_world_gives_sql_success(self):
+        from frameladder.conformance_defaults import io_defaults
+        prog = program(self.SRC)
+        found = io_defaults(prog, "populated")
+        self.assertTrue(any(v.get("SQLCODE") == 0 for v in found.values()))
+
+    def test_a_channel_comes_from_the_source_not_the_name(self):
+        # `faults.channel_of` is evidence-only, and this is the property that
+        # keeps the world model from becoming a naming heuristic: a field
+        # spelled like a status but never put in one gets nothing.
+        from frameladder.conformance_defaults import exec_channels
+        prog = program("""       IDENTIFICATION DIVISION.
+       PROGRAM-ID. T.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-FILE-STATUS PIC X(2).
+       PROCEDURE DIVISION.
+       EN-MAIN.
+           CALL 'SUB' USING WS-FILE-STATUS
+           GOBACK
+           .
+""")
+        for channels in exec_channels(prog).values():
+            self.assertNotIn("WS-FILE-STATUS", channels)
+
+
+class TestFreeInputSlots(unittest.TestCase):
+    """The obligations pin some slots and leave the rest; the export path
+    never filled the remainder, so every run took the same defaults."""
+
+    def test_the_pool_is_the_programs_own_literals(self):
+        from frameladder.cli import _overlay_pool
+        prog = program(HEADER + """       01 WS-A PIC X(1).
+       01 WS-B PIC X(1).
+       PROCEDURE DIVISION.
+       OV-MAIN.
+           IF WS-A = 'Y'
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        pool = _overlay_pool(prog)
+        self.assertIn("Y", pool.get("WS-A", []))
+        # And a complement, or the negative direction of its own comparison
+        # has no value to be sampled into.
+        self.assertGreater(len(pool.get("WS-A", [])), 1)
+
+    def test_a_profile_that_cannot_inject_a_field_keeps_it_out(self):
+        # An overlay the harness will drop in projection must never be the
+        # reason a plan was called verified.
+        from frameladder.capability import Capability
+        from frameladder.cli import _overlay_pool
+        prog = program(HEADER + """       01 WS-A PIC X(1).
+       PROCEDURE DIVISION.
+       OV-MAIN.
+           IF WS-A = 'Y'
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        narrow = Capability(stated=True, injectable=frozenset({"WS-OTHER"}))
+        self.assertNotIn("WS-A", _overlay_pool(prog, narrow))
+
+    def test_overlays_keep_every_value_the_plan_derived(self):
+        from frameladder.cli import _overlay_pool, _overlay_states
+        from frameladder.ladder import build_plan
+        prog = program(HEADER + """       01 WS-A PIC X(1).
+       01 WS-B PIC X(1).
+       PROCEDURE DIVISION.
+       OS-MAIN.
+           IF WS-A = 'Y'
+              PERFORM OS-DEEP
+           END-IF
+           GOBACK
+           .
+       OS-DEEP.
+           IF WS-B = 'Z'
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        plan = build_plan(prog, "OS-DEEP", entry="OS-MAIN")
+        states = _overlay_states(plan, _overlay_pool(prog), 3, seed=7)
+        self.assertEqual(len(states), 3)
+        for state in states:
+            for name, value in plan.input_state().items():
+                self.assertEqual(state[name], value)
+
+    def test_the_draws_are_seeded(self):
+        from frameladder.cli import _overlay_pool, _overlay_states
+        from frameladder.ladder import build_plan
+        prog = program(HEADER + """       01 WS-A PIC X(1).
+       PROCEDURE DIVISION.
+       SD-MAIN.
+           IF WS-A = 'Y'
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        plan = build_plan(prog, "SD-MAIN", entry="SD-MAIN")
+        pool = _overlay_pool(prog)
+        self.assertEqual(_overlay_states(plan, pool, 4, seed=3),
+                         _overlay_states(plan, pool, 4, seed=3))
+
+
+class TestTheWorldIsPartOfTheCandidate(unittest.TestCase):
+    """A plan verified with the files present and replayed with them absent
+    abends at its first OPEN and reports covering nothing. The world the
+    verification used therefore travels with the candidate, and a harness that
+    cannot set it up is told so rather than left to discover it."""
+
+    def _plan(self):
+        from frameladder.ir import Plan
+        return Plan(target="X", chain=["A"], edges=[], atoms=[], bindings=[],
+                    rendezvous=[], open_obligations=[])
+
+    def test_the_world_is_named_and_spelled_out(self):
+        from frameladder.replay import replay_script
+        script = replay_script(self._plan(), entry="A", io_world="populated",
+                               io_defaults={"READ:F": {"WS-ST": "00"}})
+        self.assertEqual(script["io_world"], "populated")
+        self.assertEqual(script["io_defaults"], {"READ:F": {"WS-ST": "00"}})
+
+    def test_a_harness_that_cannot_drive_the_operation_is_refused(self):
+        from frameladder.capability import Capability, Operation
+        from frameladder.replay import replay_script
+        narrow = Capability(stated=True,
+                            operations={"WRITE:G": Operation("WRITE:G")})
+        script = replay_script(self._plan(), narrow, entry="A",
+                               io_world="populated",
+                               io_defaults={"READ:F": {"WS-ST": "00"}})
+        self.assertFalse(script["representable"])
+        self.assertTrue(any("READ:F" in r for r in script["reasons"]))
+
+    def test_an_overlaid_state_is_the_one_exported(self):
+        from frameladder.replay import replay_script
+        script = replay_script(self._plan(), entry="A",
+                               entry_state={"WS-A": "Y"})
+        self.assertTrue(script["overlaid"])
+        self.assertEqual(script["input_state"], {"WS-A": "Y"})
