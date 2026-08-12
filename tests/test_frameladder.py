@@ -4644,3 +4644,107 @@ class TestTheWorldIsPartOfTheCandidate(unittest.TestCase):
                                entry_state={"WS-A": "Y"})
         self.assertTrue(script["overlaid"])
         self.assertEqual(script["input_state"], {"WS-A": "Y"})
+
+
+class TestParagraphSummary(unittest.TestCase):
+    """A paragraph as guarded commands, so composition replaces re-derivation.
+
+    Not yet consumed by the planner. It is merged because the conformance
+    harness that checks it is worth having in the tree and tracked, exactly as
+    `microdiff` is at 24/202 - a bar you can drive down beats a number in a
+    conversation.
+    """
+
+    SRC = HEADER + """       01  WS-A PIC X.
+       01  WS-B PIC X.
+       PROCEDURE DIVISION.
+       PS-MAIN.
+           IF WS-A = 'Y'
+              MOVE 'X' TO WS-B
+              PERFORM PS-DEEP
+           END-IF
+           GOBACK
+           .
+       PS-DEEP.
+           CONTINUE
+           .
+       PS-TAIL.
+           EXIT
+           .
+"""
+
+    def _summary(self, name="PS-MAIN", src=None):
+        from frameladder.summary import summarise
+        return summarise(program(src or self.SRC), name)
+
+    def test_both_ways_through_a_decision_are_paths(self):
+        s = self._summary()
+        self.assertEqual(len(s.paths), 2)
+        self.assertTrue(s.complete)
+
+    def test_only_one_path_performs_the_guarded_target(self):
+        s = self._summary()
+        reaching = s.paths_reaching("PS-DEEP")
+        self.assertEqual(len(reaching), 1)
+        self.assertTrue(reaching[0].condition)
+
+    def test_writes_before_a_call_are_ordered_and_visible(self):
+        # The last-hop question in one line: a value bound at paragraph entry
+        # survives to the call only if nothing here overwrote it. That is what
+        # the planner could not see.
+        s = self._summary()
+        path = s.paths_reaching("PS-DEEP")[0]
+        self.assertEqual([w.var for w in path.writes_before("PS-DEEP")],
+                         ["WS-B"])
+
+    def test_a_thru_range_names_every_paragraph_it_runs(self):
+        # Recorded as one call to a paragraph literally named "A THRU B" it
+        # matches nothing, and the summary then predicts none of the calls the
+        # range makes - worth 2.7 points of corpus agreement on its own.
+        src = HEADER + """       01  WS-A PIC X.
+       PROCEDURE DIVISION.
+       PS-MAIN.
+           PERFORM PS-DEEP THRU PS-TAIL
+           GOBACK
+           .
+       PS-DEEP.
+           CONTINUE
+           .
+       PS-MIDDLE.
+           CONTINUE
+           .
+       PS-TAIL.
+           EXIT
+           .
+"""
+        calls = self._summary(src=src).summary()["calls"]
+        self.assertEqual(calls, ["PS-DEEP", "PS-MIDDLE", "PS-TAIL"])
+
+    def test_a_loop_makes_the_summary_incomplete_rather_than_wrong(self):
+        # A caller may use an incomplete summary as evidence that a path
+        # exists, never as evidence that one does not. That distinction is
+        # the difference between "no plan on this chain" and "this is dead".
+        src = HEADER + """       01  WS-I PIC 9(4).
+       PROCEDURE DIVISION.
+       PS-MAIN.
+           PERFORM PS-DEEP UNTIL WS-I > 3
+           GOBACK
+           .
+       PS-DEEP.
+           ADD 1 TO WS-I
+           .
+"""
+        s = self._summary(src=src)
+        self.assertFalse(s.complete)
+        self.assertIn("loop", s.why_partial)
+
+    def test_an_unknown_paragraph_is_incomplete_not_empty(self):
+        s = self._summary(name="NO-SUCH-PARA")
+        self.assertFalse(s.complete)
+        self.assertEqual(s.paths, ())
+
+    def test_every_paragraph_of_a_program_is_summarised(self):
+        from frameladder.summary import summarise_program
+        prog = program(self.SRC)
+        self.assertEqual(set(summarise_program(prog)),
+                         set(prog.paragraph_names))

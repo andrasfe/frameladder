@@ -19,9 +19,10 @@ is a deliberate property, not an accident of youth — see *Invariants*.
 ## Commands
 
 ```bash
-python3 -m pytest tests/test_frameladder.py -q      # 279 unit tests, seconds
+python3 -m pytest tests/test_frameladder.py -q      # 286 unit tests, seconds
 python3 tests/parser_agreement.py                    # parser vs reference ASTs
 python3 -m conformance.differential  <programs>      # interpreter vs GnuCOBOL
+python3 -m conformance.summary_check <programs>      # paragraph summaries vs interpreter
 python3 -m conformance.plan_check    <programs>      # do plans reach, in GnuCOBOL?
 python3 -m frameladder.cli <program.cbl> sweep       # plan+verify every target
 ```
@@ -49,6 +50,7 @@ Reading order, which is also the dependency order:
 | `layout.py` | physical record layout — offsets and byte lengths |
 | `dependencies.py` | what each frame commits you to in the outside world |
 | `witness.py` | verified states, kept and reused |
+| `summary.py` | a paragraph as guarded commands - not yet consumed, see below |
 | `capability.py` | what the harness that will run these plans can inject and replay |
 | `replay.py` | the complete ordered outcome series, with every refusal named |
 | `represent.py` | which plans a profile could run, and a proxy profile to measure with |
@@ -598,6 +600,34 @@ work, is at 100% -- its ten dead EVALUATE arms were all testing 88-levels
 whose VALUE was a hexadecimal literal the parser read as a variable name.
 
 ## Open work, in the order I would take it
+
+0a. **Paragraph summaries are built, checked, and not yet consumed.**
+   `summary.py` turns each paragraph into `(path condition -> ordered writes,
+   calls, escape)`. `path.writes_before(target)` answers the last-hop question
+   directly - did anything overwrite this binding between paragraph entry and
+   the call - which is what item 0 below needs and what the planner has never
+   been able to see.
+
+   Affordable because of what COBOL is, measured over 834 paragraphs: median
+   **2** paths and 9 statements, 78% at most 4 paths, 89% at most 16, and only
+   **5%** containing a loop. No parameters, no heap, no recursion, no aliasing
+   outside REDEFINES, so a paragraph's interface is its live-in set.
+
+   **Do not wire it into the planner yet.** `conformance/summary_check.py`
+   puts it at **90.6% / 96.2% / 91.8%** agreement with the interpreter across
+   the three corpora, and a summary wrong one time in eleven produces
+   confident wrong plans - the failure this file already records under three
+   other names. Drive that number to ~100 first, the way `microdiff` was
+   driven from 0/89 to 24/202: read the complaints, fix one statement form,
+   re-measure. Two have been fixed already, one of them a `PERFORM A THRU B`
+   recorded as a call to a paragraph literally named "A THRU B", worth 2.7
+   points.
+
+   A caveat the harness itself taught: an earlier version stringified atoms
+   and re-parsed them, so `IO-STATUS NOT NUMERIC` became a comparison against
+   the literal `'NUMERIC'` and convicted a *correct* summary. A conformance
+   harness must never fail in that direction; it now refuses to convict on
+   anything it cannot decide.
 
 0. **Temporal, route-sensitive provenance: which write reaches *this* read on
    *this* route?** The single highest-value item in the repository. It gates
