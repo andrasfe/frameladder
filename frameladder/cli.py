@@ -1910,7 +1910,7 @@ def cmd_witnesses(args):
         key = (_freeze(state or {}), world, _freeze(stubs or {}),
                _freeze(terminals or {}))
         if key in seen_runs:
-            return
+            return None
         seen_runs.add(key)
         try:
             interp = Interpreter(program, dict(state or {}), stubs=stubs,
@@ -1918,8 +1918,9 @@ def cmd_witnesses(args):
                                  defaults=io_defaults(program, world))
             trace = interp.run(entry)
         except Exception:                                    # noqa: BLE001
-            return
-        ledger.credit(trace, state or {}, world, stubs, terminals, source)
+            return None
+        return ledger.credit(trace, state or {}, world, stubs, terminals,
+                             source)
 
     # Everything the battery runs is also a place the frontier search can
     # start: a derived plan carries the staged stubs that put a run past a
@@ -1929,7 +1930,10 @@ def cmd_witnesses(args):
 
     # 1. Every plan, even one with an open obligation: an unsolved plan still
     #    runs, and running the 804 unsolved measured +122 verified. The solver
-    #    got as far as it could; the run finds out what that buys.
+    #    got as far as it could; the run finds out what that buys. The recipe
+    #    each plan derived is kept: the staged-stub phase re-uses it as a base
+    #    when the plan got near its branch but the outside world said no.
+    plan_recipes: dict = {}
     for branch in branches_of(program):
         for direction in (True, False):
             try:
@@ -1940,6 +1944,9 @@ def cmd_witnesses(args):
                 continue
             if not plan.chain:
                 continue
+            plan_recipes[(branch.paragraph, branch.ordinal, branch.kind,
+                          direction)] = (plan.input_state(),
+                                         plan.stub_plan(), plan.terminals)
             states = [plan.input_state()]
             states += _overlay_states(plan, overlay_pool, args.overlays,
                                       seed=args.seed)
@@ -1986,7 +1993,7 @@ def cmd_witnesses(args):
     # 2. The derived outside worlds: N records then end-of-file, and the
     #    fault at one position in the series. These are recipes in their own
     #    right and reach code no per-direction plan reaches.
-    _graph, prov = analyse(program)
+    graph, prov = analyse(program)
     worlds = sequence_worlds(program, prov, prov.literals) +         fault_worlds(program, prov, prov.literals)
     for spec in worlds:
         states = [{}] + [{n: _rng_choice(v, args.seed + i) for n, v in
@@ -1997,6 +2004,23 @@ def cmd_witnesses(args):
         for state in states:
             run(state, spec["world"], spec["stubs"], spec["terminals"],
                 "world:%s" % spec["name"])
+
+    # 2.5 The staged stub search, worked backward from what is still
+    #     missing: which operation writes the tested field (provenance),
+    #     which codes the arms name (the program's own DFHRESP list, OTHER
+    #     as their complement), staged at one position in the series over a
+    #     run that already got near. Runs before the frontier search on
+    #     purpose - each witnessing recipe becomes a lift seed, so the
+    #     frontier can extend *inside* a staged world - and again after it,
+    #     with whatever budget is left, because a direction lift witnessed
+    #     is a new base recipe for a deeper stub-gated one.
+    stub_report = None
+    if args.stub_search:
+        from .stubsearch import search as _stub_search
+        stub_report = _stub_search(program, prov, graph, ledger, run,
+                                   budget=args.stub_search,
+                                   plan_recipes=plan_recipes,
+                                   on_witness=lift_seeds.append)
 
     # 3. The frontier search, credited. The residual after phases 1 and 2 is
     #    dominated by directions needing mid-run state no entry value
@@ -2037,6 +2061,26 @@ def cmd_witnesses(args):
             100.0 * repro["directions_reproduced"]
             / max(1, repro["directions_attempted"]), 1)
 
+    # 3.5 A second staged-stub pass over what lift left: a direction the
+    #     frontier search just witnessed is a base recipe this phase did not
+    #     have on its first pass.
+    if args.stub_search and stub_report is not None \
+            and stub_report["runs"] < args.stub_search:
+        from .stubsearch import search as _stub_search
+        again = _stub_search(program, prov, graph, ledger, run,
+                             budget=args.stub_search - stub_report["runs"],
+                             plan_recipes=plan_recipes)
+        stub_report = {
+            "budget": args.stub_search,
+            "runs": stub_report["runs"] + again["runs"],
+            "directions_witnessed": stub_report["directions_witnessed"]
+            + again["directions_witnessed"],
+            "no_proposals": again["no_proposals"],
+            "passes": stub_report["passes"] + again["passes"]}
+    if stub_report is not None:
+        stub_report["reproduction"] = _stub_reproduction(program, entry,
+                                                         ledger, io_defaults)
+
     gaps = missing(program, ledger)
     payload = {"program": program.name, "entry": entry,
                "directions_total": total,
@@ -2044,6 +2088,7 @@ def cmd_witnesses(args):
                "witness_pct": round(ledger.coverage(total), 1),
                "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
                "lift": lift_report,
+               "stub_search": stub_report,
                "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
                             "kind": b.kind, "direction": d,
                             "condition": b.condition, "line": b.line}
@@ -2056,6 +2101,14 @@ def cmd_witnesses(args):
         print("%s   %d/%d directions witnessed  (%.1f%%)   %d runs"
               % (p["program"], p["witnessed"], p["directions_total"],
                  p["witness_pct"], p["runs"]))
+        if p.get("stub_search"):
+            ss = p["stub_search"]
+            rep = ss["reproduction"]
+            print("   stub search: %d runs, %d directions witnessed, "
+                  "%d with no evidence chain, reproduction %d/%d (%.1f%%)"
+                  % (ss["runs"], ss["directions_witnessed"],
+                     ss["no_proposals"], rep["reproduced"], rep["witnesses"],
+                     rep["rate_pct"]))
         if p.get("lift"):
             rep = p["lift"]["reproduction"]
             print("   lift: %d runs, %d recipes credited, reproduction "
@@ -2075,6 +2128,41 @@ def cmd_witnesses(args):
 def _rng_choice(values, seed):
     import random
     return random.Random(seed).choice(values)
+
+
+def _stub_reproduction(program, entry: str, ledger, io_defaults) -> dict:
+    """Re-run every stub-search witness from its stored recipe, and count.
+
+    The phase only ever credits through a fresh interpreter run of the exact
+    recipe stored, so this *should* be 100% - which is precisely why it is
+    measured rather than asserted: a recipe that stops reproducing means the
+    staging drifted from what the ledger records, and that defect class is
+    silent everywhere else. Recipes are shared between directions, so runs
+    are grouped by recipe rather than repeated per direction.
+    """
+    from .interpreter import Interpreter
+    from .lift import direction_key
+    took: dict = {}
+    report = {"witnesses": 0, "reproduced": 0, "rate_pct": 0.0}
+    for key, recipe in ledger.witnesses.items():
+        if not recipe.source.startswith("stub:"):
+            continue
+        report["witnesses"] += 1
+        if recipe not in took:
+            payload = recipe.payload()
+            try:
+                interp = Interpreter(
+                    program, dict(payload["input_state"]),
+                    stubs=payload["stubs"], terminals=payload["terminals"],
+                    defaults=io_defaults(program, payload["world"]))
+                trace = interp.run(entry)
+                took[recipe] = {direction_key(g) for g in trace.guards}
+            except Exception:                                # noqa: BLE001
+                took[recipe] = set()
+        report["reproduced"] += key in took[recipe]
+    report["rate_pct"] = round(100.0 * report["reproduced"]
+                               / max(1, report["witnesses"]), 1)
+    return report
 
 
 def cmd_bind(args):
@@ -2305,6 +2393,14 @@ def build_parser():
                     help="up to N frontier-search runs after the battery, "
                          "each replayed through a fresh interpreter before "
                          "its directions are credited; 0 disables")
+    wt.add_argument("--stub-search", type=int, default=600, metavar="N",
+                    dest="stub_search",
+                    help="up to N staged stub-outcome runs, worked backward "
+                         "from the unwitnessed directions whose conditions "
+                         "test a stub-written field: the writing operation "
+                         "returns each code the arms name, at one position "
+                         "in its series, over a run that already got near; "
+                         "0 disables")
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
     wt.set_defaults(func=cmd_witnesses)

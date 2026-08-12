@@ -99,7 +99,8 @@ def substitute(atoms, bindings: dict) -> list:
     return out
 
 
-def _after_earlier_arms(stmt: dict, subject: str, siblings, origin: str) -> list:
+def _after_earlier_arms(stmt: dict, subject: str, siblings, origin: str,
+                        names: frozenset = frozenset()) -> list:
     """EVALUATE takes the *first* arm that matches.
 
     So reaching arm N means arms 1..N-1 all failed, and without saying so an
@@ -118,16 +119,17 @@ def _after_earlier_arms(stmt: dict, subject: str, siblings, origin: str) -> list
             continue
         if norm(subject).upper() in ("TRUE", "FALSE"):
             alts = condition_atoms(value, norm(subject).upper() == "TRUE",
-                                   origin)
+                                   origin, names)
             out.extend(alts[0] if alts else [])
         else:
             alts = condition_atoms(when_condition(subject, value), True,
-                                   origin)
+                                   origin, names)
             out.extend(alts[0] if alts else [])
     return out
 
 
-def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
+def _when_guards(stmt: dict, subject: str, siblings, origin: str,
+                 names: frozenset = frozenset()) -> list:
     value = norm(stmt.get("attributes", {}).get("value", ""))
     if not subject:
         return []
@@ -142,14 +144,16 @@ def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
                 sv = norm(sib.get("attributes", {}).get("value", ""))
                 if sib is stmt or sv.upper() in ("OTHER", "ANY") or not sv:
                     continue
-                alts = condition_atoms(sv, not invert, origin)
+                alts = condition_atoms(sv, not invert, origin, names)
                 out.extend(alts[0] if alts else [])
             return out
-        own = first_with_alternatives(condition_atoms(value, invert, origin))
+        own = first_with_alternatives(condition_atoms(value, invert, origin,
+                                                      names))
         # The arm's own condition is the point of the plan, so it is settled
         # first; the preceding arms it must out-rank are real obligations but
         # secondary, and binding them first consumes the slots it needs.
-        return own + _after_earlier_arms(stmt, subject, siblings, origin)
+        return own + _after_earlier_arms(stmt, subject, siblings, origin,
+                                         names)
 
     subj = Term("var", name=parse_term(subject).name)
     if value.upper() in ("OTHER", "ANY"):
@@ -159,41 +163,46 @@ def _when_guards(stmt: dict, subject: str, siblings, origin: str) -> list:
             sv = norm(sib.get("attributes", {}).get("value", ""))
             if sib is stmt or sv.upper() in ("OTHER", "ANY") or not sv:
                 continue
-            branch = condition_atoms(when_condition(subject, sv), True, origin)
+            branch = condition_atoms(when_condition(subject, sv), True, origin,
+                                     names)
             out.extend(branch[0] if branch else [])
         return out
     # `WHEN 1 THRU 9` and `WHEN > 10` are a range and a relation, not values
     # to compare the subject against; rendering them as `subject = <phrase>`
     # invents a field named after the phrase and the arm becomes unplannable.
     own = first_with_alternatives(
-        condition_atoms(when_condition(subject, value), False, origin))
+        condition_atoms(when_condition(subject, value), False, origin, names))
     if not own:
         return []
-    return own + _after_earlier_arms(stmt, subject, siblings, origin)
+    return own + _after_earlier_arms(stmt, subject, siblings, origin, names)
 
 
-def _loop_guards(stmt: dict, origin: str) -> tuple[list, dict]:
+def _loop_guards(stmt: dict, origin: str,
+                 names: frozenset = frozenset()) -> tuple[list, dict]:
     attrs = stmt.get("attributes", {})
     induction: dict = {}
     m = _VARYING.search(norm(attrs.get("varying") or ""))
     if m:
         induction[m.group(1).upper()] = parse_term(m.group(2)).value
         return first_with_alternatives(
-            condition_atoms(m.group(4), True, origin)), induction
+            condition_atoms(m.group(4), True, origin, names)), induction
     cond = attrs.get("condition") or attrs.get("until") or ""
     if cond:
         return first_with_alternatives(
-            condition_atoms(cond, True, origin)), induction
+            condition_atoms(cond, True, origin, names)), induction
     return [], induction
 
 
-def walk_guarded(paragraph: dict, visit):
+def walk_guarded(paragraph: dict, visit, names: frozenset = frozenset()):
     """Walk a paragraph handing each statement the conditions enclosing it.
 
     ``ELSE`` is the subtle one.  It arrives as a *child* of the IF, so the
     naive walk gives its body the IF's condition - the exact opposite of
     the truth.  Here the then-branch and the else-branch are walked
     separately, with the condition and its negation respectively.
+
+    ``names`` is the level-88 table, forwarded to the condition parser so an
+    abbreviated relation never mistakes a condition-name for an operand.
     """
     name = paragraph["name"]
 
@@ -220,8 +229,8 @@ def walk_guarded(paragraph: dict, visit):
 
             if kind == "IF":
                 condition = attrs.get("condition", "")
-                yes = condition_atoms(condition, False, origin)
-                no = condition_atoms(condition, True, origin)
+                yes = condition_atoms(condition, False, origin, names)
+                no = condition_atoms(condition, True, origin, names)
                 then_part = [c for c in children if c.get("type") != "ELSE"]
                 else_part = [c for c in children if c.get("type") == "ELSE"]
                 rec(then_part, list(guards) + first_with_alternatives(yes),
@@ -240,14 +249,15 @@ def walk_guarded(paragraph: dict, visit):
                     visit(arm, name, substitute(guards, induction),
                           dict(induction), dict(literals))
                     own = _when_guards(arm, subject, children,
-                                       "%s:%d" % (name, arm.get("line_start", line)))
+                                       "%s:%d" % (name, arm.get("line_start", line)),
+                                       names)
                     rec(arm.get("children") or [], list(guards) + own,
                         dict(induction), literals)
                 continue
 
             own, induct = ([], {})
             if kind.startswith("PERFORM"):
-                own, induct = _loop_guards(stmt, origin)
+                own, induct = _loop_guards(stmt, origin, names)
             merged = dict(induction)
             merged.update(induct)
             rec(children, list(guards) + own, merged, literals)
@@ -273,6 +283,7 @@ def obligations_for_branch(program, paragraph: str, line: int,
     para = program.paragraph(paragraph)
     if para is None:
         return []
+    names = frozenset(program.model.condition_names)
     found: list = []
 
     # A WHEN arm does not carry its own subject; the EVALUATE above it does.
@@ -303,21 +314,22 @@ def obligations_for_branch(program, paragraph: str, line: int,
         own: list = []
         if kind == "IF":
             alts = condition_atoms(attrs.get("condition", ""), not direction,
-                                   origin)
+                                   origin, names)
             own = first_with_alternatives(alts)
         elif kind == "WHEN":
             subject, siblings = subjects.get(line, ("", [stmt]))
-            own = _when_guards(stmt, subject, siblings or [stmt], origin)
+            own = _when_guards(stmt, subject, siblings or [stmt], origin,
+                               names)
             if not direction:
                 own = [a for atom in own for a in negate_atom(atom)]
         elif kind.startswith("PERFORM"):
-            own, _induct = _loop_guards(stmt, origin)
+            own, _induct = _loop_guards(stmt, origin, names)
             if not direction:
                 own = [a for atom in own for a in negate_atom(atom)]
         if own or guards:
             found.extend(list(guards) + list(own))
 
-    walk_guarded(para, visit)
+    walk_guarded(para, visit, names)
     if not found:
         return found
 
@@ -326,7 +338,7 @@ def obligations_for_branch(program, paragraph: str, line: int,
     # so every decision after the first escape is unreachable unless that is
     # said. The same computation already guards call sites; it was simply
     # never applied to the decisions themselves.
-    for escape_line, ways in _escapes(para):
+    for escape_line, ways in _escapes(para, names):
         if escape_line >= line:
             continue
         for negation in ways:
@@ -393,7 +405,7 @@ def terminations(program, paragraph: str, seen=None) -> tuple[list, bool]:
                 else:
                     always[0] = True
 
-    walk_guarded(para, visit)
+    walk_guarded(para, visit, frozenset(program.model.condition_names))
     return found, always[0]
 
 
@@ -456,6 +468,7 @@ def build_graph(program) -> dict:
     graph: dict = {}
     alters: list = []
     order = program.paragraph_names
+    names = frozenset(program.model.condition_names)
 
     for para in program.paragraphs:
         sites: list = []
@@ -504,11 +517,11 @@ def build_graph(program) -> dict:
                 _sites.append(CallSite(pname, attrs["destination"], line,
                                        list(guards), "alter"))
 
-        walk_guarded(para, visit)
+        walk_guarded(para, visit, names)
         # Reaching anything at line N means no earlier guarded escape fired.
         # Without this a GO TO late in a paragraph looks unconditional, and
         # the ladder lifts no obligation at all for the hop it enables.
-        escapes = _escapes(para)
+        escapes = _escapes(para, names)
         for site in sites:
             for line, ways in escapes:
                 if line >= site.line:
@@ -535,7 +548,7 @@ def build_graph(program) -> dict:
 
     for i, name in enumerate(order[:-1]):
         para = program.paragraphs[i]
-        guards, escapes = _fallthrough_guards(para)
+        guards, escapes = _fallthrough_guards(para, names)
         if escapes:
             continue                       # control always leaves first
         nxt = order[i + 1]
@@ -592,7 +605,7 @@ def completes(statements) -> bool:
     return True
 
 
-def _escapes(paragraph: dict) -> list:
+def _escapes(paragraph: dict, names: frozenset = frozenset()) -> list:
     """Guarded ways out of a paragraph, each with the ways to avoid it.
 
     ``NOT (A AND B)`` is satisfied by negating *either* conjunct, so an
@@ -613,11 +626,12 @@ def _escapes(paragraph: dict) -> list:
         ways = [negate_atom(g) for g in reversed(list(own_guards))]
         out.append((stmt.get("line_start", 0), ways))
 
-    walk_guarded(paragraph, visit)
+    walk_guarded(paragraph, visit, names)
     return out
 
 
-def _fallthrough_guards(paragraph: dict) -> tuple[list, bool]:
+def _fallthrough_guards(paragraph: dict,
+                        names: frozenset = frozenset()) -> tuple[list, bool]:
     """What must hold for control to run off the end of a paragraph.
 
     Falling through is not unconditional: every guarded ``GO TO`` or
@@ -641,7 +655,7 @@ def _fallthrough_guards(paragraph: dict) -> tuple[list, bool]:
         innermost = own_guards[-1]
         guards.extend(negate_atom(own_guards[-1]))
 
-    walk_guarded(paragraph, visit)
+    walk_guarded(paragraph, visit, names)
     return guards, escaped[0]
 
 

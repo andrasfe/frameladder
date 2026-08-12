@@ -4844,3 +4844,139 @@ class TestParagraphSummary(unittest.TestCase):
         prog = program(self.SRC)
         self.assertEqual(set(summarise_program(prog)),
                          set(prog.paragraph_names))
+
+
+class TestConditionNamesAreNotOperands(unittest.TestCase):
+    """`UNTIL WS-IDX >= 11 OR USER-EOF` tests the flag, not `WS-IDX >= flag`.
+
+    The abbreviated-relation expansion restored the subject onto every bare
+    part; a level-88 name became an operand, the comparison against its
+    empty pseudo-value was true from the first iteration, and every read
+    loop written in this (entirely standard) style ran zero times.
+    """
+
+    SRC = HEADER + """       01  WS-IDX PIC S9(4) COMP VALUE 0.
+       01  WS-EOF-FLG PIC X VALUE 'N'.
+           88 AT-EOF VALUE 'Y'.
+       01  WS-COUNT PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE 1 TO WS-IDX
+           PERFORM UNTIL WS-IDX >= 4 OR AT-EOF
+               ADD 1 TO WS-COUNT
+               ADD 1 TO WS-IDX
+           END-PERFORM
+           GOBACK
+           .
+"""
+
+    def test_the_loop_runs_when_the_flag_is_off(self):
+        from frameladder.interpreter import Interpreter
+        from frameladder.ir import parse_term
+        prog = program(self.SRC)
+        interp = Interpreter(prog, {})
+        interp.run("MAIN-PARA")
+        self.assertEqual(interp.value_of(parse_term("WS-COUNT")), 3)
+
+    def test_the_name_is_only_special_when_declared(self):
+        from frameladder.conditions import condition_atoms
+        with_names = condition_atoms("WS-IDX >= 4 OR AT-EOF",
+                                     names=frozenset({"AT-EOF"}))
+        self.assertEqual([str(a) for alt in with_names for a in alt],
+                         ["WS-IDX >= 4", "AT-EOF = True"])
+        without = condition_atoms("WS-IDX >= 4 OR AT-EOF")
+        self.assertIn("WS-IDX >= AT-EOF",
+                      [str(a) for alt in without for a in alt])
+
+
+class TestStagedStubSearch(unittest.TestCase):
+    """The battery phase that works backward from an unwitnessed direction
+    to the operation whose staged outcome takes it."""
+
+    SRC = HEADER + """       01  WS-RC PIC S9(8) COMP VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM READ-THING
+           GOBACK
+           .
+       READ-THING.
+           EXEC CICS READ DATASET(WS-FILE) INTO(WS-REC) RESP(WS-RC)
+           END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN DFHRESP(NOTFND)
+                   CONTINUE
+               WHEN OTHER
+                   CONTINUE
+           END-EVALUATE
+           .
+"""
+
+    def _search(self, budget=60):
+        from frameladder import stubsearch
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        from frameladder.ladder import analyse
+        from frameladder.ledger import Ledger
+        prog = program(self.SRC)
+        graph, prov = analyse(prog)
+        ledger = Ledger()
+
+        def run(state, world, stubs, terminals, source):
+            interp = Interpreter(prog, dict(state or {}), stubs=stubs,
+                                 terminals=terminals,
+                                 defaults=io_defaults(prog, world))
+            trace = interp.run("MAIN-PARA")
+            return ledger.credit(trace, state or {}, world, stubs,
+                                 terminals, source)
+
+        run({}, "populated", None, None, "seed")
+        stats = stubsearch.search(prog, prov, graph, ledger, run,
+                                  budget=budget)
+        return prog, ledger, stats
+
+    def test_every_arm_direction_is_witnessed_by_staging_the_resp(self):
+        from frameladder.ledger import missing
+        prog, ledger, stats = self._search()
+        self.assertEqual(missing(prog, ledger), [])
+        self.assertGreater(stats["directions_witnessed"], 0)
+
+    def test_every_witness_reproduces_from_its_stored_recipe(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        from frameladder.lift import direction_key
+        prog, ledger, _stats = self._search()
+        for key, recipe in ledger.witnesses.items():
+            payload = recipe.payload()
+            interp = Interpreter(prog, dict(payload["input_state"]),
+                                 stubs=payload["stubs"],
+                                 terminals=payload["terminals"],
+                                 defaults=io_defaults(prog,
+                                                      payload["world"]))
+            trace = interp.run("MAIN-PARA")
+            self.assertIn(key, {direction_key(g) for g in trace.guards})
+
+    def test_the_index_names_every_arm(self):
+        from frameladder import stubsearch
+        prog = program(self.SRC)
+        info = stubsearch.branch_index(prog)
+        self.assertIn(("READ-THING", 2, "WHEN"), info)
+
+    def test_staging_merges_over_the_base_recipes_own_stubs(self):
+        # A base whose plan already stages the operation keeps its other
+        # fields: replacing the entry list threw away the staging that made
+        # the base reach anywhere.
+        from frameladder import stubsearch
+        prog = program(self.SRC)
+        base = ({}, "populated",
+                {"EXEC:CICS:READ": [{"when": {}, "set": {"WS-REC": "AA"},
+                                     "seq": 0, "inferred": False}]},
+                {})
+        actions = [("stub", "EXEC:CICS:READ", {}, "WS-RC", 13,
+                    "READ-THING")]
+        state, world, stubs, terminals = next(iter(
+            stubsearch.staged_recipes(prog.model, base, actions)))
+        entry = stubs["EXEC:CICS:READ"][0]
+        self.assertEqual(entry["set"].get("WS-REC"), "AA")
+        self.assertEqual(entry["set"].get("WS-RC"), 13)

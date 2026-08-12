@@ -267,6 +267,7 @@ class Provenance:
         return out
 
     def _index(self):
+        names = frozenset(self.model.condition_names)
         for para in self.program.paragraphs:
             def visit(stmt, pname, guards, induction, literals):
                 kind = stmt.get("type", "")
@@ -365,7 +366,7 @@ class Provenance:
                                 self._add(g.upper(), Writer(pname, line, kind,
                                                             source=text,
                                                             guards=tuple(guards)))
-            walk_guarded(para, visit)
+            walk_guarded(para, visit, names)
 
     def _is_payload(self, var: str) -> bool:
         return any(w.kind == "STUB" for w in self.writers.get(var.upper(), []))
@@ -385,12 +386,13 @@ class Provenance:
 
     def _harvest_literals(self):
         from .ir import norm as _norm
+        names = frozenset(self.model.condition_names)
 
         def take(text):
             """Every literal a condition compares a field against."""
             if not text:
                 return
-            for alts in condition_atoms(text):
+            for alts in condition_atoms(text, names=names):
                 for atom in alts:
                     # `IS NUMERIC` says what shape the value has, not what it
                     # is. Filing "NUMERIC" as a candidate value hands the
