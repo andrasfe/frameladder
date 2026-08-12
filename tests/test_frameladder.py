@@ -4980,3 +4980,217 @@ class TestStagedStubSearch(unittest.TestCase):
         entry = stubs["EXEC:CICS:READ"][0]
         self.assertEqual(entry["set"].get("WS-REC"), "AA")
         self.assertEqual(entry["set"].get("WS-RC"), 13)
+
+
+class TestReentry(unittest.TestCase):
+    """Runs shaped to complete cycle 1 and re-enter (frameladder.reentry).
+
+    A pseudo-conversational program keeps its state machine in the
+    commarea and most of its source runs only on a second task. These pin
+    the evidence the shapes are derived from, and the interpreter's task
+    boundary: what cycle 1 saves is what cycle 2 receives, and the entry
+    state speaks only at input boundaries - the first task's commarea and
+    every RECEIVE - never over a later cycle's own writes.
+    """
+
+    SRC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. RE.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-TRANID PIC X(4) VALUE 'TT01'.
+       01  CARDDEMO-COMMAREA.
+           05  CDEMO-FLAG PIC X VALUE 'N'.
+               88  CDEMO-REENTER VALUE 'Y'.
+           05  CDEMO-FROM PIC X(8).
+       01  SCREEN-AREA.
+           05  NAMEI PIC X(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           IF EIBCALEN = 0
+               GOBACK
+           END-IF
+           MOVE DFHCOMMAREA(1:EIBCALEN) TO CARDDEMO-COMMAREA
+           IF NOT CDEMO-REENTER
+               SET CDEMO-REENTER TO TRUE
+               MOVE 'PGMONE' TO CDEMO-FROM
+           ELSE
+               EXEC CICS RECEIVE MAP('M') INTO(SCREEN-AREA) END-EXEC
+               EVALUATE EIBAID
+                   WHEN DFHENTER
+                       PERFORM CHECK-NAME
+                   WHEN DFHPF3
+                       GOBACK
+               END-EVALUATE
+           END-IF
+           EXEC CICS RETURN TRANSID(WS-TRANID)
+                COMMAREA(CARDDEMO-COMMAREA) END-EXEC.
+       CHECK-NAME.
+           IF NAMEI = 'AB'
+               CONTINUE
+           END-IF
+           IF CDEMO-FROM = 'PGMONE'
+               CONTINUE
+           END-IF.
+"""
+
+    def _directions(self, prog, state):
+        from frameladder.ledger import Ledger
+        led = Ledger()
+        trace = Interpreter(prog, dict(state)).run("MAIN-PARA")
+        led.credit(trace, state, "bare", {}, {}, "test")
+        return {(p, k, d) for (p, _o, k, d) in led.witnesses}
+
+    def test_return_commarea_is_the_evidence_gate(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        self.assertEqual(reentry.return_commareas(prog),
+                         ["CARDDEMO-COMMAREA"])
+        batch = program(HEADER + """       PROCEDURE DIVISION.
+       B-MAIN.
+           GOBACK.
+""")
+        self.assertEqual(reentry.return_commareas(batch), [])
+        self.assertEqual(reentry.reentry_states(batch, {}), [])
+
+    def test_aid_values_come_from_the_source_comparisons(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        # DFHENTER and DFHPF3 are compared; DFHPF12 is not, so its byte
+        # must not be offered - the table only says what a name stands for.
+        self.assertEqual(reentry.aid_comparisons(prog),
+                         {"EIBAID": ["'", "3"]})
+
+    def test_evaluate_true_spelling_is_the_same_evidence(self):
+        from frameladder import reentry
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  CA.
+           05  CA-F PIC X.
+       PROCEDURE DIVISION.
+       M-PARA.
+           EVALUATE TRUE
+               WHEN EIBAID IS EQUAL TO DFHPF5
+                   CONTINUE
+               WHEN OTHER
+                   CONTINUE
+           END-EVALUATE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(CA) END-EXEC.
+""")
+        self.assertEqual(reentry.aid_comparisons(prog), {"EIBAID": ["5"]})
+
+    def test_states_carry_a_commarea_length_and_one_key_each(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        states = reentry.reentry_states(prog, {"NAMEI": ["AB"]})
+        self.assertTrue(states)
+        for _name, state in states:
+            self.assertEqual(state["EIBCALEN"], 9)     # X(1) + X(8)
+            self.assertIn(state["EIBAID"], ("'", "3"))
+
+    def test_one_recipe_spans_the_cycles(self):
+        # Cycle 1 sets the re-enter flag and saves it; cycle 2 receives the
+        # map and dispatches on the key. One entry state takes directions on
+        # both sides of the task boundary - and the flag arrives set by the
+        # program, not by the entry state, which never names it.
+        prog = program(self.SRC)
+        taken = self._directions(prog, {"EIBCALEN": 9, "EIBAID": "'",
+                                        "NAMEI": "AB"})
+        self.assertIn(("MAIN-PARA", "IF", False), taken)     # cycle 1: no flag
+        self.assertIn(("CHECK-NAME", "IF", True), taken)     # cycle 2: dispatched
+        # And replayable: a fresh interpreter takes the same directions.
+        self.assertEqual(taken, self._directions(
+            prog, {"EIBCALEN": 9, "EIBAID": "'", "NAMEI": "AB"}))
+
+    def test_cycle_two_sees_what_cycle_one_wrote_not_the_entry(self):
+        # Cycle 1 writes PGMONE over the entry's CDEMO-FROM. The second
+        # cycle must see the program's value: the commarea belongs to the
+        # previous cycle, and the entry state may not overwrite it.
+        prog = program(self.SRC)
+        taken = self._directions(prog, {"EIBCALEN": 9, "EIBAID": "'",
+                                        "NAMEI": "AB",
+                                        "CDEMO-FROM": "OTHERPGM"})
+        self.assertIn(("CHECK-NAME", "IF", True), taken)
+
+    def test_a_childless_saved_area_carries_bytes(self):
+        # COACTUPC's pattern: the RETURN area is PIC X(n) assembled by
+        # slices, so there are no child fields to carry - the bytes are the
+        # only carrier, and dropping them makes every task look first.
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  WS-SAVE PIC X(9).
+       01  CA.
+           05  CA-FLAG PIC X.
+               88  CA-REENTER VALUE 'Y'.
+           05  CA-FROM PIC X(8).
+       PROCEDURE DIVISION.
+       M-PARA.
+           MOVE DFHCOMMAREA(1:9) TO CA
+           IF NOT CA-REENTER
+               SET CA-REENTER TO TRUE
+           ELSE
+               PERFORM M-DEEP
+           END-IF
+           MOVE CA TO WS-SAVE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(WS-SAVE) END-EXEC.
+       M-DEEP.
+           CONTINUE.
+""")
+        trace = Interpreter(prog, {"EIBCALEN": 9}).run("M-PARA")
+        self.assertIn("M-DEEP", trace.entered)
+
+    def test_entry_names_the_first_commarea_only(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        # CDEMO-FROM is a commarea target field: the entry state stands for
+        # what the caller staged, so it survives the first task's move...
+        taken = self._directions(prog, {"EIBCALEN": 9,
+                                        "CDEMO-FROM": "PGMX"})
+        self.assertIn(("MAIN-PARA", "IF", False), taken)
+        # ...and the evidence walk offers the field a value at all.
+        self.assertIn("CARDDEMO-COMMAREA", reentry.commarea_targets(prog))
+
+    def test_refmod_slices_assemble_a_template(self):
+        from frameladder import reentry
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  CA.
+           05  CA-F PIC X.
+       01  DATEI PIC X(5).
+       PROCEDURE DIVISION.
+       M-PARA.
+           EVALUATE TRUE
+               WHEN DATEI(1:2) IS NOT NUMERIC
+                   CONTINUE
+               WHEN DATEI(3:1) NOT EQUAL '-'
+                   CONTINUE
+               WHEN DATEI(4:2) IS NOT NUMERIC
+                   CONTINUE
+           END-EVALUATE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(CA) END-EXEC.
+""")
+        self.assertEqual(reentry._refmod_templates(prog).get("DATEI"),
+                         "11-11")
+
+    def test_resp_fault_worlds_use_the_programs_own_codes(self):
+        from frameladder import reentry
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  WS-RC PIC S9(8) COMP.
+       01  CA.
+           05  CA-F PIC X.
+       01  REC.
+           05  REC-F PIC X(4).
+       PROCEDURE DIVISION.
+       M-PARA.
+           EXEC CICS READ DATASET('F') INTO(REC) RESP(WS-RC) END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN DFHRESP(NOTFND)
+                   CONTINUE
+           END-EVALUATE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(CA) END-EXEC.
+""")
+        worlds = reentry.resp_fault_worlds(prog, {"WS-RC": [0, 13]})
+        self.assertTrue(worlds)
+        codes = {entry["set"]["WS-RC"]
+                 for spec in worlds
+                 for entry in spec["stubs"]["EXEC:CICS:READ"]}
+        self.assertIn(13, codes)                      # the compared fault
+        self.assertNotIn(19, codes)                   # never a whole table

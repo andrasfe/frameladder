@@ -1994,7 +1994,9 @@ def cmd_witnesses(args):
     #    fault at one position in the series. These are recipes in their own
     #    right and reach code no per-direction plan reaches.
     graph, prov = analyse(program)
-    worlds = sequence_worlds(program, prov, prov.literals) +         fault_worlds(program, prov, prov.literals)
+    from .reentry import reentry_states, resp_fault_worlds
+    worlds = sequence_worlds(program, prov, prov.literals) +         fault_worlds(program, prov, prov.literals) + \
+        resp_fault_worlds(program, overlay_pool)
     for spec in worlds:
         states = [{}] + [{n: _rng_choice(v, args.seed + i) for n, v in
                           overlay_pool.items()}
@@ -2004,6 +2006,28 @@ def cmd_witnesses(args):
         for state in states:
             run(state, spec["world"], spec["stubs"], spec["terminals"],
                 "world:%s" % spec["name"])
+
+    # 2.2 Re-entry: runs shaped to complete cycle 1 and come back. On a
+    #     pseudo-conversational program most of the source runs only on a
+    #     second task - after the re-enter flag is saved into the commarea,
+    #     with an attention key pressed and the map filled - and no
+    #     single-cycle-shaped state ever arrives there. The shapes are
+    #     evidence from this program (frameladder.reentry); the derived
+    #     outside worlds are crossed in because the second cycle is where
+    #     the file and RESP faults are actually tested. Before the stub and
+    #     frontier phases on purpose: a second-cycle recipe is a base the
+    #     stub search can stage against and a seed the lift can extend.
+    for index, (name, state) in enumerate(
+            reentry_states(program, overlay_pool, draws=args.overlays)):
+        for world in WORLDS:
+            run(state, world, {}, {}, "reentry:%s" % name)
+        # The outside worlds multiply, so only the completed-screen states
+        # (one per attention key, listed first) are crossed with them.
+        if index < 40:
+            lift_seeds.append((state, "populated", None, None))
+            for spec in worlds:
+                run(state, spec["world"], spec["stubs"], spec["terminals"],
+                    "reentry:%s|world:%s" % (name, spec["name"]))
 
     # 2.5 The staged stub search, worked backward from what is still
     #     missing: which operation writes the tested field (provenance),
