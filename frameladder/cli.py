@@ -1921,6 +1921,12 @@ def cmd_witnesses(args):
             return
         ledger.credit(trace, state or {}, world, stubs, terminals, source)
 
+    # Everything the battery runs is also a place the frontier search can
+    # start: a derived plan carries the staged stubs that put a run past a
+    # guard no bare state reaches, and a sequence world puts it past the end
+    # of a file. Collected as phases 1 and 2 go by, spent in phase 3.
+    lift_seeds = [({}, w, None, None) for w in WORLDS]
+
     # 1. Every plan, even one with an open obligation: an unsolved plan still
     #    runs, and running the 804 unsolved measured +122 verified. The solver
     #    got as far as it could; the run finds out what that buys.
@@ -1937,6 +1943,8 @@ def cmd_witnesses(args):
             states = [plan.input_state()]
             states += _overlay_states(plan, overlay_pool, args.overlays,
                                       seed=args.seed)
+            lift_seeds.append((plan.input_state(), "bare", plan.stub_plan(),
+                               plan.terminals))
             for world in WORLDS:
                 for state in states:
                     run(state, world, plan.stub_plan(), plan.terminals,
@@ -1951,9 +1959,50 @@ def cmd_witnesses(args):
         states = [{}] + [{n: _rng_choice(v, args.seed + i) for n, v in
                           overlay_pool.items()}
                          for i in range(max(0, args.overlays))]
+        lift_seeds.append(({}, spec["world"], spec["stubs"],
+                           spec["terminals"]))
         for state in states:
             run(state, spec["world"], spec["stubs"], spec["terminals"],
                 "world:%s" % spec["name"])
+
+    # 3. The frontier search, credited. The residual after phases 1 and 2 is
+    #    dominated by directions needing mid-run state no entry value
+    #    survives to - a flag an earlier validation set, a compound guard on
+    #    a re-entry field - which is exactly the case `lift` exists for. Its
+    #    runs start at the entry point with an edited entry state and the
+    #    seed's staged stubs, so each is a recipe in its own right. It is
+    #    credited only through a replay: the trace says which directions are
+    #    new, then the same recipe is run through a fresh interpreter by
+    #    `run()` above and whatever *that* run takes is what the ledger
+    #    records. A recipe whose replay does not take the direction is not a
+    #    witness, and the gap between the two is reported rather than
+    #    absorbed.
+    lift_report = None
+    if args.lift:
+        from .lift import direction_key, lift as _lift
+        repro = {"recipes": 0, "recipes_exact": 0,
+                 "directions_attempted": 0, "directions_reproduced": 0}
+
+        def credit_lift_run(trace, state, world, stubs, terminals):
+            new = ({direction_key(g) for g in trace.guards}
+                   - set(ledger.witnesses))
+            if not new:
+                return
+            repro["recipes"] += 1
+            repro["directions_attempted"] += len(new)
+            run(state, world, stubs, terminals, "lift")
+            reproduced = sum(1 for k in new if k in ledger.witnesses)
+            repro["directions_reproduced"] += reproduced
+            repro["recipes_exact"] += (reproduced == len(new))
+
+        result = _lift(program, entry, seeds=lift_seeds,
+                       defaults_for=lambda w: io_defaults(program, w),
+                       budget=args.lift, on_run=credit_lift_run)
+        lift_report = dict(result["stats"])
+        lift_report["reproduction"] = dict(repro)
+        lift_report["reproduction"]["rate_pct"] = round(
+            100.0 * repro["directions_reproduced"]
+            / max(1, repro["directions_attempted"]), 1)
 
     gaps = missing(program, ledger)
     payload = {"program": program.name, "entry": entry,
@@ -1961,6 +2010,7 @@ def cmd_witnesses(args):
                "witnessed": len(ledger.witnesses),
                "witness_pct": round(ledger.coverage(total), 1),
                "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
+               "lift": lift_report,
                "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
                             "kind": b.kind, "direction": d,
                             "condition": b.condition, "line": b.line}
@@ -1973,6 +2023,13 @@ def cmd_witnesses(args):
         print("%s   %d/%d directions witnessed  (%.1f%%)   %d runs"
               % (p["program"], p["witnessed"], p["directions_total"],
                  p["witness_pct"], p["runs"]))
+        if p.get("lift"):
+            rep = p["lift"]["reproduction"]
+            print("   lift: %d runs, %d recipes credited, reproduction "
+                  "%d/%d directions (%.1f%%)"
+                  % (p["lift"]["runs"], rep["recipes"],
+                     rep["directions_reproduced"],
+                     rep["directions_attempted"], rep["rate_pct"]))
         if p["missing"]:
             print("   first missing:")
             for row in p["missing"][:10]:
@@ -2210,6 +2267,10 @@ def build_parser():
     wt.add_argument("--overlays", type=int, default=2)
     wt.add_argument("--seed", type=int, default=7)
     wt.add_argument("--limit", type=int, default=40)
+    wt.add_argument("--lift", type=int, default=300, metavar="N",
+                    help="up to N frontier-search runs after the battery, "
+                         "each replayed through a fresh interpreter before "
+                         "its directions are credited; 0 disables")
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
     wt.set_defaults(func=cmd_witnesses)

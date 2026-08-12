@@ -1999,6 +1999,102 @@ class TestLift(unittest.TestCase):
         self.assertEqual(sorted(map(str, first.directions_hit)),
                          sorted(map(str, second.directions_hit)))
 
+    def test_every_run_carries_a_replayable_recipe(self):
+        # `on_run` hands back the trace *and* what produced it. The claim it
+        # exists for - a lift run starts at entry with an edited entry state,
+        # so the recipe replays - is checked here rather than assumed: every
+        # recipe re-run through a fresh interpreter takes the same directions.
+        from frameladder.conformance_defaults import io_defaults, WORLDS
+        from frameladder.lift import direction_key, lift
+        p = program(HEADER + """       01  WS-IN  PIC X(8).
+       01  WS-REC.
+           05  WS-ONE PIC X(4).
+           05  WS-TWO PIC X(4).
+       PROCEDURE DIVISION.
+       RC-MAIN.
+           MOVE WS-IN TO WS-REC
+           IF WS-TWO = 'ZZZZ'
+              PERFORM RC-DEEP
+           END-IF
+           GOBACK
+           .
+       RC-DEEP.
+           EXIT
+           .
+""")
+        recipes = []
+        lift(p, "RC-MAIN", seeds=[({}, w) for w in WORLDS],
+             defaults_for=lambda w: io_defaults(p, w), budget=40,
+             on_run=lambda *run: recipes.append(run))
+        self.assertTrue(recipes)
+        for trace, state, world, stubs, terminals in recipes:
+            fresh = Interpreter(p, dict(state), stubs=stubs,
+                                terminals=terminals,
+                                defaults=io_defaults(p, world)).run("RC-MAIN")
+            self.assertEqual({direction_key(g) for g in trace.guards},
+                             {direction_key(g) for g in fresh.guards})
+        # And at least one recipe is the one only the frontier finds: the
+        # guard reads bytes the entry state reaches through the group move.
+        self.assertTrue(any(
+            direction_key(g) == ("RC-MAIN", g.ordinal, "IF", True)
+            for trace, *_rest in recipes for g in trace.guards))
+
+
+class TestWitnessLift(unittest.TestCase):
+    """The witness battery's third phase: lift runs, credited via replay."""
+
+    SOURCE = HEADER + """       01  WS-IN  PIC X(8).
+       01  WS-REC.
+           05  WS-ONE PIC X(4).
+           05  WS-TWO PIC X(4).
+       PROCEDURE DIVISION.
+       WL-MAIN.
+           MOVE WS-IN TO WS-REC
+           IF WS-TWO = 'ZZZZ'
+              PERFORM WL-DEEP
+           END-IF
+           GOBACK
+           .
+       WL-DEEP.
+           EXIT
+           .
+"""
+
+    def _witnesses(self, path, *extra):
+        from frameladder.cli import build_parser, cmd_witnesses
+        args = build_parser().parse_args([path, "--json", "witnesses",
+                                          *extra])
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cmd_witnesses(args)
+
+    def test_lift_witnesses_a_direction_the_battery_misses(self):
+        # The guard needs mid-run state: the MOVE destroys anything placed
+        # in WS-TWO at entry, and WS-IN is compared against nothing so no
+        # overlay draws it. Plans and worlds miss the True direction; the
+        # frontier search reaches it through the group move's origins, and
+        # the witness it leaves must be a recipe that replays.
+        p = program(self.SOURCE)
+        before = self._witnesses(p.source_path, "--lift", "0")
+        self.assertIsNone(before["lift"])
+        missing = {(m["paragraph"], m["direction"]) for m in before["missing"]}
+        self.assertIn(("WL-MAIN", True), missing)
+
+        after = self._witnesses(p.source_path, "--lift", "40")
+        left = {(m["paragraph"], m["direction"]) for m in after["missing"]}
+        self.assertNotIn(("WL-MAIN", True), left)
+        self.assertGreater(after["witnessed"], before["witnessed"])
+
+    def test_lifted_recipes_reproduce_and_the_rate_is_reported(self):
+        p = program(self.SOURCE)
+        payload = self._witnesses(p.source_path, "--lift", "40")
+        rep = payload["lift"]["reproduction"]
+        self.assertGreater(rep["directions_attempted"], 0)
+        self.assertEqual(rep["directions_reproduced"],
+                         rep["directions_attempted"])
+        self.assertEqual(rep["rate_pct"], 100.0)
+
 
 class TestInspect(unittest.TestCase):
     """INSPECT, against the standard's own rules rather than one corpus."""
