@@ -542,6 +542,10 @@ class Interpreter:
         # plan that needs an obligation about that write - which is what
         # `blocking_writes` and `establishing_writes` are for - not a plan
         # that needs the write suppressed.
+        # The level-88 table, handed to the condition parser so an
+        # abbreviated relation never reads a condition-name as an
+        # elided operand - see `conditions.expand_abbreviated`.
+        self._names88 = frozenset(self.model.condition_names)
         self._pinned: set = set()
         self._delivered: dict = {}
         self._selector_cache: dict = {}
@@ -895,7 +899,7 @@ class Interpreter:
         text = norm(condition)
         if not text:
             return True
-        for alternative in condition_atoms(text):
+        for alternative in condition_atoms(text, names=self._names88):
             if not alternative:
                 continue
             if all(self._atom(a) for a in alternative):
@@ -1156,7 +1160,8 @@ class Interpreter:
         if not self.track_origins:
             return {}
         out: dict = {}
-        for alternative in condition_atoms(condition):
+        for alternative in condition_atoms(condition,
+                                           names=self._names88):
             for atom in alternative:
                 for term in (atom.lhs, atom.rhs):
                     if term.kind != "var":
@@ -1726,13 +1731,21 @@ class Interpreter:
     def _deliver_terminal_input(self, key: str, stmt) -> None:
         if not key.startswith(self._INPUT_OPS):
             return
+        from .origins import Origin
         from .provenance import stub_outputs
         for area in stub_outputs(norm(stmt.get("text", ""))):
             names = [area] + list(self.model.descendants(area))
             for name in names:
                 if name in self._supplied_slots or name in self._supplied.extra:
                     self.state[name] = self._supplied[name]
-                    self._note(name, None)
+                    # The value delivered here *is* the entry state's value
+                    # for this field, re-arriving at the RECEIVE - so the
+                    # entry state still decides it, and the origin says so.
+                    # Noting None instead made every screen field opaque to
+                    # the frontier search on exactly the routes where the
+                    # harness could set it: a guard on re-received operator
+                    # input was unliftable by construction.
+                    self._note(name, Origin(name, 0, None))
 
     _WRITE_FROM = re.compile(r"^(?:WRITE|REWRITE|RELEASE)\s+(\S+)\s+FROM\s+"
                              r"([A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?)", re.I)
@@ -1884,7 +1897,8 @@ class Interpreter:
 
     def _snapshot(self, condition: str) -> dict:
         out = {}
-        for alternative in condition_atoms(condition):
+        for alternative in condition_atoms(condition,
+                                           names=self._names88):
             for atom in alternative:
                 for term in (atom.lhs, atom.rhs):
                     if term.kind == "var":
@@ -2568,7 +2582,7 @@ class Interpreter:
 
     def _key_step(self, condition: str, keys: list, direction: dict) -> int:
         """+1 to look higher up the table, -1 lower, 0 when undecidable."""
-        alternatives = condition_atoms(condition)
+        alternatives = condition_atoms(condition, names=self._names88)
         if not alternatives:
             return 0
         ranked: list = []

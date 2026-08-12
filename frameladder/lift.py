@@ -247,7 +247,8 @@ def deltas_for(model, guard, want: bool, state: dict, cache: dict,
     distinguishing from one the solver merely failed on.
     """
     out, liftable = [], False
-    for alternative in condition_atoms(guard.condition, negate=not want):
+    for alternative in condition_atoms(guard.condition, negate=not want,
+                                       names=frozenset(model.condition_names)):
         if not alternative:
             continue
         delta: dict = {}
