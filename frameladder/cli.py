@@ -1942,6 +1942,39 @@ def cmd_witnesses(args):
                     run(state, world, plan.stub_plan(), plan.terminals,
                         "plan:%s:%s" % (branch.paragraph, direction))
 
+    # 1.2 A plan per paragraph, not only per direction. A paragraph plan
+    #     lifts a different obligation set than any branch plan for a
+    #     decision inside it - the coverage path has always run both, and on
+    #     one program the branch battery alone was 12 directions short of
+    #     what these add.
+    from .ladder import build_plan
+    for target in program.paragraph_names[1:]:
+        try:
+            plan = build_plan(program, target, entry=args.entry)
+        except Exception:                                    # noqa: BLE001
+            continue
+        if not plan.chain:
+            continue
+        states = [plan.input_state()]
+        states += _overlay_states(plan, overlay_pool, args.overlays,
+                                  seed=args.seed)
+        for world in WORLDS:
+            for state in states:
+                run(state, world, plan.stub_plan(), plan.terminals,
+                    "para:%s" % target)
+
+    # 1.5 Random states from the literal pool, under every world. Deliberate
+    #     hybrid, same as `coverage --sample`: backward derivation reaches
+    #     guards sampling never will; sampling reaches statements whose
+    #     obligations the ladder cannot lift at all. Measured on one program
+    #     the two sets differ by ~100 directions each way.
+    import random as _random
+    _rng = _random.Random(args.seed)
+    from .conformance_defaults import WORLDS as _W
+    for index in range(args.sample):
+        state = {n: _rng.choice(v) for n, v in overlay_pool.items()}
+        run(state, _W[index % len(_W)], None, None, "sample:%d" % index)
+
     # 2. The derived outside worlds: N records then end-of-file, and the
     #    fault at one position in the series. These are recipes in their own
     #    right and reach code no per-direction plan reaches.
@@ -2209,6 +2242,7 @@ def build_parser():
     wt.add_argument("--out", metavar="FILE")
     wt.add_argument("--overlays", type=int, default=2)
     wt.add_argument("--seed", type=int, default=7)
+    wt.add_argument("--sample", type=int, default=60)
     wt.add_argument("--limit", type=int, default=40)
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
