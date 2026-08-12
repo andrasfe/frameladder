@@ -1880,6 +1880,315 @@ def cmd_export(args):
     return _emit(payload, args.json, render)
 
 
+def cmd_witnesses(args):
+    """Harvest a witness per direction from every run the battery makes.
+
+    The run set is the export battery - every derived plan, under every I/O
+    world, from its own state and each overlay - plus the derived sequence and
+    fault worlds. The difference from `export` is the accounting: every run
+    credits *every* direction its trace took, so nothing a run demonstrates is
+    thrown away. Runs are deduplicated by their full recipe first - 563
+    corpus targets ask for only 189 distinct states, so most of the battery
+    would otherwise be re-running a run it already credited.
+    """
+    program = _program(args)
+    entry = _entry(program, args)
+    capability, _source = _capability(args, program)
+    from .conformance_defaults import WORLDS, io_defaults
+    from .coverage import branches_of
+    from .interpreter import Interpreter
+    from .ladder import analyse, plan_for_branch
+    from .ledger import Ledger, _freeze, missing
+    from .sequences import fault_worlds, sequence_worlds
+
+    ledger = Ledger()
+    seen_runs: set = set()
+    total = 2 * len(branches_of(program))
+    overlay_pool = _overlay_pool(program, capability)
+
+    def run(state, world, stubs, terminals, source):
+        key = (_freeze(state or {}), world, _freeze(stubs or {}),
+               _freeze(terminals or {}))
+        if key in seen_runs:
+            return None
+        seen_runs.add(key)
+        try:
+            interp = Interpreter(program, dict(state or {}), stubs=stubs,
+                                 terminals=terminals,
+                                 defaults=io_defaults(program, world))
+            trace = interp.run(entry)
+        except Exception:                                    # noqa: BLE001
+            return None
+        return ledger.credit(trace, state or {}, world, stubs, terminals,
+                             source)
+
+    # Everything the battery runs is also a place the frontier search can
+    # start: a derived plan carries the staged stubs that put a run past a
+    # guard no bare state reaches, and a sequence world puts it past the end
+    # of a file. Collected as phases 1 and 2 go by, spent in phase 3.
+    lift_seeds = [({}, w, None, None) for w in WORLDS]
+
+    # 1. Every plan, even one with an open obligation: an unsolved plan still
+    #    runs, and running the 804 unsolved measured +122 verified. The solver
+    #    got as far as it could; the run finds out what that buys. The recipe
+    #    each plan derived is kept: the staged-stub phase re-uses it as a base
+    #    when the plan got near its branch but the outside world said no.
+    plan_recipes: dict = {}
+    for branch in branches_of(program):
+        for direction in (True, False):
+            try:
+                plan = plan_for_branch(program, branch.paragraph, branch.line,
+                                       direction, entry=args.entry,
+                                       ordinal=branch.ordinal)
+            except Exception:                                # noqa: BLE001
+                continue
+            if not plan.chain:
+                continue
+            plan_recipes[(branch.paragraph, branch.ordinal, branch.kind,
+                          direction)] = (plan.input_state(),
+                                         plan.stub_plan(), plan.terminals)
+            states = [plan.input_state()]
+            states += _overlay_states(plan, overlay_pool, args.overlays,
+                                      seed=args.seed)
+            lift_seeds.append((plan.input_state(), "bare", plan.stub_plan(),
+                               plan.terminals))
+            for world in WORLDS:
+                for state in states:
+                    run(state, world, plan.stub_plan(), plan.terminals,
+                        "plan:%s:%s" % (branch.paragraph, direction))
+
+    # 1.2 A plan per paragraph, not only per direction. A paragraph plan
+    #     lifts a different obligation set than any branch plan for a
+    #     decision inside it - the coverage path has always run both, and on
+    #     one program the branch battery alone was 12 directions short of
+    #     what these add.
+    from .ladder import build_plan
+    for target in program.paragraph_names[1:]:
+        try:
+            plan = build_plan(program, target, entry=args.entry)
+        except Exception:                                    # noqa: BLE001
+            continue
+        if not plan.chain:
+            continue
+        states = [plan.input_state()]
+        states += _overlay_states(plan, overlay_pool, args.overlays,
+                                  seed=args.seed)
+        for world in WORLDS:
+            for state in states:
+                run(state, world, plan.stub_plan(), plan.terminals,
+                    "para:%s" % target)
+
+    # 1.5 Random states from the literal pool, under every world. Deliberate
+    #     hybrid, same as `coverage --sample`: backward derivation reaches
+    #     guards sampling never will; sampling reaches statements whose
+    #     obligations the ladder cannot lift at all. Measured on one program
+    #     the two sets differ by ~100 directions each way.
+    import random as _random
+    _rng = _random.Random(args.seed)
+    from .conformance_defaults import WORLDS as _W
+    for index in range(args.sample):
+        state = {n: _rng.choice(v) for n, v in overlay_pool.items()}
+        run(state, _W[index % len(_W)], None, None, "sample:%d" % index)
+
+    # 2. The derived outside worlds: N records then end-of-file, and the
+    #    fault at one position in the series. These are recipes in their own
+    #    right and reach code no per-direction plan reaches.
+    graph, prov = analyse(program)
+    from .reentry import reentry_states, resp_fault_worlds
+    worlds = sequence_worlds(program, prov, prov.literals) +         fault_worlds(program, prov, prov.literals) + \
+        resp_fault_worlds(program, overlay_pool)
+    for spec in worlds:
+        states = [{}] + [{n: _rng_choice(v, args.seed + i) for n, v in
+                          overlay_pool.items()}
+                         for i in range(max(0, args.overlays))]
+        lift_seeds.append(({}, spec["world"], spec["stubs"],
+                           spec["terminals"]))
+        for state in states:
+            run(state, spec["world"], spec["stubs"], spec["terminals"],
+                "world:%s" % spec["name"])
+
+    # 2.2 Re-entry: runs shaped to complete cycle 1 and come back. On a
+    #     pseudo-conversational program most of the source runs only on a
+    #     second task - after the re-enter flag is saved into the commarea,
+    #     with an attention key pressed and the map filled - and no
+    #     single-cycle-shaped state ever arrives there. The shapes are
+    #     evidence from this program (frameladder.reentry); the derived
+    #     outside worlds are crossed in because the second cycle is where
+    #     the file and RESP faults are actually tested. Before the stub and
+    #     frontier phases on purpose: a second-cycle recipe is a base the
+    #     stub search can stage against and a seed the lift can extend.
+    for index, (name, state) in enumerate(
+            reentry_states(program, overlay_pool, draws=args.overlays)):
+        for world in WORLDS:
+            run(state, world, {}, {}, "reentry:%s" % name)
+        # The outside worlds multiply, so only the completed-screen states
+        # (one per attention key, listed first) are crossed with them.
+        if index < 40:
+            lift_seeds.append((state, "populated", None, None))
+            for spec in worlds:
+                run(state, spec["world"], spec["stubs"], spec["terminals"],
+                    "reentry:%s|world:%s" % (name, spec["name"]))
+
+    # 2.5 The staged stub search, worked backward from what is still
+    #     missing: which operation writes the tested field (provenance),
+    #     which codes the arms name (the program's own DFHRESP list, OTHER
+    #     as their complement), staged at one position in the series over a
+    #     run that already got near. Runs before the frontier search on
+    #     purpose - each witnessing recipe becomes a lift seed, so the
+    #     frontier can extend *inside* a staged world - and again after it,
+    #     with whatever budget is left, because a direction lift witnessed
+    #     is a new base recipe for a deeper stub-gated one.
+    stub_report = None
+    if args.stub_search:
+        from .stubsearch import search as _stub_search
+        stub_report = _stub_search(program, prov, graph, ledger, run,
+                                   budget=args.stub_search,
+                                   plan_recipes=plan_recipes,
+                                   on_witness=lift_seeds.append)
+
+    # 3. The frontier search, credited. The residual after phases 1 and 2 is
+    #    dominated by directions needing mid-run state no entry value
+    #    survives to - a flag an earlier validation set, a compound guard on
+    #    a re-entry field - which is exactly the case `lift` exists for. Its
+    #    runs start at the entry point with an edited entry state and the
+    #    seed's staged stubs, so each is a recipe in its own right. It is
+    #    credited only through a replay: the trace says which directions are
+    #    new, then the same recipe is run through a fresh interpreter by
+    #    `run()` above and whatever *that* run takes is what the ledger
+    #    records. A recipe whose replay does not take the direction is not a
+    #    witness, and the gap between the two is reported rather than
+    #    absorbed.
+    lift_report = None
+    if args.lift:
+        from .lift import direction_key, lift as _lift
+        repro = {"recipes": 0, "recipes_exact": 0,
+                 "directions_attempted": 0, "directions_reproduced": 0}
+
+        def credit_lift_run(trace, state, world, stubs, terminals):
+            new = ({direction_key(g) for g in trace.guards}
+                   - set(ledger.witnesses))
+            if not new:
+                return
+            repro["recipes"] += 1
+            repro["directions_attempted"] += len(new)
+            run(state, world, stubs, terminals, "lift")
+            reproduced = sum(1 for k in new if k in ledger.witnesses)
+            repro["directions_reproduced"] += reproduced
+            repro["recipes_exact"] += (reproduced == len(new))
+
+        result = _lift(program, entry, seeds=lift_seeds,
+                       defaults_for=lambda w: io_defaults(program, w),
+                       budget=args.lift, on_run=credit_lift_run)
+        lift_report = dict(result["stats"])
+        lift_report["reproduction"] = dict(repro)
+        lift_report["reproduction"]["rate_pct"] = round(
+            100.0 * repro["directions_reproduced"]
+            / max(1, repro["directions_attempted"]), 1)
+
+    # 3.5 A second staged-stub pass over what lift left: a direction the
+    #     frontier search just witnessed is a base recipe this phase did not
+    #     have on its first pass.
+    if args.stub_search and stub_report is not None \
+            and stub_report["runs"] < args.stub_search:
+        from .stubsearch import search as _stub_search
+        again = _stub_search(program, prov, graph, ledger, run,
+                             budget=args.stub_search - stub_report["runs"],
+                             plan_recipes=plan_recipes)
+        stub_report = {
+            "budget": args.stub_search,
+            "runs": stub_report["runs"] + again["runs"],
+            "directions_witnessed": stub_report["directions_witnessed"]
+            + again["directions_witnessed"],
+            "no_proposals": again["no_proposals"],
+            "passes": stub_report["passes"] + again["passes"]}
+    if stub_report is not None:
+        stub_report["reproduction"] = _stub_reproduction(program, entry,
+                                                         ledger, io_defaults)
+
+    gaps = missing(program, ledger)
+    payload = {"program": program.name, "entry": entry,
+               "directions_total": total,
+               "witnessed": len(ledger.witnesses),
+               "witness_pct": round(ledger.coverage(total), 1),
+               "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
+               "lift": lift_report,
+               "stub_search": stub_report,
+               "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
+                            "kind": b.kind, "direction": d,
+                            "condition": b.condition, "line": b.line}
+                           for b, d in gaps[: args.limit or len(gaps)]]}
+    if args.out:
+        ledger.write(args.out, program.name)
+        payload["written"] = args.out
+
+    def render(p):
+        print("%s   %d/%d directions witnessed  (%.1f%%)   %d runs"
+              % (p["program"], p["witnessed"], p["directions_total"],
+                 p["witness_pct"], p["runs"]))
+        if p.get("stub_search"):
+            ss = p["stub_search"]
+            rep = ss["reproduction"]
+            print("   stub search: %d runs, %d directions witnessed, "
+                  "%d with no evidence chain, reproduction %d/%d (%.1f%%)"
+                  % (ss["runs"], ss["directions_witnessed"],
+                     ss["no_proposals"], rep["reproduced"], rep["witnesses"],
+                     rep["rate_pct"]))
+        if p.get("lift"):
+            rep = p["lift"]["reproduction"]
+            print("   lift: %d runs, %d recipes credited, reproduction "
+                  "%d/%d directions (%.1f%%)"
+                  % (p["lift"]["runs"], rep["recipes"],
+                     rep["directions_reproduced"],
+                     rep["directions_attempted"], rep["rate_pct"]))
+        if p["missing"]:
+            print("   first missing:")
+            for row in p["missing"][:10]:
+                print("      %-28s ord=%-3d %-6s %s   %s"
+                      % (row["paragraph"], row["ordinal"], row["kind"],
+                         row["direction"], row["condition"][:40]))
+    return _emit(payload, args.json, render)
+
+
+def _rng_choice(values, seed):
+    import random
+    return random.Random(seed).choice(values)
+
+
+def _stub_reproduction(program, entry: str, ledger, io_defaults) -> dict:
+    """Re-run every stub-search witness from its stored recipe, and count.
+
+    The phase only ever credits through a fresh interpreter run of the exact
+    recipe stored, so this *should* be 100% - which is precisely why it is
+    measured rather than asserted: a recipe that stops reproducing means the
+    staging drifted from what the ledger records, and that defect class is
+    silent everywhere else. Recipes are shared between directions, so runs
+    are grouped by recipe rather than repeated per direction.
+    """
+    from .interpreter import Interpreter
+    from .lift import direction_key
+    took: dict = {}
+    report = {"witnesses": 0, "reproduced": 0, "rate_pct": 0.0}
+    for key, recipe in ledger.witnesses.items():
+        if not recipe.source.startswith("stub:"):
+            continue
+        report["witnesses"] += 1
+        if recipe not in took:
+            payload = recipe.payload()
+            try:
+                interp = Interpreter(
+                    program, dict(payload["input_state"]),
+                    stubs=payload["stubs"], terminals=payload["terminals"],
+                    defaults=io_defaults(program, payload["world"]))
+                trace = interp.run(entry)
+                took[recipe] = {direction_key(g) for g in trace.guards}
+            except Exception:                                # noqa: BLE001
+                took[recipe] = set()
+        report["reproduced"] += key in took[recipe]
+    report["rate_pct"] = round(100.0 * report["reproduced"]
+                               / max(1, report["witnesses"]), 1)
+    return report
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -2096,6 +2405,29 @@ def build_parser():
                     help="rank the N capability additions that would unblock "
                          "the most refused plans; 0 to skip")
     rr.set_defaults(func=cmd_represent)
+
+    wt = sub.add_parser("witnesses", help="a witness per direction from "
+                                         "every run the battery makes")
+    wt.add_argument("--out", metavar="FILE")
+    wt.add_argument("--overlays", type=int, default=2)
+    wt.add_argument("--seed", type=int, default=7)
+    wt.add_argument("--sample", type=int, default=60)
+    wt.add_argument("--limit", type=int, default=40)
+    wt.add_argument("--lift", type=int, default=300, metavar="N",
+                    help="up to N frontier-search runs after the battery, "
+                         "each replayed through a fresh interpreter before "
+                         "its directions are credited; 0 disables")
+    wt.add_argument("--stub-search", type=int, default=600, metavar="N",
+                    dest="stub_search",
+                    help="up to N staged stub-outcome runs, worked backward "
+                         "from the unwitnessed directions whose conditions "
+                         "test a stub-written field: the writing operation "
+                         "returns each code the arms name, at one position "
+                         "in its series, over a run that already got near; "
+                         "0 disables")
+    wt.add_argument("--proxy", nargs="?", const="status",
+                    choices=["status", "outputs"])
+    wt.set_defaults(func=cmd_witnesses)
 
     dr = sub.add_parser("directions", help="how a harness's work list lands "
                                            "on this program's decisions")

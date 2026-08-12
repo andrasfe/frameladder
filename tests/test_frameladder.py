@@ -1999,6 +1999,102 @@ class TestLift(unittest.TestCase):
         self.assertEqual(sorted(map(str, first.directions_hit)),
                          sorted(map(str, second.directions_hit)))
 
+    def test_every_run_carries_a_replayable_recipe(self):
+        # `on_run` hands back the trace *and* what produced it. The claim it
+        # exists for - a lift run starts at entry with an edited entry state,
+        # so the recipe replays - is checked here rather than assumed: every
+        # recipe re-run through a fresh interpreter takes the same directions.
+        from frameladder.conformance_defaults import io_defaults, WORLDS
+        from frameladder.lift import direction_key, lift
+        p = program(HEADER + """       01  WS-IN  PIC X(8).
+       01  WS-REC.
+           05  WS-ONE PIC X(4).
+           05  WS-TWO PIC X(4).
+       PROCEDURE DIVISION.
+       RC-MAIN.
+           MOVE WS-IN TO WS-REC
+           IF WS-TWO = 'ZZZZ'
+              PERFORM RC-DEEP
+           END-IF
+           GOBACK
+           .
+       RC-DEEP.
+           EXIT
+           .
+""")
+        recipes = []
+        lift(p, "RC-MAIN", seeds=[({}, w) for w in WORLDS],
+             defaults_for=lambda w: io_defaults(p, w), budget=40,
+             on_run=lambda *run: recipes.append(run))
+        self.assertTrue(recipes)
+        for trace, state, world, stubs, terminals in recipes:
+            fresh = Interpreter(p, dict(state), stubs=stubs,
+                                terminals=terminals,
+                                defaults=io_defaults(p, world)).run("RC-MAIN")
+            self.assertEqual({direction_key(g) for g in trace.guards},
+                             {direction_key(g) for g in fresh.guards})
+        # And at least one recipe is the one only the frontier finds: the
+        # guard reads bytes the entry state reaches through the group move.
+        self.assertTrue(any(
+            direction_key(g) == ("RC-MAIN", g.ordinal, "IF", True)
+            for trace, *_rest in recipes for g in trace.guards))
+
+
+class TestWitnessLift(unittest.TestCase):
+    """The witness battery's third phase: lift runs, credited via replay."""
+
+    SOURCE = HEADER + """       01  WS-IN  PIC X(8).
+       01  WS-REC.
+           05  WS-ONE PIC X(4).
+           05  WS-TWO PIC X(4).
+       PROCEDURE DIVISION.
+       WL-MAIN.
+           MOVE WS-IN TO WS-REC
+           IF WS-TWO = 'ZZZZ'
+              PERFORM WL-DEEP
+           END-IF
+           GOBACK
+           .
+       WL-DEEP.
+           EXIT
+           .
+"""
+
+    def _witnesses(self, path, *extra):
+        from frameladder.cli import build_parser, cmd_witnesses
+        args = build_parser().parse_args([path, "--json", "witnesses",
+                                          *extra])
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cmd_witnesses(args)
+
+    def test_lift_witnesses_a_direction_the_battery_misses(self):
+        # The guard needs mid-run state: the MOVE destroys anything placed
+        # in WS-TWO at entry, and WS-IN is compared against nothing so no
+        # overlay draws it. Plans and worlds miss the True direction; the
+        # frontier search reaches it through the group move's origins, and
+        # the witness it leaves must be a recipe that replays.
+        p = program(self.SOURCE)
+        before = self._witnesses(p.source_path, "--lift", "0")
+        self.assertIsNone(before["lift"])
+        missing = {(m["paragraph"], m["direction"]) for m in before["missing"]}
+        self.assertIn(("WL-MAIN", True), missing)
+
+        after = self._witnesses(p.source_path, "--lift", "40")
+        left = {(m["paragraph"], m["direction"]) for m in after["missing"]}
+        self.assertNotIn(("WL-MAIN", True), left)
+        self.assertGreater(after["witnessed"], before["witnessed"])
+
+    def test_lifted_recipes_reproduce_and_the_rate_is_reported(self):
+        p = program(self.SOURCE)
+        payload = self._witnesses(p.source_path, "--lift", "40")
+        rep = payload["lift"]["reproduction"]
+        self.assertGreater(rep["directions_attempted"], 0)
+        self.assertEqual(rep["directions_reproduced"],
+                         rep["directions_attempted"])
+        self.assertEqual(rep["rate_pct"], 100.0)
+
 
 class TestInspect(unittest.TestCase):
     """INSPECT, against the standard's own rules rather than one corpus."""
@@ -4748,3 +4844,353 @@ class TestParagraphSummary(unittest.TestCase):
         prog = program(self.SRC)
         self.assertEqual(set(summarise_program(prog)),
                          set(prog.paragraph_names))
+
+
+class TestConditionNamesAreNotOperands(unittest.TestCase):
+    """`UNTIL WS-IDX >= 11 OR USER-EOF` tests the flag, not `WS-IDX >= flag`.
+
+    The abbreviated-relation expansion restored the subject onto every bare
+    part; a level-88 name became an operand, the comparison against its
+    empty pseudo-value was true from the first iteration, and every read
+    loop written in this (entirely standard) style ran zero times.
+    """
+
+    SRC = HEADER + """       01  WS-IDX PIC S9(4) COMP VALUE 0.
+       01  WS-EOF-FLG PIC X VALUE 'N'.
+           88 AT-EOF VALUE 'Y'.
+       01  WS-COUNT PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE 1 TO WS-IDX
+           PERFORM UNTIL WS-IDX >= 4 OR AT-EOF
+               ADD 1 TO WS-COUNT
+               ADD 1 TO WS-IDX
+           END-PERFORM
+           GOBACK
+           .
+"""
+
+    def test_the_loop_runs_when_the_flag_is_off(self):
+        from frameladder.interpreter import Interpreter
+        from frameladder.ir import parse_term
+        prog = program(self.SRC)
+        interp = Interpreter(prog, {})
+        interp.run("MAIN-PARA")
+        self.assertEqual(interp.value_of(parse_term("WS-COUNT")), 3)
+
+    def test_the_name_is_only_special_when_declared(self):
+        from frameladder.conditions import condition_atoms
+        with_names = condition_atoms("WS-IDX >= 4 OR AT-EOF",
+                                     names=frozenset({"AT-EOF"}))
+        self.assertEqual([str(a) for alt in with_names for a in alt],
+                         ["WS-IDX >= 4", "AT-EOF = True"])
+        without = condition_atoms("WS-IDX >= 4 OR AT-EOF")
+        self.assertIn("WS-IDX >= AT-EOF",
+                      [str(a) for alt in without for a in alt])
+
+
+class TestStagedStubSearch(unittest.TestCase):
+    """The battery phase that works backward from an unwitnessed direction
+    to the operation whose staged outcome takes it."""
+
+    SRC = HEADER + """       01  WS-RC PIC S9(8) COMP VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM READ-THING
+           GOBACK
+           .
+       READ-THING.
+           EXEC CICS READ DATASET(WS-FILE) INTO(WS-REC) RESP(WS-RC)
+           END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN DFHRESP(NOTFND)
+                   CONTINUE
+               WHEN OTHER
+                   CONTINUE
+           END-EVALUATE
+           .
+"""
+
+    def _search(self, budget=60):
+        from frameladder import stubsearch
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        from frameladder.ladder import analyse
+        from frameladder.ledger import Ledger
+        prog = program(self.SRC)
+        graph, prov = analyse(prog)
+        ledger = Ledger()
+
+        def run(state, world, stubs, terminals, source):
+            interp = Interpreter(prog, dict(state or {}), stubs=stubs,
+                                 terminals=terminals,
+                                 defaults=io_defaults(prog, world))
+            trace = interp.run("MAIN-PARA")
+            return ledger.credit(trace, state or {}, world, stubs,
+                                 terminals, source)
+
+        run({}, "populated", None, None, "seed")
+        stats = stubsearch.search(prog, prov, graph, ledger, run,
+                                  budget=budget)
+        return prog, ledger, stats
+
+    def test_every_arm_direction_is_witnessed_by_staging_the_resp(self):
+        from frameladder.ledger import missing
+        prog, ledger, stats = self._search()
+        self.assertEqual(missing(prog, ledger), [])
+        self.assertGreater(stats["directions_witnessed"], 0)
+
+    def test_every_witness_reproduces_from_its_stored_recipe(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.interpreter import Interpreter
+        from frameladder.lift import direction_key
+        prog, ledger, _stats = self._search()
+        for key, recipe in ledger.witnesses.items():
+            payload = recipe.payload()
+            interp = Interpreter(prog, dict(payload["input_state"]),
+                                 stubs=payload["stubs"],
+                                 terminals=payload["terminals"],
+                                 defaults=io_defaults(prog,
+                                                      payload["world"]))
+            trace = interp.run("MAIN-PARA")
+            self.assertIn(key, {direction_key(g) for g in trace.guards})
+
+    def test_the_index_names_every_arm(self):
+        from frameladder import stubsearch
+        prog = program(self.SRC)
+        info = stubsearch.branch_index(prog)
+        self.assertIn(("READ-THING", 2, "WHEN"), info)
+
+    def test_staging_merges_over_the_base_recipes_own_stubs(self):
+        # A base whose plan already stages the operation keeps its other
+        # fields: replacing the entry list threw away the staging that made
+        # the base reach anywhere.
+        from frameladder import stubsearch
+        prog = program(self.SRC)
+        base = ({}, "populated",
+                {"EXEC:CICS:READ": [{"when": {}, "set": {"WS-REC": "AA"},
+                                     "seq": 0, "inferred": False}]},
+                {})
+        actions = [("stub", "EXEC:CICS:READ", {}, "WS-RC", 13,
+                    "READ-THING")]
+        state, world, stubs, terminals = next(iter(
+            stubsearch.staged_recipes(prog.model, base, actions)))
+        entry = stubs["EXEC:CICS:READ"][0]
+        self.assertEqual(entry["set"].get("WS-REC"), "AA")
+        self.assertEqual(entry["set"].get("WS-RC"), 13)
+
+
+class TestReentry(unittest.TestCase):
+    """Runs shaped to complete cycle 1 and re-enter (frameladder.reentry).
+
+    A pseudo-conversational program keeps its state machine in the
+    commarea and most of its source runs only on a second task. These pin
+    the evidence the shapes are derived from, and the interpreter's task
+    boundary: what cycle 1 saves is what cycle 2 receives, and the entry
+    state speaks only at input boundaries - the first task's commarea and
+    every RECEIVE - never over a later cycle's own writes.
+    """
+
+    SRC = """       IDENTIFICATION DIVISION.
+       PROGRAM-ID. RE.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-TRANID PIC X(4) VALUE 'TT01'.
+       01  CARDDEMO-COMMAREA.
+           05  CDEMO-FLAG PIC X VALUE 'N'.
+               88  CDEMO-REENTER VALUE 'Y'.
+           05  CDEMO-FROM PIC X(8).
+       01  SCREEN-AREA.
+           05  NAMEI PIC X(2).
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           IF EIBCALEN = 0
+               GOBACK
+           END-IF
+           MOVE DFHCOMMAREA(1:EIBCALEN) TO CARDDEMO-COMMAREA
+           IF NOT CDEMO-REENTER
+               SET CDEMO-REENTER TO TRUE
+               MOVE 'PGMONE' TO CDEMO-FROM
+           ELSE
+               EXEC CICS RECEIVE MAP('M') INTO(SCREEN-AREA) END-EXEC
+               EVALUATE EIBAID
+                   WHEN DFHENTER
+                       PERFORM CHECK-NAME
+                   WHEN DFHPF3
+                       GOBACK
+               END-EVALUATE
+           END-IF
+           EXEC CICS RETURN TRANSID(WS-TRANID)
+                COMMAREA(CARDDEMO-COMMAREA) END-EXEC.
+       CHECK-NAME.
+           IF NAMEI = 'AB'
+               CONTINUE
+           END-IF
+           IF CDEMO-FROM = 'PGMONE'
+               CONTINUE
+           END-IF.
+"""
+
+    def _directions(self, prog, state):
+        from frameladder.ledger import Ledger
+        led = Ledger()
+        trace = Interpreter(prog, dict(state)).run("MAIN-PARA")
+        led.credit(trace, state, "bare", {}, {}, "test")
+        return {(p, k, d) for (p, _o, k, d) in led.witnesses}
+
+    def test_return_commarea_is_the_evidence_gate(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        self.assertEqual(reentry.return_commareas(prog),
+                         ["CARDDEMO-COMMAREA"])
+        batch = program(HEADER + """       PROCEDURE DIVISION.
+       B-MAIN.
+           GOBACK.
+""")
+        self.assertEqual(reentry.return_commareas(batch), [])
+        self.assertEqual(reentry.reentry_states(batch, {}), [])
+
+    def test_aid_values_come_from_the_source_comparisons(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        # DFHENTER and DFHPF3 are compared; DFHPF12 is not, so its byte
+        # must not be offered - the table only says what a name stands for.
+        self.assertEqual(reentry.aid_comparisons(prog),
+                         {"EIBAID": ["'", "3"]})
+
+    def test_evaluate_true_spelling_is_the_same_evidence(self):
+        from frameladder import reentry
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  CA.
+           05  CA-F PIC X.
+       PROCEDURE DIVISION.
+       M-PARA.
+           EVALUATE TRUE
+               WHEN EIBAID IS EQUAL TO DFHPF5
+                   CONTINUE
+               WHEN OTHER
+                   CONTINUE
+           END-EVALUATE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(CA) END-EXEC.
+""")
+        self.assertEqual(reentry.aid_comparisons(prog), {"EIBAID": ["5"]})
+
+    def test_states_carry_a_commarea_length_and_one_key_each(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        states = reentry.reentry_states(prog, {"NAMEI": ["AB"]})
+        self.assertTrue(states)
+        for _name, state in states:
+            self.assertEqual(state["EIBCALEN"], 9)     # X(1) + X(8)
+            self.assertIn(state["EIBAID"], ("'", "3"))
+
+    def test_one_recipe_spans_the_cycles(self):
+        # Cycle 1 sets the re-enter flag and saves it; cycle 2 receives the
+        # map and dispatches on the key. One entry state takes directions on
+        # both sides of the task boundary - and the flag arrives set by the
+        # program, not by the entry state, which never names it.
+        prog = program(self.SRC)
+        taken = self._directions(prog, {"EIBCALEN": 9, "EIBAID": "'",
+                                        "NAMEI": "AB"})
+        self.assertIn(("MAIN-PARA", "IF", False), taken)     # cycle 1: no flag
+        self.assertIn(("CHECK-NAME", "IF", True), taken)     # cycle 2: dispatched
+        # And replayable: a fresh interpreter takes the same directions.
+        self.assertEqual(taken, self._directions(
+            prog, {"EIBCALEN": 9, "EIBAID": "'", "NAMEI": "AB"}))
+
+    def test_cycle_two_sees_what_cycle_one_wrote_not_the_entry(self):
+        # Cycle 1 writes PGMONE over the entry's CDEMO-FROM. The second
+        # cycle must see the program's value: the commarea belongs to the
+        # previous cycle, and the entry state may not overwrite it.
+        prog = program(self.SRC)
+        taken = self._directions(prog, {"EIBCALEN": 9, "EIBAID": "'",
+                                        "NAMEI": "AB",
+                                        "CDEMO-FROM": "OTHERPGM"})
+        self.assertIn(("CHECK-NAME", "IF", True), taken)
+
+    def test_a_childless_saved_area_carries_bytes(self):
+        # COACTUPC's pattern: the RETURN area is PIC X(n) assembled by
+        # slices, so there are no child fields to carry - the bytes are the
+        # only carrier, and dropping them makes every task look first.
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  WS-SAVE PIC X(9).
+       01  CA.
+           05  CA-FLAG PIC X.
+               88  CA-REENTER VALUE 'Y'.
+           05  CA-FROM PIC X(8).
+       PROCEDURE DIVISION.
+       M-PARA.
+           MOVE DFHCOMMAREA(1:9) TO CA
+           IF NOT CA-REENTER
+               SET CA-REENTER TO TRUE
+           ELSE
+               PERFORM M-DEEP
+           END-IF
+           MOVE CA TO WS-SAVE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(WS-SAVE) END-EXEC.
+       M-DEEP.
+           CONTINUE.
+""")
+        trace = Interpreter(prog, {"EIBCALEN": 9}).run("M-PARA")
+        self.assertIn("M-DEEP", trace.entered)
+
+    def test_entry_names_the_first_commarea_only(self):
+        from frameladder import reentry
+        prog = program(self.SRC)
+        # CDEMO-FROM is a commarea target field: the entry state stands for
+        # what the caller staged, so it survives the first task's move...
+        taken = self._directions(prog, {"EIBCALEN": 9,
+                                        "CDEMO-FROM": "PGMX"})
+        self.assertIn(("MAIN-PARA", "IF", False), taken)
+        # ...and the evidence walk offers the field a value at all.
+        self.assertIn("CARDDEMO-COMMAREA", reentry.commarea_targets(prog))
+
+    def test_refmod_slices_assemble_a_template(self):
+        from frameladder import reentry
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  CA.
+           05  CA-F PIC X.
+       01  DATEI PIC X(5).
+       PROCEDURE DIVISION.
+       M-PARA.
+           EVALUATE TRUE
+               WHEN DATEI(1:2) IS NOT NUMERIC
+                   CONTINUE
+               WHEN DATEI(3:1) NOT EQUAL '-'
+                   CONTINUE
+               WHEN DATEI(4:2) IS NOT NUMERIC
+                   CONTINUE
+           END-EVALUATE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(CA) END-EXEC.
+""")
+        self.assertEqual(reentry._refmod_templates(prog).get("DATEI"),
+                         "11-11")
+
+    def test_resp_fault_worlds_use_the_programs_own_codes(self):
+        from frameladder import reentry
+        prog = program(HEADER + """       01  WS-T PIC X(4) VALUE 'TT'.
+       01  WS-RC PIC S9(8) COMP.
+       01  CA.
+           05  CA-F PIC X.
+       01  REC.
+           05  REC-F PIC X(4).
+       PROCEDURE DIVISION.
+       M-PARA.
+           EXEC CICS READ DATASET('F') INTO(REC) RESP(WS-RC) END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN DFHRESP(NOTFND)
+                   CONTINUE
+           END-EVALUATE
+           EXEC CICS RETURN TRANSID(WS-T) COMMAREA(CA) END-EXEC.
+""")
+        worlds = reentry.resp_fault_worlds(prog, {"WS-RC": [0, 13]})
+        self.assertTrue(worlds)
+        codes = {entry["set"]["WS-RC"]
+                 for spec in worlds
+                 for entry in spec["stubs"]["EXEC:CICS:READ"]}
+        self.assertIn(13, codes)                      # the compared fault
+        self.assertNotIn(19, codes)                   # never a whole table

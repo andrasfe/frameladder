@@ -35,8 +35,8 @@ WORLDS = ("bare", "populated", "empty")
 # ran and found nothing" - the two outcomes the worlds are named after. Both
 # are read out of `faults`, which holds them as fixed platform vocabulary
 # rather than as a guess about any one program.
-_CHANNEL_OK = {"file": "00", "sql": 0, "cics": 0}
-_CHANNEL_NIL = {"file": "10", "sql": 100, "cics": 13}
+_CHANNEL_OK = {"file": "00", "sql": 0, "cics": 0, "dli": "  "}
+_CHANNEL_NIL = {"file": "10", "sql": 100, "cics": 13, "dli": "GB"}
 
 
 def exec_channels(program) -> dict:

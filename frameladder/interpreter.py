@@ -542,6 +542,10 @@ class Interpreter:
         # plan that needs an obligation about that write - which is what
         # `blocking_writes` and `establishing_writes` are for - not a plan
         # that needs the write suppressed.
+        # The level-88 table, handed to the condition parser so an
+        # abbreviated relation never reads a condition-name as an
+        # elided operand - see `conditions.expand_abbreviated`.
+        self._names88 = frozenset(self.model.condition_names)
         self._pinned: set = set()
         self._delivered: dict = {}
         self._selector_cache: dict = {}
@@ -562,6 +566,15 @@ class Interpreter:
         supplied = FieldMap(self.memory.copy(), {})
         supplied.extra = dict(self.state.extra)
         self._supplied = supplied
+        # Which names the entry state actually spoke about - as given and as
+        # base names, since a state may say `ACTIDINI OF COTRN2AI` and the
+        # data model answers for `ACTIDINI`. `_supplied` cannot answer this:
+        # it snapshots every declared slot, named or not.
+        self._entry_names = set()
+        for key in (state or {}):
+            key = key.upper()
+            self._entry_names.add(key)
+            self._entry_names.add(key.split(" OF ")[0].strip())
         # Membership is asked of the same keys the materialised map had - the
         # laid-out names plus whatever had no slot - and not of `FieldMap`'s
         # own test, which resolves a qualified reference to its declaration
@@ -895,7 +908,7 @@ class Interpreter:
         text = norm(condition)
         if not text:
             return True
-        for alternative in condition_atoms(text):
+        for alternative in condition_atoms(text, names=self._names88):
             if not alternative:
                 continue
             if all(self._atom(a) for a in alternative):
@@ -1156,7 +1169,8 @@ class Interpreter:
         if not self.track_origins:
             return {}
         out: dict = {}
-        for alternative in condition_atoms(condition):
+        for alternative in condition_atoms(condition,
+                                           names=self._names88):
             for atom in alternative:
                 for term in (atom.lhs, atom.rhs):
                     if term.kind != "var":
@@ -1521,13 +1535,39 @@ class Interpreter:
             # unreachable second half. The contents are carried across the
             # task boundary as fields, because that is what they are here:
             # the group itself holds no bytes of its own.
-            if source.name == "DFHCOMMAREA" and getattr(self, "_carried", None):
+            if source.name == "DFHCOMMAREA":
+                # `_carried is None` means no task has returned yet, so this
+                # is the first task and the commarea is *caller* input -
+                # whatever program transferred control here staged it. That
+                # makes this the same input boundary a RECEIVE is for the
+                # map: the linkage area itself is an anonymous byte array
+                # the entry state cannot usefully address, so the fields the
+                # entry state *named inside the receiving area* stand for
+                # the staged bytes - the ordinary move runs, then those
+                # fields are re-delivered over it. Fields the entry never
+                # named keep what the move left, so a run that supplies
+                # nothing still models an empty commarea.
+                #
+                # On a re-entered task the commarea belongs to the previous
+                # cycle, never to the entry state - the second cycle earns
+                # its state from the first - so the bytes the RETURN saved
+                # are moved (`_one_task` staged them under DFHCOMMAREA; the
+                # refmod arithmetic in `MOVE DFHCOMMAREA(LENGTH OF A + 1:
+                # ...)` runs against them, which matters when the saved area
+                # is a childless PIC X(n) the program assembles by slices),
+                # and the carried fields overlay them for the names whose
+                # state-dict values are finer than their bytes. From here on
+                # the program owns every one of them (nothing is pinned).
+                carried = getattr(self, "_carried", None)
+                value = self.value_of(source)
                 for name in move_targets(attrs.get("targets", "")):
-                    for child, value in self._carried.items():
-                        if child not in self._pinned:
-                            self.state[child] = value
-                            self._note(child, None)
-                    del name
+                    self.assign(name, value, self.origin_of(source))
+                    if carried is None:
+                        self._deliver_entry_fields(name)
+                for child, kept in (carried or {}).items():
+                    if child not in self._pinned:
+                        self.state[child] = kept
+                        self._note(child, None)
                 return
             value = self.value_of(source)
             origin = self.origin_of(source)
@@ -1723,16 +1763,36 @@ class Interpreter:
     # not.
     _INPUT_OPS = ("EXEC:CICS:RECEIVE",)
 
+    def _deliver_entry_fields(self, area: str) -> None:
+        """Re-deliver the entry-named fields of one receiving area.
+
+        Only names the entry state explicitly spoke about: everything else
+        keeps what the program's own move just left there, so the area is
+        exactly "what the caller staged" and nothing more.
+        """
+        for name in [area] + list(self.model.descendants(area)):
+            if name in self._entry_names and name not in self._pinned:
+                self.state[name] = self._supplied[name]
+                self._note(name, None)
+
     def _deliver_terminal_input(self, key: str, stmt) -> None:
         if not key.startswith(self._INPUT_OPS):
             return
+        from .origins import Origin
         from .provenance import stub_outputs
         for area in stub_outputs(norm(stmt.get("text", ""))):
             names = [area] + list(self.model.descendants(area))
             for name in names:
                 if name in self._supplied_slots or name in self._supplied.extra:
                     self.state[name] = self._supplied[name]
-                    self._note(name, None)
+                    # The value delivered here *is* the entry state's value
+                    # for this field, re-arriving at the RECEIVE - so the
+                    # entry state still decides it, and the origin says so.
+                    # Noting None instead made every screen field opaque to
+                    # the frontier search on exactly the routes where the
+                    # harness could set it: a guard on re-received operator
+                    # input was unliftable by construction.
+                    self._note(name, Origin(name, 0, None))
 
     _WRITE_FROM = re.compile(r"^(?:WRITE|REWRITE|RELEASE)\s+(\S+)\s+FROM\s+"
                              r"([A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?)", re.I)
@@ -1783,6 +1843,12 @@ class Interpreter:
                         if child in self.state:
                             kept[child] = self.state[child]
                     self._carried = kept
+                else:
+                    # A RETURN with no COMMAREA still re-enters, with
+                    # nothing carried. `None` is reserved for "no task has
+                    # returned yet" - the first-task commarea is caller
+                    # input, a re-entered one never is.
+                    self._carried = {}
                 raise _NextTask()
             self.trace.stopped = "terminated by %s" % key
             raise _Stop()
@@ -1884,7 +1950,8 @@ class Interpreter:
 
     def _snapshot(self, condition: str) -> dict:
         out = {}
-        for alternative in condition_atoms(condition):
+        for alternative in condition_atoms(condition,
+                                           names=self._names88):
             for atom in alternative:
                 for term in (atom.lhs, atom.rhs):
                     if term.kind == "var":
@@ -2568,7 +2635,7 @@ class Interpreter:
 
     def _key_step(self, condition: str, keys: list, direction: dict) -> int:
         """+1 to look higher up the table, -1 lower, 0 when undecidable."""
-        alternatives = condition_atoms(condition)
+        alternatives = condition_atoms(condition, names=self._names88)
         if not alternatives:
             return 0
         ranked: list = []

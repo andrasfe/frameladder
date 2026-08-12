@@ -247,7 +247,8 @@ def deltas_for(model, guard, want: bool, state: dict, cache: dict,
     distinguishing from one the solver merely failed on.
     """
     out, liftable = [], False
-    for alternative in condition_atoms(guard.condition, negate=not want):
+    for alternative in condition_atoms(guard.condition, negate=not want,
+                                       names=frozenset(model.condition_names)):
         if not alternative:
             continue
         delta: dict = {}
@@ -305,12 +306,20 @@ def _seed(item) -> tuple:
 
 
 def lift(program, entry: str, *, seeds, defaults_for, budget: int = 600,
-         fanout: int = 2, attempts: int = 4, on_trace=None,
+         fanout: int = 2, attempts: int = 4, on_trace=None, on_run=None,
          should_stop=None) -> dict:
     """Extend the reached frontier one decision at a time.
 
     ``seeds`` are ``(state, world)`` pairs to start from and ``defaults_for``
     maps a world name to the I/O defaults for it.
+
+    ``on_run`` receives ``(trace, state, world, stubs, terminals)`` for every
+    run - the complete recipe that produced the trace, not just its result.
+    Every run here starts at the program's entry point with an edited entry
+    state and the seed's staged stubs, so the recipe is replayable as-is:
+    that is what lets a witness ledger credit these runs instead of throwing
+    the attribution away. ``on_trace`` stays for callers that only fold
+    coverage.
 
     The queue is deepest-first and that is the whole search strategy. A state
     reached by solving six guards in a row is worth more than the seventh
@@ -379,6 +388,8 @@ def lift(program, entry: str, *, seeds, defaults_for, budget: int = 600,
         traces.append(trace)
         if on_trace is not None:
             on_trace(trace)
+        if on_run is not None:
+            on_run(trace, state, world, stubs, terminals)
         covered |= {direction_key(g) for g in trace.guards}
 
         for guard in trace.guards:

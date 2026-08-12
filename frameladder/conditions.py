@@ -93,13 +93,23 @@ def _is_negated_name(part: str) -> bool:
     return bool(_NEGATED_NAME.match(part or ""))
 
 
-def expand_abbreviated(parts: list[str]) -> list[str]:
+def expand_abbreviated(parts: list[str], names: frozenset = frozenset()) -> list[str]:
     """Restore the subject COBOL lets you leave out.
 
     ``IF WS-RC = '00' OR '04'`` means ``WS-RC = '00' OR WS-RC = '04'``.
     Splitting on OR first strips the subject off every later term, and a
     bare ``'04'`` then reads as a condition-name - silently wrong rather
     than loudly wrong, which is the worst kind.
+
+    ``names`` is the program's level-88 table, when the caller has one. A
+    condition-name is a *condition*, not an operand: ``UNTIL WS-IDX >= 11
+    OR USER-SEC-EOF`` tests the end-of-file flag on its own, and restoring
+    the subject makes it ``WS-IDX >= USER-SEC-EOF`` - a comparison against
+    the empty value of a field nobody declares, true from the first
+    iteration, so the read loop below it runs zero times and every arm it
+    guards is unreachable. Only the data division can tell that bare name
+    from an elided operand, which is why the set is a parameter rather
+    than a guess.
     """
     out, subject = [], None
     for part in parts:
@@ -112,7 +122,8 @@ def expand_abbreviated(parts: list[str]) -> list[str]:
             # relation is there but the subject is not, and reading the empty
             # left side as a constant compares nothing against 10.
             out.append("%s %s" % (subject[0], part))
-        elif subject and not m and not _is_negated_name(part):
+        elif subject and not m and not _is_negated_name(part) \
+                and norm(part).upper() not in names:
             out.append("%s %s %s" % (subject[0], subject[1], part))
         else:
             out.append(part)
@@ -209,18 +220,24 @@ def when_condition(subject: str, value: str) -> str:
 
 
 def condition_atoms(condition: str, negate: bool = False,
-                    origin: str = "") -> list[list[Atom]]:
+                    origin: str = "",
+                    names: frozenset = frozenset()) -> list[list[Atom]]:
     """Expand a condition into alternatives, each a conjunction of atoms.
 
     Satisfying any one alternative satisfies the condition, so the ladder
     can take the first that resolves and keep the rest in reserve.
+
+    ``names`` is the program's set of level-88 condition-names, and it
+    changes how an abbreviated relation reads - see `expand_abbreviated`.
+    Callers with a model in hand should pass it; the default keeps the
+    parser usable on bare text.
 
     Memoised: the interpreter re-evaluates the same handful of conditions
     thousands of times per run, and re-running the relational-operator
     regex each time dominates everything else.
     """
     return [list(alt) for alt in _atoms_cached(_strip_tail(norm(condition)),
-                                               negate, origin)]
+                                               negate, origin, names)]
 
 
 # Words that end a condition rather than belong to it. `IF X = '00' THEN` and
@@ -284,8 +301,10 @@ def _expand_paren_list(condition: str) -> str:
 
 
 @lru_cache(maxsize=8192)
-def _atoms_cached(condition: str, negate: bool, origin: str) -> tuple:
-    return tuple(tuple(alt) for alt in _condition_atoms(condition, negate, origin))
+def _atoms_cached(condition: str, negate: bool, origin: str,
+                  names: frozenset = frozenset()) -> tuple:
+    return tuple(tuple(alt) for alt in _condition_atoms(condition, negate,
+                                                        origin, names))
 
 
 # Disjunctive normal form of a conjunction is a cross product, and a
@@ -319,7 +338,8 @@ def _conjoin(groups: list) -> list[list[Atom]]:
 
 
 def _condition_atoms(condition: str, negate: bool = False,
-                     origin: str = "") -> list[list[Atom]]:
+                     origin: str = "",
+                     names: frozenset = frozenset()) -> list[list[Atom]]:
     text = norm(condition)
     if not text:
         return [[]]
@@ -340,13 +360,14 @@ def _condition_atoms(condition: str, negate: bool = False,
     if shaped is not None:
         return shaped
 
-    ors = expand_abbreviated(split_top(text, "OR"))
+    ors = expand_abbreviated(split_top(text, "OR"), names)
     if len(ors) > 1:
         if negate:                                   # NOT(A OR B) = !A AND !B
-            return _conjoin([_condition_atoms(p, True, origin) for p in ors])
+            return _conjoin([_condition_atoms(p, True, origin, names)
+                             for p in ors])
         out: list[list[Atom]] = []
         for part in ors:
-            out.extend(_condition_atoms(part, False, origin))
+            out.extend(_condition_atoms(part, False, origin, names))
         return out
 
     # The subject and the operator may be left out after AND just as after
@@ -354,14 +375,15 @@ def _condition_atoms(condition: str, negate: bool = False,
     # only for OR leaves the bare literal to be read as a condition-name,
     # which is always false - so the conjunction is unsatisfiable and the
     # true direction of the whole condition cannot be reached.
-    ands = expand_abbreviated(split_top(text, "AND"))
+    ands = expand_abbreviated(split_top(text, "AND"), names)
     if len(ands) > 1:
         if negate:                                   # NOT(A AND B) -> disjuncts
             out = []
             for part in ands:
-                out.extend(_condition_atoms(part, True, origin))
+                out.extend(_condition_atoms(part, True, origin, names))
             return out
-        return _conjoin([_condition_atoms(p, False, origin) for p in ands])
+        return _conjoin([_condition_atoms(p, False, origin, names)
+                         for p in ands])
 
     m = _COMPARE.match(text)
     if not m:
