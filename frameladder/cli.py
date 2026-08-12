@@ -1172,11 +1172,12 @@ def cmd_represent(args):
                           "derive one from the source"}
         return _emit(payload, args.json,
                      lambda p: print("%s: %s" % (p["error"], p["how"])))
-    from .represent import PROXY_CAVEAT, classify
+    from .represent import PROXY_CAVEAT, classify, unlock
     payload = classify(program, capability, entry=args.entry,
                        profile_aware=args.profile_aware,
                        max_routes=args.routes,
                        measure_precheck=True)
+    payload["unlock"] = unlock(payload["rows"], limit=args.unlock)
     payload["profile"] = source
     # A stated profile may still omit a section, which means "no constraint"
     # and is not the same as an empty one. `None` here is a count of nothing
@@ -1202,6 +1203,17 @@ def cmd_represent(args):
             print("\n   why, by category")
             for name, count in p["reason_categories"].items():
                 print("      %-38s %5d" % (name, count))
+        u = p.get("unlock") or {}
+        if u.get("additions"):
+            print("\n   what to widen: %d blocked plans, each waiting on "
+                  "%d capabilities (most %d)"
+                  % (u["blocked"], u["needs_median"], u["needs_max"]))
+            for i, row in enumerate(u["additions"], 1):
+                print("      %-2d %-44s +%-4d %4d" % (i, row["capability"],
+                                                      row["unlocks"],
+                                                      row["cumulative"]))
+            print("      %d of %d unblocked by those %d additions"
+                  % (u["unlocked"], u["blocked"], len(u["additions"])))
         if p["precheck_false_refusals"]:
             print("\n   precheck refused %d route(s) the full solve found "
                   "representable: %s"
@@ -2005,6 +2017,9 @@ def build_parser():
                          "routes the profile permits")
     rr.add_argument("--routes", type=int, default=4)
     rr.add_argument("--limit", type=int, default=12)
+    rr.add_argument("--unlock", type=int, default=8, metavar="N",
+                    help="rank the N capability additions that would unblock "
+                         "the most refused plans; 0 to skip")
     rr.set_defaults(func=cmd_represent)
 
     dr = sub.add_parser("directions", help="how a harness's work list lands "

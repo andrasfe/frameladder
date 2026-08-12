@@ -3459,6 +3459,63 @@ class TestRepresentability(unittest.TestCase):
         self.assertEqual(aware["emitted"]["unrepresentable"], 0)
         self.assertGreater(aware["runnable"], report["runnable"])
 
+    def test_a_refusal_names_the_unit_of_work_it_would_take_to_clear_it(self):
+        # A missing mock and a missing field on a mock that exists are two
+        # different pieces of work for two different people, and the sentences
+        # differ only in shape - so the mapping is pinned rather than assumed.
+        from frameladder.represent import capability_needed
+        self.assertEqual(
+            capability_needed("cannot replay READ:F (needed to set CUST-ID)"),
+            "replay READ:F")
+        self.assertEqual(capability_needed("READ:F cannot set CUST-ID"),
+                         "READ:F must set CUST-ID")
+        self.assertEqual(capability_needed("cannot inject WS-SHUT"),
+                         "inject WS-SHUT")
+
+    def test_unlock_covers_reason_sets_rather_than_ranking_reasons(self):
+        # The commonest reason is not the most valuable addition when it is
+        # one of several a plan is waiting on. Here `inject A` appears in
+        # three plans and unlocks none of them alone; `inject C` appears in
+        # one and unlocks it outright, so a cover must open with C.
+        from frameladder.represent import unlock
+        rows = [{"target": "T1", "representable": False,
+                 "reasons": ["cannot inject A", "cannot inject B"]},
+                {"target": "T2", "representable": False,
+                 "reasons": ["cannot inject A", "cannot inject B"]},
+                {"target": "T3", "representable": False,
+                 "reasons": ["cannot inject A", "cannot inject D"]},
+                {"target": "T4", "representable": False,
+                 "reasons": ["cannot inject C"]},
+                {"target": "T5", "representable": True, "reasons": []}]
+        report = unlock(rows, limit=3)
+        self.assertEqual(report["blocked"], 4)
+        self.assertEqual(report["additions"][0]["capability"], "inject C")
+        self.assertEqual(report["additions"][0]["unlocks"], 1)
+        # A plan waiting on two things is not unblocked by one of them.
+        self.assertEqual(report["needs_median"], 2)
+        self.assertEqual(report["needs_max"], 2)
+
+    def test_unlock_keeps_going_when_no_single_addition_unblocks_anything(self):
+        # Greedy stalls as soon as every remaining plan needs two at once,
+        # which is the common case. Stopping there would report nothing to do
+        # while three plans wait on one obvious field.
+        from frameladder.represent import unlock
+        rows = [{"target": "T%d" % i, "representable": False,
+                 "reasons": ["cannot inject A", "cannot inject B%d" % i]}
+                for i in range(3)]
+        report = unlock(rows, limit=2)
+        self.assertEqual(report["additions"][0]["capability"], "inject A")
+        self.assertEqual(report["additions"][0]["unlocks"], 0)
+        self.assertEqual(report["additions"][1]["unlocks"], 1)
+        self.assertEqual(report["unlocked"], 1)
+
+    def test_unlock_reports_nothing_when_every_plan_is_representable(self):
+        from frameladder.represent import unlock
+        report = unlock([{"target": "T", "representable": True, "reasons": []}])
+        self.assertEqual(report["blocked"], 0)
+        self.assertEqual(report["additions"], [])
+        self.assertEqual(unlock([], limit=0)["additions"], [])
+
     def test_an_unstated_profile_classifies_everything_as_representable(self):
         from frameladder.capability import Capability
         from frameladder.represent import classify

@@ -158,6 +158,94 @@ def category_of(reason: str) -> str:
     return "other"
 
 
+def capability_needed(reason: str) -> str:
+    """The unit of harness work a refusal names.
+
+    A refusal sentence is built for a human; a work list needs the *thing to
+    build*. "cannot replay READ:F (needed to set CUST-ID)" and "READ:F cannot
+    set CUST-ID" both mention one operation and one field, but the first is a
+    missing mock and the second is a missing field on a mock that exists.
+    The sentences come from `capability.unrepresentable`, so this reads them
+    back rather than re-deriving anything.
+    """
+    from .capability import refusal_kind
+    kind = refusal_kind(reason)
+    if kind == "unsupported_operation":
+        return "replay %s" % reason[len("cannot replay "):].split(" (needed")[0]
+    if kind == "unsupported_output_field" and " cannot set " in reason:
+        op, var = reason.split(" cannot set ", 1)
+        return "%s must set %s" % (op, var)
+    if kind == "unrepresentable_input" and reason.startswith("cannot inject "):
+        return "inject %s" % reason[len("cannot inject "):]
+    return reason
+
+
+def unlock(rows, limit: int = 8) -> dict:
+    """Fewest capability additions that make the most refused plans replayable.
+
+    The dual of the refusal report. A refused plan needs *every* one of its
+    reasons cleared, so this is a maximum-coverage problem over the reason
+    sets and not a count of the commonest reason - the two disagree, because
+    the commonest reason is usually one of several a plan is waiting on, and
+    widening it alone unlocks nothing. Greedy, which is within 1-1/e of
+    optimal on maximum coverage, and the curve is the actionable part anyway:
+    the useful sentence for a harness team is "these three and N plans become
+    replayable", which needs the marginal figures rather than the ranking.
+
+    Reports what a *widening* would be worth. It cannot promise the plan then
+    passes, because a capability the planner no longer has to route around may
+    let it choose a different route entirely - so the count is what stops
+    being refused, which is the number the widening is responsible for.
+    """
+    blocked = [(r["target"], frozenset(capability_needed(x)
+                                       for x in r.get("reasons") or ()))
+               for r in rows if not r.get("representable")]
+    blocked = [(t, needs) for t, needs in blocked if needs]
+
+    granted: set = set()
+    curve: list = []
+    candidates = {c for _t, needs in blocked for c in needs}
+    unlocked: set = set()
+    for _step in range(max(0, limit)):
+        best, gain = None, 0
+        for cand in sorted(candidates - granted):
+            trial = granted | {cand}
+            marginal = sum(1 for t, needs in blocked
+                           if t not in unlocked and needs <= trial)
+            if marginal > gain:
+                best, gain = cand, marginal
+        if best is None:
+            # Greedy stalls as soon as every remaining plan needs two or more
+            # additions at once, which is the common case and not a failure:
+            # the next thing to build is then the one the most plans are
+            # waiting on, even though on its own it unlocks none of them.
+            frequency: dict = {}
+            for t, needs in blocked:
+                if t in unlocked:
+                    continue
+                for cand in needs - granted:
+                    frequency[cand] = frequency.get(cand, 0) + 1
+            if not frequency:
+                break
+            best = max(sorted(frequency), key=lambda c: frequency[c])
+            gain = 0
+        granted.add(best)
+        unlocked = {t for t, needs in blocked if needs <= granted}
+        curve.append({"capability": best, "unlocks": gain,
+                      "cumulative": len(unlocked)})
+
+    sizes = sorted(len(needs) for _t, needs in blocked)
+    return {
+        "blocked": len(blocked),
+        "unlocked": len(unlocked),
+        "additions": curve,
+        # How many capabilities a blocked plan is waiting on. A median above
+        # one is the reason the ranking and the cover disagree.
+        "needs_median": sizes[len(sizes) // 2] if sizes else 0,
+        "needs_max": sizes[-1] if sizes else 0,
+    }
+
+
 def classify(program, capability, *, entry: str | None = None,
              profile_aware: bool = False, targets=None,
              max_routes: int = 4, measure_precheck: bool = False) -> dict:

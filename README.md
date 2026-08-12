@@ -743,6 +743,75 @@ producer `precheck` objected to. So the filter skips and orders, and when
 plan gives the answer. A filter that decides what gets tested has to be wrong
 in the harmless direction.
 
+### Ranking those routes by what they cost the harness: measured at zero
+
+The paragraph above chooses *between* routes but does not score them, and
+`route_options` ranks by external reach, which is not the same thing as what a
+profile will refuse. So routes were scored by capability demand — the distinct
+stub operations, payload fields and entry variables their guards oblige — and
+the planner made to try the cheapest first.
+
+The premise holds and the conclusion does not. Demand really does vary between
+routes: over 772 targets, 697 with more than one way in, the spread from
+cheapest to dearest route is **median 4 demands, range 0–47**, and for **40%**
+of targets some route is cheaper than the shortest one, by a median of 2.
+
+It buys nothing. Corpus-wide, under the proxy profile, ordering by capability
+cost moves `runnable` from 390 to **390** — no program changed, at either
+route cap. The reason is that refusal is not route-local the way demand is:
+**39.9%** of those targets have every route refused *identically*, and another
+24.8% differ in demand while agreeing exactly on the refusal. Of the 398
+targets whose shortest route is refused, only **47** have any deliverable
+route at all, and today's ordering already finds every one of them — the first
+clear route sits at rank ≤ 3 with the cap at 4.
+
+Two ablations finish it off. Cost ordering pays **+7 to +14 runnable** on
+profiles narrowed by randomly dropping a quarter to three-quarters of what the
+proxy grants — so it is not *nothing* once the harness is narrow. But simply
+raising the route cap from 4 to 16 pays **+41 to +45** on those same profiles,
+at half the runtime, and saturates there (40 is identical to 16). The ordering
+is dominated by trying more routes, and trying more routes is raw budget,
+which this repository has already measured as a non-mechanism. Raising the cap
+is also not free: on the shared `--routes` parameter it costs `verified`
+804 → 801, because `plan_for_branch`'s plain retry prefers an
+*uncontested* candidate over a *solved* one, so a later route can displace a
+base plan that worked.
+
+Nothing was shipped from any of this. It is recorded because "a cheaper route"
+is an obvious idea, the spread that motivates it is real and measurable, and
+the reason it fails is a property of the corpus rather than of the code.
+
+### The dual: which capabilities to add, as a set cover
+
+The useful direction turned out to be the other one. A refused plan needs
+*every* one of its reasons cleared, so "what should the harness build next" is
+a maximum-coverage problem over the reason sets and not a ranking of the
+commonest reason — and the two disagree, because a blocked plan here waits on
+a **median of 2** capabilities. `represent.unlock` reports it, `represent
+--unlock N` prints it.
+
+Pooled over the corpus under the proxy profile, 377 of 772 emitted plans are
+blocked, and **twelve additions unblock 250 of them (66%)**:
+
+| | capability | new | cumulative |
+|---|---|---|---|
+| 1 | replay `EXEC:CICS:XCTL` | 50 | 50 |
+| 2 | inject `LIT-MENUPGM` | 40 | 90 |
+| 3 | inject `LIT-THISPGM` | 29 | 119 |
+| 4 | inject `CDEMO-FROM-PROGRAM` | 32 | 151 |
+| 5 | inject `LIT-ADMINPGM` | 27 | 178 |
+
+Six of the top seven are the fields a screen program compares against to work
+out which program handed control to it. That is a more specific piece of
+advice than "support more mocks": on this corpus the transfer-of-control
+context is worth more than any file operation, and it is worth more as a set
+than any member of it is alone.
+
+The count is what stops being *refused*. It cannot promise the plan then
+verifies, and a widening may let the planner choose a different route
+entirely, so it is the number the widening is responsible for rather than a
+forecast of coverage.
+
 **A gap in the contract, found by measuring rather than by reading it.**
 188 of the 819 plans carry an outcome selected by a *discriminator* — "this
 `READ` returns not-found only while the create flag is off" — and `Capability`
