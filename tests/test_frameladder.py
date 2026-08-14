@@ -46,6 +46,28 @@ class TestConditions(unittest.TestCase):
         self.assertEqual([str(a[0]) for a in atoms],
                          ["WS-RC = '00'", "WS-RC = '04'"])
 
+    def test_nested_intrinsic_names_the_real_operand(self):
+        # `FUNCTION` binds to the token after it. Split on whitespace and the
+        # outer call gets a variable named `FUNCTION` and one named `TRIM(X)`,
+        # so the field the guard is really about is never named and the
+        # condition is undecidable in both directions.
+        atom = conditions.condition_atoms(
+            "FUNCTION LENGTH(FUNCTION TRIM(WS-NAME)) = 0")[0][0]
+        self.assertEqual(atom.lhs.name, "WS-NAME")
+        self.assertEqual(atom.lhs.func, "LENGTH")
+        self.assertEqual(len(atom.lhs.args), 1)
+
+    def test_intrinsic_arguments_still_split_on_space(self):
+        # The rejoin must not swallow the space-as-separator rule the
+        # reference manuals use for multi-argument intrinsics.
+        self.assertEqual(
+            len(conditions.condition_atoms("FUNCTION MOD(A B) = 0")[0][0].lhs.args),
+            2)
+        maxi = conditions.condition_atoms(
+            "FUNCTION MAX(FUNCTION LENGTH(A) FUNCTION LENGTH(B)) = 3")[0][0]
+        self.assertEqual(maxi.lhs.func, "MAX")
+        self.assertEqual([a.name for a in maxi.lhs.args], ["A", "B"])
+
     def test_negated_or_becomes_conjunction(self):
         atoms = conditions.condition_atoms("A = 1 OR B = 2", negate=True)
         self.assertEqual(sorted(str(a) for a in atoms[0]), ["A != 1", "B != 2"])

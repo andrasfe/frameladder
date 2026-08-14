@@ -238,13 +238,36 @@ def _split_args(text: str) -> list:
     pieces = [p.strip() for p in out if p.strip()]
     split: list = []
     for piece in pieces:
-        words = _top_level_words(piece)
+        words = _bind_function_words(_top_level_words(piece))
         if (len(words) > 1 and not any(w in _ARITH_OPS for w in words)
                 and not _LENGTH_OF.match(piece)):
             split.extend(words)
         else:
             split.append(piece)
     return split
+
+
+def _bind_function_words(words: list) -> list:
+    """Rejoin `FUNCTION` with the intrinsic it names.
+
+    An argument may itself be an intrinsic call, and `FUNCTION TRIM(X)` is
+    two whitespace-separated words. Split them and the outer call gets two
+    arguments - a variable named `FUNCTION` and one named `TRIM(X)` - so the
+    operand the condition is really about is never named at all and the
+    guard becomes undecidable. `FUNCTION` is a prefix keyword that binds to
+    the token after it, which is the same rule that keeps `LENGTH OF X`
+    whole above.
+    """
+    out, index = [], 0
+    while index < len(words):
+        word = words[index]
+        if word.upper() == "FUNCTION" and index + 1 < len(words):
+            out.append(word + " " + words[index + 1])
+            index += 2
+            continue
+        out.append(word)
+        index += 1
+    return out
 
 
 def _top_level_words(text: str) -> list:
