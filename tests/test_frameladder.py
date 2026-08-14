@@ -5216,3 +5216,156 @@ class TestReentry(unittest.TestCase):
                  for entry in spec["stubs"]["EXEC:CICS:READ"]}
         self.assertIn(13, codes)                      # the compared fault
         self.assertNotIn(19, codes)                   # never a whole table
+
+
+class TestMarshal(unittest.TestCase):
+    """Validator micro-execution: the convention, the tables, the screen."""
+
+    SOURCE = HEADER + """       01  WS-WORK.
+           05  WS-EDIT-IN         PIC X(4).
+           05  WS-EDIT-LEN        PIC S9(4) COMP-3.
+           05  WS-EDIT-FLAG       PIC X.
+               88  EDIT-BLANK     VALUE 'B'.
+               88  EDIT-BAD       VALUE 'N'.
+               88  EDIT-GOOD      VALUE 'Y'.
+       01  WS-SCREEN.
+           05  SCR-ONE            PIC X(4).
+           05  SCR-TWO            PIC X(4).
+       01  WS-VERDICT.
+           05  VER-ONE            PIC X.
+               88  ONE-BLANK      VALUE 'B'.
+               88  ONE-BAD        VALUE 'N'.
+               88  ONE-GOOD       VALUE 'Y'.
+           05  VER-TWO            PIC X.
+               88  TWO-BLANK      VALUE 'B'.
+               88  TWO-BAD        VALUE 'N'.
+               88  TWO-GOOD       VALUE 'Y'.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           MOVE SCR-ONE               TO WS-EDIT-IN
+           PERFORM 1100-EDIT THRU 1100-EDIT-EXIT
+           MOVE WS-EDIT-FLAG          TO VER-ONE
+
+           MOVE SCR-TWO               TO WS-EDIT-IN
+           PERFORM 1100-EDIT THRU 1100-EDIT-EXIT
+           MOVE WS-EDIT-FLAG          TO VER-TWO
+
+           EVALUATE TRUE
+              WHEN ONE-BLANK
+                  CONTINUE
+              WHEN ONE-BAD
+                  CONTINUE
+              WHEN TWO-BLANK
+                  CONTINUE
+              WHEN TWO-BAD
+                  CONTINUE
+              WHEN OTHER
+                  CONTINUE
+           END-EVALUATE
+           GOBACK.
+       1100-EDIT.
+           SET EDIT-BAD               TO TRUE
+           IF WS-EDIT-IN EQUAL SPACES OR WS-EDIT-IN EQUAL LOW-VALUES
+              SET EDIT-BLANK          TO TRUE
+              GO TO 1100-EDIT-EXIT
+           END-IF
+           IF WS-EDIT-IN IS NUMERIC
+              SET EDIT-GOOD           TO TRUE
+           END-IF
+           .
+       1100-EDIT-EXIT.
+           EXIT.
+"""
+
+    def _program(self):
+        return program(self.SOURCE)
+
+    def test_sites_finds_both_call_sites(self):
+        from frameladder import marshal
+        found = marshal.sites(self._program())
+        self.assertEqual(len(found), 2)
+        for site in found:
+            self.assertEqual(site["host"], "0000-MAIN")
+            self.assertEqual(site["range"], ("1100-EDIT", "1100-EDIT-EXIT"))
+            # `PERFORM A THRU B` is the range, never a paragraph called "A THRU B"
+            self.assertIn(("WS-EDIT-FLAG",), [tuple(o[0] for o in site["outs"])])
+        sources = sorted(src for site in found for src, _work in site["ins"])
+        self.assertEqual(sources, ["SCR-ONE", "SCR-TWO"])
+
+    def test_sites_needs_both_halves(self):
+        """A MOVE that merely sits beside a PERFORM is not a call site."""
+        from frameladder import marshal
+        prog = program(self.SOURCE.replace(
+            "           MOVE WS-EDIT-FLAG          TO VER-ONE\n", ""))
+        hosts = [s for s in marshal.sites(prog) if s["host"] == "0000-MAIN"]
+        self.assertEqual(len(hosts), 1)             # the un-harvested one is gone
+
+    def test_outcome_table_reaches_every_verdict(self):
+        from frameladder import marshal
+        prog = self._program()
+        table = marshal.outcome_table(prog, ("1100-EDIT", "1100-EDIT-EXIT"))
+        self.assertEqual(set(table), {"EDIT-BLANK", "EDIT-BAD", "EDIT-GOOD"})
+        for state in table.values():
+            self.assertIn("WS-EDIT-IN", state)
+
+    def test_outcome_table_is_memoised_per_range(self):
+        from frameladder import marshal
+        prog = self._program()
+        cache: dict = {}
+        first = marshal.outcome_table(prog, ("1100-EDIT", "1100-EDIT-EXIT"),
+                                      cache=cache)
+        self.assertEqual(list(cache), [("1100-EDIT", "1100-EDIT-EXIT")])
+        cache[("1100-EDIT", "1100-EDIT-EXIT")] = {"SENTINEL": {}}
+        again = marshal.outcome_table(prog, ("1100-EDIT", "1100-EDIT-EXIT"),
+                                      cache=cache)
+        self.assertEqual(set(again), {"SENTINEL"})   # served from the cache
+        self.assertNotEqual(set(first), {"SENTINEL"})
+
+    def test_compose_makes_every_edit_pass(self):
+        """The composed state must actually run to the chain's OTHER arm."""
+        from frameladder import marshal
+        prog = self._program()
+        found = marshal.sites(prog)
+        cache: dict = {}
+        for members in {tuple(s["range"]) for s in found}:
+            marshal.outcome_table(prog, members, cache=cache)
+        state = marshal.compose(prog, found, dict(cache))
+        self.assertEqual(sorted(state), ["SCR-ONE", "SCR-TWO"])
+        trace = Interpreter(prog, dict(state)).run("0000-MAIN")
+        fired = [g for g in trace.guards
+                 if g.paragraph == "0000-MAIN" and g.result
+                 and g.kind == "WHEN"]
+        self.assertEqual([g.condition for g in fired], ["OTHER"])
+
+    def test_spoil_puts_the_chain_on_one_arm(self):
+        from frameladder import marshal
+        prog = self._program()
+        found = marshal.sites(prog)
+        cache: dict = {}
+        for members in {tuple(s["range"]) for s in found}:
+            marshal.outcome_table(prog, members, cache=cache)
+        seen = set()
+        for position, verdict in marshal.spoil_variants(prog, found,
+                                                        dict(cache)):
+            state = marshal.compose(prog, found, dict(cache),
+                                    spoil=(position, verdict))
+            trace = Interpreter(prog, dict(state)).run("0000-MAIN")
+            for guard in trace.guards:
+                if guard.kind == "WHEN" and guard.result \
+                        and guard.condition != "OTHER":
+                    seen.add(guard.condition)
+        # spoiling one field at a time reaches arms the all-valid run misses
+        self.assertTrue(seen)
+
+    def test_no_sites_is_reported_not_guessed(self):
+        from frameladder import marshal
+        prog = program(HEADER + """       01  WS-A PIC X(4).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           MOVE SPACES TO WS-A
+           GOBACK.
+""")
+        self.assertEqual(marshal.sites(prog), [])
+        report = marshal.marshal(prog, None, lambda *a, **k: None)
+        self.assertEqual(report["reason"], "no_sites")
+        self.assertEqual(report["runs"], 0)

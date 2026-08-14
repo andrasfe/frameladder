@@ -2046,6 +2046,27 @@ def cmd_witnesses(args):
                                    plan_recipes=plan_recipes,
                                    on_witness=lift_seeds.append)
 
+    # 2.5 Validator micro-execution. Where the program factors its input
+    #     edits into paragraphs called through a MOVE-in/PERFORM/MOVE-out
+    #     convention, each range is run *in isolation* over a small
+    #     evidence-derived pool and the verdicts it can produce are
+    #     tabulated once. The tables compose into one entry state in which
+    #     every edit passes, and into one-field-spoiled variants of it -
+    #     the shape a first-match chain over per-field verdicts needs and
+    #     that no per-direction plan and no sampling axis reaches, because
+    #     each solves one field while destroying the rest. Runs before the
+    #     frontier so the composed state, which is the deepest any run
+    #     gets on such a program, becomes a seed.
+    marshal_report = None
+    if getattr(args, "marshal", 0):
+        from .marshal import marshal as _marshal
+        marshal_bases = [({}, world, None, None) for world in WORLDS]
+        marshal_bases += [seed for seed in lift_seeds[-8:]]
+        marshal_report = _marshal(program, ledger, run,
+                                  budget=args.marshal,
+                                  bases=marshal_bases, prov=prov,
+                                  on_witness=lift_seeds.append)
+
     # 3. The frontier search, credited. The residual after phases 1 and 2 is
     #    dominated by directions needing mid-run state no entry value
     #    survives to - a flag an earlier validation set, a compound guard on
@@ -2113,6 +2134,7 @@ def cmd_witnesses(args):
                "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
                "lift": lift_report,
                "stub_search": stub_report,
+               "marshal": marshal_report,
                "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
                             "kind": b.kind, "direction": d,
                             "condition": b.condition, "line": b.line}
@@ -2425,6 +2447,13 @@ def build_parser():
                          "returns each code the arms name, at one position "
                          "in its series, over a run that already got near; "
                          "0 disables")
+    wt.add_argument("--marshal", type=int, default=120, metavar="N",
+                    help="up to N runs composing a screen from validator "
+                         "outcome tables: every paragraph range reached "
+                         "through a MOVE-in/PERFORM/MOVE-out call site is "
+                         "run in isolation over a candidate pool, and the "
+                         "answers compose into one all-valid entry state "
+                         "plus one-field-spoiled variants; 0 disables")
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
     wt.set_defaults(func=cmd_witnesses)
