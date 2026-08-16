@@ -5356,3 +5356,118 @@ class TestChain(unittest.TestCase):
                            False), budget, cache)
         # the second direction is answered mostly from the shared sweep
         self.assertLess(budget.spent - spent_first, spent_first + 3)
+class TestMinimize(unittest.TestCase):
+    """Shrinking a witness recipe to its essential support
+    (frameladder.minimize). Coverage never changes here - only cost does: a
+    recipe drops every pinned key its owned directions do not need, and must
+    still reproduce every one of them from what remains.
+    """
+
+    def test_only_the_deciding_key_survives(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.ledger import Recipe, _freeze
+        from frameladder.minimize import minimize, taken_directions
+        prog = program(HEADER + """       01  WS-A PIC X VALUE 'A'.
+       01  WS-B PIC X VALUE 'N'.
+       01  WS-C PIC X VALUE 'C'.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           IF WS-B = 'X'
+               CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        state = {"WS-A": "Z", "WS-B": "X", "WS-C": "Z"}
+        trace = Interpreter(prog, dict(state)).run("MAIN-PARA")
+        owns = {k for k in taken_directions(trace) if k[3]}
+        self.assertTrue(owns)                          # the True arm was taken
+        recipe = Recipe(_freeze(state), "bare", (), (), "test")
+
+        shrunk = minimize(prog, "MAIN-PARA", recipe, owns,
+                          lambda w: io_defaults(prog, w))
+
+        # WS-A and WS-C never gate anything: only the deciding key survives.
+        self.assertEqual(dict(shrunk.input_state), {"WS-B": "X"})
+        # And it reproduces: a fresh interpreter from exactly the minimized
+        # payload still takes every direction the recipe was credited with.
+        payload = shrunk.payload()
+        replay = Interpreter(prog, dict(payload["input_state"]),
+                             stubs=payload["stubs"],
+                             terminals=payload["terminals"],
+                             defaults=io_defaults(prog, payload["world"]))
+        self.assertTrue(owns <= taken_directions(replay.run("MAIN-PARA")))
+
+    def test_an_unconsulted_stub_series_is_dropped(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.ledger import Recipe, _freeze
+        from frameladder.minimize import minimize, taken_directions
+        prog = program(HEADER + """       01  WS-RC PIC S9(8) COMP VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM READ-THING
+           GOBACK
+           .
+       READ-THING.
+           EXEC CICS READ DATASET(WS-FILE) INTO(WS-REC) RESP(WS-RC)
+           END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN DFHRESP(NOTFND)
+                   CONTINUE
+               WHEN OTHER
+                   CONTINUE
+           END-EVALUATE
+           .
+""")
+        # Two staged operations; only the READ series is ever consulted.
+        stubs = {
+            "EXEC:CICS:READ": [{"when": {}, "set": {"WS-RC": 13},
+                               "seq": 0, "inferred": False}],
+            "EXEC:CICS:WRITE": [{"when": {}, "set": {"WS-JUNK": "Z"},
+                                "seq": 0, "inferred": False}],
+        }
+        trace = Interpreter(prog, {}, stubs=stubs).run("MAIN-PARA")
+        owns = {k for k in taken_directions(trace)
+                if k[0] == "READ-THING" and k[3]}
+        self.assertTrue(owns)
+        recipe = Recipe((), "bare", _freeze(stubs), (), "test")
+
+        shrunk = minimize(prog, "MAIN-PARA", recipe, owns,
+                          lambda w: io_defaults(prog, w))
+
+        payload = shrunk.payload()
+        self.assertEqual(set(payload["stubs"]), {"EXEC:CICS:READ"})
+        replay = Interpreter(prog, dict(payload["input_state"]),
+                             stubs=payload["stubs"],
+                             terminals=payload["terminals"],
+                             defaults=io_defaults(prog, payload["world"]))
+        self.assertTrue(owns <= taken_directions(replay.run("MAIN-PARA")))
+
+    def test_budget_of_zero_spends_no_runs_and_drops_nothing(self):
+        from frameladder.conformance_defaults import io_defaults
+        from frameladder.ledger import Recipe, _freeze
+        from frameladder.minimize import minimize, taken_directions
+        prog = program(HEADER + """       01  WS-A PIC X VALUE 'A'.
+       01  WS-B PIC X VALUE 'N'.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           IF WS-B = 'X'
+               CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        state = {"WS-A": "Z", "WS-B": "X"}
+        trace = Interpreter(prog, dict(state)).run("MAIN-PARA")
+        owns = {k for k in taken_directions(trace) if k[3]}
+        recipe = Recipe(_freeze(state), "bare", (), (), "test")
+        stats = {"runs": 0}
+
+        shrunk = minimize(prog, "MAIN-PARA", recipe, owns,
+                          lambda w: io_defaults(prog, w),
+                          budget=0, stats=stats)
+
+        self.assertEqual(stats["runs"], 0)
+        self.assertEqual(dict(shrunk.input_state), state)
