@@ -5471,3 +5471,36 @@ class TestMinimize(unittest.TestCase):
 
         self.assertEqual(stats["runs"], 0)
         self.assertEqual(dict(shrunk.input_state), state)
+
+
+class TestSpoilFamily(unittest.TestCase):
+    """One-field-spoiled probe variants: every failure kind, never the pass."""
+
+    def test_spoils_cover_the_failure_kinds(self):
+        from frameladder import chain
+        prog = program(HEADER + """       01  WS-IN-NUM        PIC X(4).
+       01  WS-IN-CODE       PIC X.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           GOBACK.
+""")
+        index = chain._Index(prog)
+        chain._valid_screen.__evidence__ = {
+            "WS-IN-NUM": [" ", "9999"],
+            "WS-IN-CODE": [" ", "Y", "N"]}
+        screen = {"EXEC:CICS:RECEIVE": {"WS-IN-NUM": "9999",
+                                        "WS-IN-CODE": "Y"}}
+        family = chain._spoil_family(index, screen)
+        kinds = {(field, kind) for _op, field, kind, _v in family}
+        # a digits-pass field gets blank, low, the class failure, and zero
+        self.assertLessEqual({("WS-IN-NUM", "blank"), ("WS-IN-NUM", "low"),
+                              ("WS-IN-NUM", "nonnum"), ("WS-IN-NUM", "zero")},
+                             kinds)
+        # an enumerated field gets a byte outside its own literal set
+        outside = [v for _op, f, k, v in family
+                   if f == "WS-IN-CODE" and k == "outside"]
+        self.assertTrue(outside)
+        self.assertNotIn(outside[0], ("Y", "N"))
+        # no spoil ever equals the pass value it replaces
+        for op, field, _kind, value in family:
+            self.assertNotEqual(value, screen[op][field])
