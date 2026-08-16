@@ -2216,8 +2216,10 @@ def cmd_chain(args):
         goals = [(para.upper(), int(ordinal), kind.upper(),
                   direction.strip().lower() in ("true", "1", "t"))]
 
+    facts_path = (args.out + ".facts.json") if args.out else None
     report = run_chain(program, goals=goals, budget=args.budget,
-                       baseline=baseline)
+                       baseline=baseline, epochs=args.epochs,
+                       facts_path=facts_path)
     ledger = report.pop("ledger")
     report["program"] = program.name
     if args.out:
@@ -2229,6 +2231,12 @@ def cmd_chain(args):
         print("%s: %d goals, %d witnessed, %d directions credited, %d runs"
               % (program.name, report["goals"], report["witnessed"],
                  report["credited_directions"], report["runs"]))
+        for row in report.get("epochs", []):
+            print("  epoch %d: +%d witnessed (%d total), +%d credited, "
+                  "%d facts, %d subgoals, %d runs"
+                  % (row["epoch"], row["witnessed_delta"],
+                     row["witnessed_original"], row["credited_delta"],
+                     row["new_facts"], row["new_subgoals"], row["runs"]))
         for reason, count in sorted(report["refusals"].items(),
                                     key=lambda kv: -kv[1]):
             print("  refused %-24s %d" % (reason, count))
@@ -2485,6 +2493,10 @@ def build_parser():
                     help="one direction, e.g. 1200-EDIT:4:IF:True")
     ch.add_argument("--budget", type=int, default=8000, metavar="N",
                     help="total interpreter runs, micro and full together")
+    ch.add_argument("--epochs", type=int, default=3, metavar="N",
+                    help="solve-replay-learn cycles; each epoch consults "
+                         "the facts and subgoals the previous one donated; "
+                         "stops early when an epoch adds nothing")
     ch.add_argument("--out", metavar="FILE",
                     help="write credited witnesses as JSONL")
     ch.set_defaults(func=cmd_chain)

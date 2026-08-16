@@ -53,13 +53,15 @@ from .ledger import Ledger, _freeze
 from .liveness import live_in
 
 MAX_DEPTH = 6           # producer hops per goal
-MAX_LOCAL_RUNS = 260    # interpreter runs per local solve
+MAX_LOCAL_RUNS = 420    # interpreter runs per local solve
 MAX_PRODUCER_RUNS = 220 # interpreter runs per output-constrained solve
 MAX_VALUES = 8          # candidate values per variable
 MAX_VARIABLES = 24      # variables swept per closure
 MAX_SPOILS = 40         # mixed-construction variants per closure
 STUB_SERIES = 6         # deliveries staged per operation, one per call
 MAX_CANDIDATES = 3      # local witnesses composed and replayed per goal
+MAX_FACTS = 4           # donated fact states consulted per closure
+MAX_FACT_VARS = 20      # variables kept per donated fact projection
 
 _KIND = {"PERFORM_UNTIL": "LOOP", "PERFORM_VARYING": "LOOP",
          "PERFORM_TIMES": "LOOP"}
@@ -247,9 +249,12 @@ def _guard_evidence(index, members) -> dict:
                             continue
                         raw = (arm.get("attributes") or {}).get("value")
                         value = _literal(raw)
-                        if value is not None and value.upper() not in (
+                        if value is None:
+                            continue
+                        if isinstance(value, str) and value.upper() in (
                                 "OTHER", "ANY", "TRUE", "FALSE"):
-                            note(subject, value)
+                            continue
+                        note(subject, value)
     # One value outside every tested set, so negative directions of a
     # field's only comparison are reachable at all.
     from .heuristics import complement_value
@@ -318,6 +323,15 @@ def _literal(raw):
     text = str(raw).strip()
     if text.upper() in _FIGURATIVE:
         return _FIGURATIVE[text.upper()]
+    # The platform's own reader resolves what a bare strip cannot:
+    # DFHRESP(NORMAL) is the integer 0, not a fifteen-byte string.
+    try:
+        from .ir import parse_term
+        term = parse_term(text)
+        if term.kind == "const" and not isinstance(term.value, bool):
+            return term.value
+    except Exception:                                        # noqa: BLE001
+        pass
     return text.strip("'\"")
 
 
@@ -463,12 +477,78 @@ def _stub_channels(index, prov, names, members=()) -> dict:
     return out
 
 
-def _attempts_for(index, prov, members) -> list:
-    """The sweep, cheapest shape first: the bare state, guard-evidence
-    values one at a time, staged stub terminals one at a time, the mixed
-    all-valid-plus-one-spoiled construction, joint bases rotating through
-    the candidate lists, and the all-valid joint base with one variable
-    (or one stub code) varied. Every attempt is ``(state, terminals)``.
+def _mirror_pairs(index, prov, members) -> list:
+    """``[(stub_head, op_key, other_name)]`` from var-vs-var comparisons.
+
+    A guard like ``record-key = screen-key`` where one side arrives from
+    an external operation is a *consistency* constraint: no literal in
+    the program says what either side holds, only that they must agree.
+    The staging that satisfies it is the mirror - deliver into the
+    stub-written side whatever value the attempt already chose for the
+    other side. Measured on iteration 1, every such gate refused; the
+    program's own text names no value because the value is "whatever the
+    user typed".
+    """
+    names = frozenset(index.model.condition_names or ())
+    out, marks = [], set()
+    for member in members:
+        for stmt in _statements(index.paragraphs.get(member, {})):
+            attributes = stmt.get("attributes") or {}
+            for field in ("condition", "value"):
+                cond = attributes.get(field)
+                if not cond:
+                    continue
+                try:
+                    groups = condition_atoms(str(cond), names=names)
+                except Exception:                            # noqa: BLE001
+                    continue
+                for group in groups:
+                    for atom in group:
+                        lhs, rhs = atom.lhs, atom.rhs
+                        if getattr(lhs, "kind", "") != "var"                                 or getattr(rhs, "kind", "") != "var":
+                            continue
+                        for one, other in ((lhs, rhs), (rhs, lhs)):
+                            head = str(one.name).upper().split(" OF ")[0]
+                            writers = [w for w in _writers(prov, head)
+                                       if w.kind == "STUB" and w.op_key]
+                            if not writers:
+                                continue
+                            other_name = str(other.name).upper()
+                            if not index.model.knows(
+                                    other_name.split(" OF ")[0]):
+                                continue
+                            local = [w for w in writers
+                                     if w.para in members]
+                            op = (local or writers)[0].op_key
+                            mark = (head, op, other_name)
+                            if mark not in marks:
+                                marks.add(mark)
+                                out.append(mark)
+    return out
+
+
+def _from_state(state, name):
+    """A value for ``name`` out of an attempt state, qualified or not."""
+    if name in state:
+        return state[name]
+    head = name.split(" OF ")[0]
+    if head in state:
+        return state[head]
+    for key, value in state.items():
+        if str(key).split(" OF ")[0] == head:
+            return value
+    return None
+
+
+def _attempts_for(index, prov, members, facts=()) -> list:
+    """The sweep, cheapest shape first: the bare state, donated fact
+    states from earlier from-entry replays, guard-evidence values one at
+    a time, staged stub codes one at a time, the mixed all-valid-plus-
+    one-spoiled construction, joint bases rotating through the candidate
+    lists, and the all-valid joint base with one variable (or one stub
+    code) varied. Every attempt is ``(state, stub_plan)``; var-vs-var
+    consistency gates get their stub side mirrored from whatever the
+    attempt chose for the entry side.
     """
     evidence = _guard_evidence(index, members)
     pool = _pool_from_literals(index, prov)
@@ -493,25 +573,21 @@ def _attempts_for(index, prov, members) -> list:
                 merged.append(value)
         return merged[:MAX_VALUES + 2]
 
-    def series(assignments):
-        """``{op: [{"set": {...}}] * STUB_SERIES}`` - the same outcome on
-        every call the run makes."""
-        out: dict = {}
-        for op, fields in assignments.items():
-            out[op] = [{"set": dict(fields)} for _n in range(STUB_SERIES)]
-        return out
+    mirrors = _mirror_pairs(index, prov, members)
 
-    attempts = [({}, {})]
+    raw = [({}, {})]                       # (state, {op: {field: value}})
+    for fact in list(facts)[:MAX_FACTS]:
+        raw.append((dict(fact), {}))
     for name in variables:
         if name in channels:
             op, _extra = channels[name]
             head = name.split(" OF ")[0]
             for value in stub_values(name):
-                attempts.append(({}, series({op: {head: value}})))
+                raw.append(({}, {op: {head: value}}))
             continue
         for value in candidates(name):
-            attempts.append(({name: value}, {}))
-    attempts.extend((state, {}) for state in _mixed_states(index, members))
+            raw.append(({name: value}, {}))
+    raw.extend((state, {}) for state in _mixed_states(index, members))
     # Joint bases. The all-complements joint comes first and serves as the
     # varied-sweep base: a variable's complement (or digits, under a class
     # condition) is the one value outside everything the closure tests it
@@ -548,10 +624,14 @@ def _attempts_for(index, prov, members) -> list:
         if joint and joint not in joints:
             joints.append(joint)
     for joint in joints:
-        attempts.append((joint, {}))
+        raw.append((joint, {}))
         if joint_terms:
-            attempts.append((joint, series(joint_terms)))
+            raw.append((joint, {k: dict(v) for k, v in joint_terms.items()}))
     base = joints[0] if joints else {}
+    for fact in list(facts)[:MAX_FACTS]:
+        merged = dict(base)
+        merged.update(fact)
+        raw.append((merged, {k: dict(v) for k, v in joint_terms.items()}))
     for name in variables:
         if name in channels:
             op, _extra = channels[name]
@@ -559,19 +639,40 @@ def _attempts_for(index, prov, members) -> list:
             for value in stub_values(name):
                 varied_terms = {k: dict(v) for k, v in joint_terms.items()}
                 varied_terms.setdefault(op, {})[head] = value
-                attempts.append((dict(base), series(varied_terms)))
+                raw.append((dict(base), varied_terms))
             continue
         for value in candidates(name):
             if base.get(name) != value:
                 varied = dict(base)
                 varied[name] = value
-                attempts.append((varied, {}))
+                raw.append((varied, {}))
                 if joint_terms:
-                    attempts.append((varied, series(joint_terms)))
+                    raw.append((varied,
+                                {k: dict(v) for k, v in joint_terms.items()}))
+
+    def materialise(fields):
+        return {op: [{"set": dict(vals)} for _n in range(STUB_SERIES)]
+                for op, vals in fields.items()}
+
+    attempts = []
+    for state, fields in raw:
+        # The mirror: any var-vs-var consistency gate whose entry side
+        # this attempt values gets the stub side delivered to match.
+        mirrored = {k: dict(v) for k, v in fields.items()}
+        hit = False
+        for stub_head, op, other_name in mirrors:
+            value = _from_state(state, other_name)
+            if value is None:
+                continue
+            mirrored.setdefault(op, {})[stub_head] = value
+            hit = True
+        attempts.append((state, materialise(fields)))
+        if hit and mirrored != fields:
+            attempts.append((state, materialise(mirrored)))
     return attempts
 
 
-def local_solve(index, prov, goal, budget, sweep_cache) -> tuple:
+def local_solve(index, prov, goal, budget, sweep_cache, facts=()) -> tuple:
     """``(assignment, runs)`` firing the goal in the closure, or
     ``(None, runs)``.
 
@@ -620,21 +721,28 @@ def local_solve(index, prov, goal, budget, sweep_cache) -> tuple:
         the most deliberate construction) and the caller lets the
         from-entry replay decide.
         """
-        firing = [(state, staged) for state, staged, fired
+        firing = [(state, staged, fired) for state, staged, fired
                   in cached["states"] if goal in fired]
-        firing.sort(key=lambda pair: -(len(pair[0]) + len(pair[1])))
+        # Deepest-first: the state whose run fired the most *distinct*
+        # directions got past the most gates - an error loop fires the
+        # same few guards over and over, however big its state was. The
+        # first cut of this used richest-state-first and reliably chose
+        # a donated failure state whose screen bytes poisoned the recipe.
+        firing.sort(key=lambda row: (-len(row[2]),
+                                     -(len(row[0]) + len(row[1]))))
         out = []
-        for state, staged in firing[:MAX_CANDIDATES]:
+        for state, staged, fired_set in firing[:MAX_CANDIDATES]:
             def fires(trimmed, _staged=staged):
                 fired = observe(trimmed, _staged)
                 if fired is None:
                     return None
                 return goal in fired
-            out.append((_shrink(fires, state), staged, dict(state)))
+            out.append((_shrink(fires, state), staged, dict(state),
+                        fired_set))
         return out
 
     if not cached["done"]:
-        attempts = _attempts_for(index, prov, members)
+        attempts = _attempts_for(index, prov, members, facts=facts)
         position = len(cached["states"])
         for state, staged in attempts[position:]:
             fired = observe(state, staged)
@@ -783,8 +891,16 @@ def _stage_stub(stub_fields, writer, name, value):
     """One operation is one delivery: a RECEIVE fills the whole screen in
     one call, so every staged field of an op belongs to *every* entry of
     its series, not to an entry of its own. Fields accumulate here and
-    materialise once, together."""
-    stub_fields.setdefault(writer.op_key, {})[str(name).upper()] = value
+    materialise once, together.
+
+    First write wins. The frontier is walked goal-level first, producer
+    recursion after, and a producer's own sweep state is incidental - it
+    said what fires the *producer*, not what the goal's screen holds.
+    Letting depth 2 overwrite depth 1 measurably replaced a valid screen
+    byte with a producer's LOW-VALUE and failed the very edit the goal
+    state had passed."""
+    stub_fields.setdefault(writer.op_key, {}).setdefault(
+        str(name).upper(), value)
 
 
 def _materialise(stub_fields) -> dict:
@@ -793,14 +909,15 @@ def _materialise(stub_fields) -> dict:
 
 
 def solve(index, prov, goal, budget, memo, reentry_bases,
-          sweep_cache) -> dict:
+          sweep_cache, facts=()) -> dict:
     """One goal in, ``{"recipe": ...}`` or ``{"refusal": ...}`` out.
 
     The recipe is not yet validated - validation is the caller's replay,
     because crediting must go through the same deduplicating run every
     mechanism uses.
     """
-    candidates, _runs = local_solve(index, prov, goal, budget, sweep_cache)
+    candidates, _runs = local_solve(index, prov, goal, budget, sweep_cache,
+                                    facts=facts)
     if not candidates:
         if budget.left() <= 0:
             return {"refusal": "budget-exhausted"}
@@ -810,7 +927,9 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
     bases = [({}, world) for world in WORLDS]
     bases += [(dict(state), "populated") for _name, state in reentry_bases]
     recipes, refusal = [], None
-    for assignment, staged_stubs, full_state in candidates:
+    local_fired: set = set()
+    for assignment, staged_stubs, full_state, fired_set in candidates:
+        local_fired |= set(fired_set)
         entry_pins: dict = {}
         stub_fields: dict = {}
         for key, entries in (staged_stubs or {}).items():
@@ -842,20 +961,27 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
                 kind, detail = classify(index, prov, name, value,
                                         goal_members)
                 if kind == "entry":
-                    held = entry_pins.get(str(name).upper())
-                    if held is not None and str(held) != str(value):
-                        failed = "producer-unsolvable"
-                        break
-                    entry_pins[str(name).upper()] = value
+                    # First write wins here too, same depth argument.
+                    entry_pins.setdefault(str(name).upper(), value)
                 elif kind == "stub":
                     _stage_stub(stub_fields, detail, name, value)
-                elif str(name).upper() in essential:
-                    producer = detail[0]
-                    produced.setdefault(producer, {})[str(name).upper()] =                         value
                 else:
-                    # Locally redundant and program-written on the route:
-                    # the route's own computation is trusted to fill it.
-                    continue
+                    # Program-written, so the producer chase may apply -
+                    # but when an operation also delivers the field (a
+                    # screen fill, a record read), stage that delivery
+                    # too: on the route that matters the producer
+                    # paragraph may never run, and the operation is what
+                    # actually hands the value over. Measured without
+                    # this, the replay diverged at the unstaged field's
+                    # own not-blank gate every time.
+                    stub_writers = _stub_writers(prov, name)
+                    if stub_writers:
+                        _stage_stub(stub_fields, stub_writers[0], name,
+                                    value)
+                    if str(name).upper() in essential:
+                        producer = detail[0]
+                        produced.setdefault(producer, {})[
+                            str(name).upper()] = value
             if failed is not None:
                 break
             for producer, required in produced.items():
@@ -868,18 +994,22 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
                     # The producer would not write it from any swept
                     # input; a stub that writes the field directly is the
                     # remaining legal source.
-                    staged = False
                     for name, value in required.items():
                         stub_writers = _stub_writers(prov, name)
                         if stub_writers:
                             _stage_stub(stub_fields, stub_writers[0], name,
                                         value)
-                            staged = True
-                    if not staged:
-                        has_writer = any(_writers(prov, name)
-                                         for name in required)
-                        failed = "producer-unsolvable" if has_writer                             else "no-producer"
-                        break
+                        else:
+                            # Last resort: pin at entry and let the replay
+                            # judge. The classification said a paragraph
+                            # overwrites it, but on the route that matters
+                            # the read may come first - and the exact
+                            # value the producer refused to write is often
+                            # over-specific anyway (a 'non-blank message'
+                            # obligation surfaces here as one arbitrary
+                            # byte string). A wrong pin costs one replay;
+                            # a refusal costs the direction.
+                            entry_pins.setdefault(str(name).upper(), value)
                     continue
                 next_frontier.extend(answer.items())
             frontier = next_frontier
@@ -890,20 +1020,108 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
                         "stubs": _materialise(stub_fields), "bases": bases})
     if not recipes:
         return {"refusal": refusal or "producer-unsolvable"}
-    return {"recipes": recipes}
+    return {"recipes": recipes, "local_fired": local_fired}
 
 
 # ---------------------------------------------------------------------------
 # The driver: solve every goal, validate from entry, account for everything
 # ---------------------------------------------------------------------------
+def _project(index, state_view, paragraph, para_vars_cache) -> dict:
+    """The replay's state, projected onto one paragraph's variables.
 
-def run_chain(program, goals=None, budget=8000, baseline=None) -> dict:
-    """Chain every goal (default: every unwitnessed direction).
+    ``state_view`` is a live interpreter FieldMap; only the variables the
+    paragraph's own guards and live-in set name are read, so a fact stays
+    a paragraph-sized statement rather than a core dump.
+    """
+    names = para_vars_cache.get(paragraph)
+    if names is None:
+        members = index.closure(paragraph)
+        names = set()
+        for member in members:
+            names |= index.live_in(member)
+        try:
+            from .ladder import analyse            # noqa: F401  (no re-run)
+        except Exception:                          # noqa: BLE001
+            pass
+        names = sorted(name for name in names
+                       if index.model.knows(str(name).split(" OF ")[0]))
+        names = names[:MAX_FACT_VARS]
+        para_vars_cache[paragraph] = names
+    out = {}
+    for name in names:
+        try:
+            value = state_view.get(str(name).split(" OF ")[0])
+        except Exception:                          # noqa: BLE001
+            continue
+        if value is not None:
+            out[name] = value
+    return out
 
-    Returns the report; ``report["ledger"]`` is the fresh ledger holding
-    every credited witness. Crediting is generous - a run is a witness for
-    every direction its trace took - and deduplicated by full recipe, the
-    same contract the battery's run() enforces.
+
+def _flip(key):
+    return (key[0], key[1], key[2], not key[3])
+
+
+def _first_divergence(trace, local_fired) -> tuple:
+    """The first guard the replay took the other way from the local
+    witness: ``(subgoal_key, observed_values)`` or ``(None, None)``.
+
+    The local witness fired the goal after its closure took a specific
+    set of directions; the from-entry run diverged where it took a
+    direction whose *flip* the local run took and whose own key the
+    local run never did. The flip is exactly the direction the route
+    needs - a concrete, smaller goal - and the guard's observed operand
+    values say what the state held at the moment it went wrong.
+    """
+    for guard in trace.guards:
+        key = _direction_key(guard)
+        if _flip(key) in local_fired and key not in local_fired:
+            return _flip(key), dict(guard.values or {})
+    return None, None
+
+
+def _load_facts(path):
+    import json as _json
+    import os as _os
+    if not path or not _os.path.exists(path):
+        return {}
+    try:
+        raw = _json.load(open(path))
+        return {para: [dict(fact) for fact in facts_list]
+                for para, facts_list in raw.items()}
+    except Exception:                              # noqa: BLE001
+        return {}
+
+
+def _save_facts(path, facts):
+    import json as _json
+    if not path:
+        return
+    try:
+        with open(path, "w") as handle:
+            _json.dump(facts, handle, indent=1, default=str)
+    except Exception:                              # noqa: BLE001
+        pass
+
+
+def run_chain(program, goals=None, budget=8000, baseline=None,
+              epochs=3, facts_path=None) -> dict:
+    """Chain every goal, in epochs that learn from their own replays.
+
+    One epoch solves every pending goal (default: every direction the
+    baseline lacks). Each from-entry replay - success or failure -
+    donates facts: the replay's state projected onto the paragraphs it
+    entered, keyed per paragraph, consulted by the next epoch's local
+    sweeps before anything is invented. A composed recipe whose replay
+    diverges contributes its first divergent guard as a *subgoal* for
+    the next epoch - the route's actual gap, with the operand values the
+    replay observed. The loop stops early when an epoch adds no witness,
+    no fact and no subgoal.
+
+    Crediting is generous - a run is a witness for every direction its
+    trace took - deduplicated by full recipe, and only ever through a
+    fresh from-entry interpreter; nothing enters the ledger on a solver's
+    say-so. ``report["ledger"]`` holds every credited witness.
     """
     from .ladder import analyse
     index = _Index(program)
@@ -912,6 +1130,25 @@ def run_chain(program, goals=None, budget=8000, baseline=None) -> dict:
     ledger = Ledger()
     seen_runs: set = set()
     the_budget = _Budget(budget)
+    facts = _load_facts(facts_path)
+    facts_seen = {para: {repr(sorted(fact.items())) for fact in facts_list}
+                  for para, facts_list in facts.items()}
+    para_vars_cache: dict = {}
+    fact_watch: set = set()        # paragraphs whose facts are worth keeping
+    new_fact_count = [0]
+
+    def donate(fact_paragraphs, interp):
+        for paragraph in fact_paragraphs:
+            fact = _project(index, interp.state, paragraph, para_vars_cache)
+            if not fact:
+                continue
+            mark = repr(sorted(fact.items()))
+            seen = facts_seen.setdefault(paragraph, set())
+            if mark in seen:
+                continue
+            seen.add(mark)
+            facts.setdefault(paragraph, []).append(fact)
+            new_fact_count[0] += 1
 
     def run(state, world, stub_plan, terminals, source):
         key = (_freeze(state or {}), world, _freeze(stub_plan or {}),
@@ -925,9 +1162,10 @@ def run_chain(program, goals=None, budget=8000, baseline=None) -> dict:
                                  terminals=terminals,
                                  defaults=io_defaults(program, world))
             trace = interp.run(entry)
-        except Exception:                                    # noqa: BLE001
+        except Exception:                          # noqa: BLE001
             return None
         ledger.credit(trace, state or {}, world, stub_plan, terminals, source)
+        donate(set(trace.entered) & fact_watch, interp)
         return trace
 
     have = set(baseline or ())
@@ -939,14 +1177,14 @@ def run_chain(program, goals=None, budget=8000, baseline=None) -> dict:
                        direction)
                 if key not in have:
                     goals.append(key)
+    original = list(goals)
 
     try:
         from .reentry import reentry_states
         pool = _pool_from_literals(index, prov)
         # One base per distinct shape (the name encodes the AID key and
         # fill mode); the first carries the attention key the program
-        # compares against first, which for the mission shape is the one
-        # that routes to the deep processing paragraphs.
+        # compares against first.
         reentry_bases, seen_names = [], set()
         for name, state in reentry_states(program, pool):
             mark = name.split(":filled")[0].split(":drawn")[0]
@@ -956,52 +1194,109 @@ def run_chain(program, goals=None, budget=8000, baseline=None) -> dict:
             reentry_bases.append((name, state))
             if len(reentry_bases) >= 4:
                 break
-    except Exception:                                        # noqa: BLE001
+    except Exception:                              # noqa: BLE001
         reentry_bases = []
 
     memo: dict = {}
-    sweep_cache: dict = {}
-    refusals: dict = {}
-    outcomes = {"witnessed": 0}
-    for goal in goals:
-        if the_budget.left() <= 0:
-            refusals["budget-exhausted"] = refusals.get(
-                "budget-exhausted", 0) + 1
-            continue
-        if goal in ledger.witnesses:
-            outcomes["witnessed"] += 1     # an earlier goal's run took it
-            continue
-        answer = solve(index, prov, goal, the_budget, memo, reentry_bases,
-                       sweep_cache)
-        if "refusal" in answer:
-            refusals[answer["refusal"]] = refusals.get(
-                answer["refusal"], 0) + 1
-            continue
-        landed = False
-        any_stubs = False
-        for recipe in answer["recipes"]:
-            any_stubs = any_stubs or bool(recipe["stubs"])
-            for base_state, world in recipe["bases"]:
-                state = dict(base_state)
-                state.update(recipe["pins"])
-                run(state, world, recipe["stubs"] or None, None,
-                    "chain:%s:%s:%s" % (goal[0], goal[1], goal[3]))
-                if goal in ledger.witnesses:
-                    landed = True
+    last_outcome: dict = {}
+    pending = list(original)
+    fact_watch.update(goal[0] for goal in pending)
+    per_epoch = []
+    for epoch in range(max(1, epochs)):
+        sweep_cache: dict = {}    # facts changed; sweeps must re-run
+        epoch_subgoals: list = []
+        witnessed_before = sum(1 for g in original if g in ledger.witnesses)
+        credited_before = len(ledger.witnesses)
+        facts_before = new_fact_count[0]
+        runs_before = the_budget.spent
+        for goal in pending:
+            if the_budget.left() <= 0:
+                last_outcome.setdefault(goal, "budget-exhausted")
+                continue
+            if goal in ledger.witnesses:
+                last_outcome[goal] = "witnessed"
+                continue
+            answer = solve(index, prov, goal, the_budget, memo,
+                           reentry_bases, sweep_cache,
+                           facts=facts.get(goal[0], ()))
+            if "refusal" in answer:
+                last_outcome[goal] = answer["refusal"]
+                continue
+            landed = False
+            any_stubs = False
+            diverged_trace = None
+            for recipe in answer["recipes"]:
+                any_stubs = any_stubs or bool(recipe["stubs"])
+                for base_state, world in recipe["bases"]:
+                    state = dict(base_state)
+                    state.update(recipe["pins"])
+                    trace = run(state, world, recipe["stubs"] or None, None,
+                                "chain:%s:%s:%s" % (goal[0], goal[1],
+                                                    goal[3]))
+                    if trace is not None:
+                        diverged_trace = trace
+                    if goal in ledger.witnesses:
+                        landed = True
+                        break
+                if landed:
                     break
             if landed:
-                break
-        if landed:
-            outcomes["witnessed"] += 1
-        elif any_stubs:
-            refusals["stub-terminal-unsolved"] = refusals.get(
-                "stub-terminal-unsolved", 0) + 1
-        else:
-            refusals["validation-diverged"] = refusals.get(
-                "validation-diverged", 0) + 1
+                last_outcome[goal] = "witnessed"
+                continue
+            last_outcome[goal] = "stub-terminal-unsolved" if any_stubs \
+                else "validation-diverged"
+            if diverged_trace is not None:
+                subgoal, observed = _first_divergence(
+                    diverged_trace, answer.get("local_fired", set()))
+                if subgoal is not None \
+                        and subgoal not in ledger.witnesses \
+                        and subgoal not in pending \
+                        and subgoal not in epoch_subgoals:
+                    epoch_subgoals.append(subgoal)
+                    fact_watch.add(subgoal[0])
+                    if observed:
+                        donatable = {name: value for name, value
+                                     in observed.items()
+                                     if index.model.knows(
+                                         str(name).split(" OF ")[0])}
+                        if donatable:
+                            mark = repr(sorted(donatable.items()))
+                            seen = facts_seen.setdefault(subgoal[0], set())
+                            if mark not in seen:
+                                seen.add(mark)
+                                facts.setdefault(subgoal[0], []).append(
+                                    donatable)
+                                new_fact_count[0] += 1
+        witnessed_after = sum(1 for g in original if g in ledger.witnesses)
+        per_epoch.append({
+            "epoch": epoch + 1,
+            "witnessed_original": witnessed_after,
+            "witnessed_delta": witnessed_after - witnessed_before,
+            "credited_delta": len(ledger.witnesses) - credited_before,
+            "new_facts": new_fact_count[0] - facts_before,
+            "new_subgoals": len(epoch_subgoals),
+            "runs": the_budget.spent - runs_before,
+        })
+        still = [g for g in pending if g not in ledger.witnesses]
+        pending = still + epoch_subgoals
+        if per_epoch[-1]["witnessed_delta"] == 0 \
+                and per_epoch[-1]["new_facts"] == 0 \
+                and not epoch_subgoals:
+            break
+        if the_budget.left() <= 0:
+            break
+    _save_facts(facts_path, facts)
 
-    report = {"goals": len(goals), "witnessed": outcomes["witnessed"],
+    refusals: dict = {}
+    for goal in original:
+        outcome = last_outcome.get(goal, "budget-exhausted")
+        if outcome == "witnessed" or goal in ledger.witnesses:
+            continue
+        refusals[outcome] = refusals.get(outcome, 0) + 1
+    witnessed = sum(1 for g in original if g in ledger.witnesses)
+    report = {"goals": len(original), "witnessed": witnessed,
               "credited_directions": len(ledger.witnesses),
               "runs": the_budget.spent, "budget": budget,
+              "epochs": per_epoch,
               "refusals": refusals, "ledger": ledger}
     return report

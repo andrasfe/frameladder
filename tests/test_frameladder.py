@@ -5277,7 +5277,7 @@ class TestChain(unittest.TestCase):
             self.assertTrue(candidates, "direction %s" % direction)
             # and some minimal assignment names only the deciding variable
             self.assertTrue(any(set(found) <= {"WS-IN"}
-                                for found, _st, _full in candidates))
+                                for found, _st, _full, _fired in candidates))
 
     def test_producer_walk_derives_through_one_hop(self):
         """2000-DECIDE tests a flag only 1000-PRODUCE writes: the chain
