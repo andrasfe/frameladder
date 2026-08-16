@@ -183,7 +183,46 @@ def _guard_evidence(index, members) -> dict:
     """
     values: dict = {}
     slices: dict = {}
+    full_88: dict = {}
     names = frozenset(index.model.condition_names or ())
+
+    def formatted(name, raw):
+        """One 88 VALUE as the byte image the parent field holds.
+
+        A range-form clause (`VALUES 1 THRU 12`) arrives expanded but
+        unpadded: the month 1 is the bytes '01' in a PIC 9(2), and the
+        unpadded '1' moved into an X-typed twin fails the very NUMERIC
+        test the value was meant to pass.
+        """
+        value = _literal(raw)
+        if value is None:
+            return None
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = str(value)
+        if isinstance(value, str) and value.isdigit():
+            width = index.width(str(name).upper())
+            if width and len(value) < width:
+                value = value.zfill(width)
+        return value
+
+    def note_88(parent, raw_values):
+        """Representative values of one condition-name, capped at three.
+
+        `VALUES 1 THRU 12` names twelve states; both endpoints and one
+        interior value cover the range's boundary and body without
+        flooding the candidate list. The full set is kept aside so the
+        complement is computed against everything the 88 names, not
+        against the sample - a "complement" inside the range satisfies
+        the condition it was meant to falsify.
+        """
+        cooked = [v for v in (formatted(parent, raw) for raw in raw_values)
+                  if v is not None]
+        if not cooked:
+            return
+        reps = cooked if len(cooked) <= 3 else             [cooked[0], cooked[len(cooked) // 2], cooked[-1]]
+        for value in reps:
+            note(parent, value)
+        full_88.setdefault(parent, set()).update(cooked)
 
     def note(name, value):
         name = str(name).upper()
@@ -222,8 +261,7 @@ def _guard_evidence(index, members) -> dict:
                     entry = (index.model.condition_names or {}).get(name)
                     if entry:
                         parent = str(entry[0]).upper()
-                        for raw in list(entry[1] or [])[:4]:
-                            note(parent, _literal(raw))
+                        note_88(parent, list(entry[1] or []))
                         continue
                     if not index.width(name):
                         continue
@@ -266,7 +304,8 @@ def _guard_evidence(index, members) -> dict:
     # field's only comparison are reachable at all.
     from .heuristics import complement_value
     for name in list(values):
-        extra = complement_value(name, index.model.pic_of(name), values[name])
+        avoid = list(values[name]) + sorted(full_88.get(name, ()))
+        extra = complement_value(name, index.model.pic_of(name), avoid)
         if extra is not None and extra not in values[name]:
             values[name].append(extra)
     # Class conditions constrain the *shape* of the value, not its
@@ -1079,6 +1118,37 @@ def _valid_screen(index, prov, pick=-1) -> dict:
     # the shape constraint lives on the destination. The destination's
     # evidence tail - its pass shape - speaks for the source.
     flows: dict = {}
+    slice_landings: dict = {}
+
+    def edge(src, dst):
+        src, dst = str(src).upper(), str(dst).upper()
+        bucket = flows.setdefault(src, [])
+        if dst not in bucket and dst != src:
+            bucket.append(dst)
+
+    def parts_of(name, cache={}):
+        """Leaf fields covering ``name``'s bytes, REDEFINES included.
+
+        A date group declared ``PIC X(8)`` has no children of its own;
+        its month lives under the ``-PARTS REDEFINES`` overlay, and both
+        sides count from the same first byte.
+        """
+        key = str(name).upper()
+        if key in cache:
+            return cache[key]
+        from .lift import _elementary
+        scratch: dict = {}
+        found = [p for p in _elementary(index.model, key, scratch)
+                 if p[0] != key]
+        for overlay, base in (index.model.redefines or {}).items():
+            if str(base).upper() == key:
+                found += [p for p in _elementary(index.model,
+                                                 str(overlay).upper(),
+                                                 scratch)
+                          if p[0] != str(overlay).upper()]
+        cache[key] = found
+        return found
+
     for dest, writers in (getattr(prov, "writers", None) or {}).items():
         for writer in writers:
             if writer.kind != "MOVE" or not getattr(writer, "source", None):
@@ -1087,9 +1157,114 @@ def _valid_screen(index, prov, pick=-1) -> dict:
                 source = parse_term(writer.source)
             except Exception:                                # noqa: BLE001
                 continue
-            if source.kind == "var" and not source.refmod:
-                flows.setdefault(str(source.name).upper().split(" OF ")[0],
-                                 []).append(str(dest).upper())
+            if source.kind != "var" or source.refmod:
+                continue
+            src = str(source.name).upper().split(" OF ")[0]
+            dst = str(dest).upper()
+            edge(src, dst)
+            # A group move relocates every leaf: the source leaf at byte
+            # (offset, width) lands on the destination leaf at the same
+            # (offset, width), and that positional identity - not any
+            # name - is what carries a screen month into the field the
+            # month check actually reads.
+            src_parts, dst_parts = parts_of(src), parts_of(dst)
+            if src_parts and dst_parts:
+                landing = {(off, size): part
+                           for part, off, size in dst_parts}
+                for part, off, size in src_parts:
+                    matched = landing.get((off, size))
+                    if matched:
+                        edge(part, matched)
+                    else:
+                        # The source part spans several destination
+                        # leaves - a four-byte year over a two-byte
+                        # century and a two-byte YY. No single edge can
+                        # carry it; the byte window is recorded and the
+                        # composer assembles the window from the leaves
+                        # that fall inside it.
+                        slice_landings.setdefault(
+                            str(part).upper(), (str(dst).upper(), off,
+                                                size))
+    # A REDEFINES twin holds the same bytes under another description;
+    # evidence on either side speaks for both.
+    for overlay, base in (index.model.redefines or {}).items():
+        edge(overlay, base)
+        edge(base, overlay)
+    twins: dict = {}
+    for overlay, base in (index.model.redefines or {}).items():
+        twins[str(overlay).upper()] = str(base).upper()
+        twins[str(base).upper()] = str(overlay).upper()
+
+    def evidence_of(name):
+        name = str(name).upper()
+        found = evidence.get(name)
+        if not found and name in twins:
+            found = evidence.get(twins[name])
+        return found or []
+
+    def composed_from_parts(head, depth=3):
+        """A whole-field value assembled from its parts' own evidence.
+
+        The century check sits on a two-byte slice of the four-byte year
+        (`WS-EDIT-DATE-CC-N REDEFINES` the head of CCYY), so no whole-
+        field evidence can ever exist - the pass shape must be composed:
+        each part's evidence tail at that part's offset, digits filling
+        whatever no check constrains. Walked along the same flow chain
+        as everything else.
+        """
+        frontier, seen = [str(head).upper()], set()
+        for _hop in range(depth):
+            fresh = []
+            for name in frontier:
+                if name in seen:
+                    continue
+                seen.add(name)
+                window = slice_landings.get(name)
+                if window is not None:
+                    dst, at, span = window
+                    inside = [(part, off - at, size)
+                              for part, off, size in parts_of(dst)
+                              if at <= off and off + size <= at + span]
+                    if any(evidence_of(part) for part, _o, _s in inside):
+                        buffer = ["9"] * span
+                        for part, off, size in inside:
+                            tail = None
+                            for value in reversed(evidence_of(part)):
+                                text = str(value)
+                                if text.isdigit():
+                                    tail = text.zfill(size)[-size:]
+                                    break
+                            if tail:
+                                for position in range(size):
+                                    if 0 <= off + position < span:
+                                        buffer[off + position] = \
+                                            tail[position]
+                        return "".join(buffer)
+                parts = parts_of(name)
+                witnessed = [(part, off, size) for part, off, size in parts
+                             if evidence_of(part)]
+                if witnessed:
+                    width = index.width(name) or max(
+                        off + size for _p, off, size in parts)
+                    buffer = ["9"] * width
+                    for part, off, size in parts:
+                        tail = None
+                        for value in reversed(evidence_of(part)):
+                            text = str(value)
+                            if text.isdigit():
+                                tail = text.zfill(size)[-size:]
+                                break
+                        if tail:
+                            for position in range(size):
+                                if 0 <= off + position < width:
+                                    buffer[off + position] = tail[position]
+                    return "".join(buffer)
+                fresh.extend(flows.get(name, ())[:4])
+                if name in twins:
+                    fresh.append(twins[name])
+            frontier = fresh
+        return None
+
     def chased(head, depth=3):
         """Evidence along the MOVE chain, nearest hop first."""
         out, frontier, seen = [], [head], {head}
@@ -1134,12 +1309,19 @@ def _valid_screen(index, prov, pick=-1) -> dict:
                 merged = hop
                 break
         position = pick if -len(merged) <= pick < len(merged) else -1
+        chosen = merged[position]
         # (A width/int-evidence reshaping of the chosen value was built
         # and measured here: +0 on the program it targeted and -2 on a
         # neighbour whose working screen it disturbed. Reverted; the
-        # shapes stay exactly what the evidence chase produced.)
-        out.setdefault(writers[0].op_key, {}).setdefault(
-            head, merged[position])
+        # shapes stay exactly what the evidence chase produced - except
+        # where no whole-field evidence CAN exist because the checks sit
+        # on byte slices, where the parts compose.)
+        if isinstance(chosen, str) \
+                and not any(ch.isdigit() for ch in chosen):
+            assembled = composed_from_parts(head)
+            if assembled is not None:
+                chosen = assembled
+        out.setdefault(writers[0].op_key, {}).setdefault(head, chosen)
         union[head] = [value for hop in hops for value in hop]
     _valid_screen.__evidence__ = union
     return out
