@@ -2280,9 +2280,10 @@ def cmd_chain(args):
                   direction.strip().lower() in ("true", "1", "t"))]
 
     facts_path = (args.out + ".facts.json") if args.out else None
+    pools_path = (args.out + ".pools.json") if args.out else None
     report = run_chain(program, goals=goals, budget=args.budget,
                        baseline=baseline, epochs=args.epochs,
-                       facts_path=facts_path)
+                       facts_path=facts_path, pools_path=pools_path)
     ledger = report.pop("ledger")
     report["program"] = program.name
     if args.out:
@@ -2296,9 +2297,10 @@ def cmd_chain(args):
                  report["credited_directions"], report["runs"]))
         for row in report.get("epochs", []):
             print("  epoch %d: +%d witnessed (%d total), +%d credited, "
-                  "%d facts, %d subgoals, %d runs"
+                  "paragraphs %d (+%d), %d facts, %d subgoals, %d runs"
                   % (row["epoch"], row["witnessed_delta"],
                      row["witnessed_original"], row["credited_delta"],
+                     row["paragraphs_entered"], row["paragraphs_delta"],
                      row["new_facts"], row["new_subgoals"], row["runs"]))
         for reason, count in sorted(report["refusals"].items(),
                                     key=lambda kv: -kv[1]):
