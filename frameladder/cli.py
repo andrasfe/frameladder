@@ -2105,6 +2105,61 @@ def cmd_witnesses(args):
         stub_report["reproduction"] = _stub_reproduction(program, entry,
                                                          ledger, io_defaults)
 
+    # 4. Minimize: a post-pass, not a coverage phase - it credits nothing
+    #    new, it only shrinks what phases 1-3.5 already credited down to the
+    #    keys each recipe's directions actually need. Recipes are shared
+    #    across directions (the same first-recipe-wins choice `credit` makes),
+    #    so each distinct recipe object is minimized once and the result
+    #    fanned back out to every direction it owns. Every credited direction
+    #    is then re-verified from the minimized payload through a fresh
+    #    interpreter, independent of `minimize`'s own bookkeeping; a group
+    #    that fails re-verification keeps its original recipe and is counted,
+    #    never silently dropped from the ledger.
+    minimize_report = None
+    if args.minimize:
+        from .minimize import minimize as _minimize, taken_directions
+        groups: dict = {}
+        for key, recipe in ledger.witnesses.items():
+            groups.setdefault(id(recipe), (recipe, set()))[1].add(key)
+        stats = {"runs": 0}
+        pins_before = pins_after = reverify_failures = recipes_done = 0
+        for recipe, owns in groups.values():
+            if stats["runs"] >= args.minimize:
+                break
+            before = (len(recipe.input_state) + len(recipe.stubs)
+                      + len(recipe.terminals))
+            shrunk = _minimize(program, entry, recipe, owns,
+                               lambda w: io_defaults(program, w),
+                               budget=args.minimize, stats=stats)
+            payload = shrunk.payload()
+            stats["runs"] += 1
+            try:
+                interp = Interpreter(program, dict(payload["input_state"]),
+                                     stubs=payload["stubs"],
+                                     terminals=payload["terminals"],
+                                     defaults=io_defaults(program,
+                                                          payload["world"]))
+                taken = taken_directions(interp.run(entry))
+            except Exception:                                # noqa: BLE001
+                taken = set()
+            recipes_done += 1
+            pins_before += before
+            if owns <= taken:
+                for key in owns:
+                    ledger.witnesses[key] = shrunk
+                pins_after += (len(shrunk.input_state) + len(shrunk.stubs)
+                              + len(shrunk.terminals))
+            else:
+                reverify_failures += 1
+                pins_after += before
+        minimize_report = {
+            "recipes": recipes_done, "pins_before": pins_before,
+            "pins_after": pins_after,
+            "dropped_pct": round(100.0 * (pins_before - pins_after)
+                                 / max(1, pins_before), 1),
+            "reverify_failures": reverify_failures,
+            "runs_spent": stats["runs"]}
+
     gaps = missing(program, ledger)
     payload = {"program": program.name, "entry": entry,
                "directions_total": total,
@@ -2113,6 +2168,7 @@ def cmd_witnesses(args):
                "runs": ledger.runs, "runs_deduplicated": len(seen_runs),
                "lift": lift_report,
                "stub_search": stub_report,
+               "minimize": minimize_report,
                "missing": [{"paragraph": b.paragraph, "ordinal": b.ordinal,
                             "kind": b.kind, "direction": d,
                             "condition": b.condition, "line": b.line}
@@ -2140,6 +2196,13 @@ def cmd_witnesses(args):
                   % (p["lift"]["runs"], rep["recipes"],
                      rep["directions_reproduced"],
                      rep["directions_attempted"], rep["rate_pct"]))
+        if p.get("minimize"):
+            mz = p["minimize"]
+            print("   minimize: %d recipes, %d->%d pins (%.1f%% dropped), "
+                  "%d reverify failures, %d runs"
+                  % (mz["recipes"], mz["pins_before"], mz["pins_after"],
+                     mz["dropped_pct"], mz["reverify_failures"],
+                     mz["runs_spent"]))
         if p["missing"]:
             print("   first missing:")
             for row in p["missing"][:10]:
@@ -2427,6 +2490,11 @@ def build_parser():
                          "0 disables")
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
+    wt.add_argument("--minimize", type=int, default=None, metavar="N",
+                    help="shrink each witnessed recipe to its essential "
+                         "support after the battery, up to N interpreter "
+                         "runs total; a post-pass, credits no new coverage; "
+                         "absent disables it entirely")
     wt.set_defaults(func=cmd_witnesses)
 
     dr = sub.add_parser("directions", help="how a harness's work list lands "
