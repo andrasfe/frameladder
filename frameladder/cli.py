@@ -2189,6 +2189,52 @@ def _stub_reproduction(program, entry: str, ledger, io_defaults) -> dict:
     return report
 
 
+def cmd_chain(args):
+    """Goal-directed backward chaining: one missing direction at a time.
+
+    Standalone by design - no battery phase, no shared state with
+    `witnesses`. The work list is every direction absent from
+    ``--baseline`` (a witnesses JSONL), or every direction when no
+    baseline is given, or the single ``--goal``.
+    """
+    import json as _json
+    program = _program(args)
+    from .chain import run_chain
+
+    baseline = set()
+    if args.baseline:
+        for line in open(args.baseline):
+            if not line.strip():
+                continue
+            row = _json.loads(line)
+            baseline.add((row["paragraph"], row["ordinal"], row["kind"],
+                          row["direction"]))
+
+    goals = None
+    if args.goal:
+        para, ordinal, kind, direction = args.goal.rsplit(":", 3)
+        goals = [(para.upper(), int(ordinal), kind.upper(),
+                  direction.strip().lower() in ("true", "1", "t"))]
+
+    report = run_chain(program, goals=goals, budget=args.budget,
+                       baseline=baseline)
+    ledger = report.pop("ledger")
+    report["program"] = program.name
+    if args.out:
+        ledger.write(args.out, program.name)
+        report["written"] = args.out
+    if args.json:
+        print(_json.dumps(report, indent=1, default=str))
+    else:
+        print("%s: %d goals, %d witnessed, %d directions credited, %d runs"
+              % (program.name, report["goals"], report["witnessed"],
+                 report["credited_directions"], report["runs"]))
+        for reason, count in sorted(report["refusals"].items(),
+                                    key=lambda kv: -kv[1]):
+            print("  refused %-24s %d" % (reason, count))
+    return 0
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -2428,6 +2474,20 @@ def build_parser():
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
     wt.set_defaults(func=cmd_witnesses)
+
+    ch = sub.add_parser("chain", help="goal-directed backward chaining: "
+                                      "solve one missing direction at a time "
+                                      "with concrete local witnesses")
+    ch.add_argument("--baseline", metavar="JSONL",
+                    help="witnesses JSONL whose directions are already "
+                         "covered; the work list is what it lacks")
+    ch.add_argument("--goal", metavar="PARA:ORD:KIND:DIR",
+                    help="one direction, e.g. 1200-EDIT:4:IF:True")
+    ch.add_argument("--budget", type=int, default=8000, metavar="N",
+                    help="total interpreter runs, micro and full together")
+    ch.add_argument("--out", metavar="FILE",
+                    help="write credited witnesses as JSONL")
+    ch.set_defaults(func=cmd_chain)
 
     dr = sub.add_parser("directions", help="how a harness's work list lands "
                                            "on this program's decisions")

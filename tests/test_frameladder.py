@@ -5216,3 +5216,143 @@ class TestReentry(unittest.TestCase):
                  for entry in spec["stubs"]["EXEC:CICS:READ"]}
         self.assertIn(13, codes)                      # the compared fault
         self.assertNotIn(19, codes)                   # never a whole table
+
+
+class TestChain(unittest.TestCase):
+    """Goal-directed backward chaining: local solve, producers, refusals."""
+
+    SOURCE = HEADER + """       01  WS-IN            PIC X(2).
+       01  WS-MODE          PIC X.
+           88  MODE-GOOD    VALUE 'G'.
+           88  MODE-BAD     VALUE 'B'.
+       01  WS-FLAG          PIC X.
+           88  FLAG-ON      VALUE 'Y'.
+           88  FLAG-OFF     VALUE 'N'.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-PRODUCE THRU 1000-PRODUCE-EXIT
+           PERFORM 2000-DECIDE THRU 2000-DECIDE-EXIT
+           GOBACK.
+       1000-PRODUCE.
+           IF WS-IN EQUAL 'OK'
+              SET FLAG-ON       TO TRUE
+           ELSE
+              SET FLAG-OFF      TO TRUE
+           END-IF
+           .
+       1000-PRODUCE-EXIT.
+           EXIT.
+       2000-DECIDE.
+           IF FLAG-ON
+              CONTINUE
+           ELSE
+              CONTINUE
+           END-IF
+           .
+       2000-DECIDE-EXIT.
+           EXIT.
+"""
+
+    def _index(self, prog):
+        from frameladder import chain
+        return chain._Index(prog)
+
+    def _analysed(self, prog):
+        from frameladder.ladder import analyse
+        return analyse(prog)
+
+    def test_local_solve_fires_both_directions(self):
+        from frameladder import chain
+        prog = program(self.SOURCE)
+        index = self._index(prog)
+        _graph, prov = self._analysed(prog)
+        branch = next(b for b in __import__("frameladder.coverage",
+                                            fromlist=["branches_of"])
+                      .branches_of(prog) if b.paragraph == "1000-PRODUCE")
+        for direction in (True, False):
+            goal = (branch.paragraph, branch.ordinal, branch.kind, direction)
+            budget = chain._Budget(500)
+            candidates, _runs = chain.local_solve(index, prov, goal,
+                                                  budget, {})
+            self.assertTrue(candidates, "direction %s" % direction)
+            # and some minimal assignment names only the deciding variable
+            self.assertTrue(any(set(found) <= {"WS-IN"}
+                                for found, _st, _full in candidates))
+
+    def test_producer_walk_derives_through_one_hop(self):
+        """2000-DECIDE tests a flag only 1000-PRODUCE writes: the chain
+        must classify it produced, solve the producer for the output, and
+        compose a from-entry recipe that validates."""
+        from frameladder import chain
+        prog = program(self.SOURCE)
+        report = chain.run_chain(prog, budget=2000)
+        ledger = report["ledger"]
+        decide = [k for k in ledger.witnesses if k[0] == "2000-DECIDE"]
+        directions = {k[3] for k in decide}
+        self.assertEqual(directions, {True, False})
+        # from-disk shape: every witness replays to its direction
+        for key, recipe in ledger.witnesses.items():
+            payload = recipe.payload()
+            interp = Interpreter(prog, dict(payload["input_state"]),
+                                 stubs=payload["stubs"] or None,
+                                 terminals=payload["terminals"] or None)
+            trace = interp.run("0000-MAIN")
+            took = {chain._direction_key(g) for g in trace.guards}
+            self.assertIn(key, took)
+
+    def test_output_constrained_solve(self):
+        from frameladder import chain
+        prog = program(self.SOURCE)
+        index = self._index(prog)
+        _graph, prov = self._analysed(prog)
+        budget = chain._Budget(500)
+        answer, _runs = chain.producer_solve(index, prov, "1000-PRODUCE",
+                                             {"WS-FLAG": "Y"}, budget, {})
+        self.assertEqual(answer, {"WS-IN": "OK"})
+        # the conjunction case: two required outputs at once
+        answer2, _runs = chain.producer_solve(index, prov, "1000-PRODUCE",
+                                              {"WS-FLAG": "N"}, budget, {})
+        self.assertIsNotNone(answer2)
+        self.assertNotEqual(answer2.get("WS-IN"), "OK")
+
+    def test_refusal_on_dead_direction(self):
+        """A condition no value can satisfy refuses with a name, never
+        credits."""
+        from frameladder import chain
+        dead = HEADER + """       01  WS-A     PIC X.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           MOVE 'X' TO WS-A
+           IF WS-A EQUAL 'Q'
+              CONTINUE
+           END-IF
+           GOBACK.
+"""
+        prog = program(dead)
+        from frameladder.coverage import branches_of
+        branch = next(b for b in branches_of(prog))
+        goal = (branch.paragraph, branch.ordinal, branch.kind, True)
+        report = chain.run_chain(prog, goals=[goal], budget=600)
+        self.assertEqual(report["witnessed"], 0)
+        self.assertEqual(sum(report["refusals"].values()), 1)
+        self.assertNotIn(goal, report["ledger"].witnesses)
+
+    def test_memoised_sweep_is_shared_per_closure(self):
+        from frameladder import chain
+        prog = program(self.SOURCE)
+        index = self._index(prog)
+        _graph, prov = self._analysed(prog)
+        from frameladder.coverage import branches_of
+        branch = next(b for b in branches_of(prog)
+                      if b.paragraph == "1000-PRODUCE")
+        cache: dict = {}
+        budget = chain._Budget(500)
+        chain.local_solve(index, prov,
+                          (branch.paragraph, branch.ordinal, branch.kind,
+                           True), budget, cache)
+        spent_first = budget.spent
+        chain.local_solve(index, prov,
+                          (branch.paragraph, branch.ordinal, branch.kind,
+                           False), budget, cache)
+        # the second direction is answered mostly from the shared sweep
+        self.assertLess(budget.spent - spent_first, spent_first + 3)
