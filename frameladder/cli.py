@@ -2189,6 +2189,49 @@ def _stub_reproduction(program, entry: str, ledger, io_defaults) -> dict:
     return report
 
 
+def cmd_callers(args):
+    """Infeasibility certificates for commarea-gated missing directions.
+
+    Answers a narrower question than `witnesses`: not "does a recipe exist"
+    but "could any real caller in the corpus have produced the value this
+    direction needs". A direction nothing can produce is `caller-unreachable`
+    - an honest reduction of the denominator - rather than a residual to keep
+    searching.
+    """
+    from .callgraph import certify
+    payload = certify(args.program, args.copybooks, args.corpus, args.baseline)
+
+    def render(p):
+        callers_in = len({e["caller"] for e in p["edges_in"]})
+        print("%s   %d inbound edge(s) from %d distinct caller(s)   "
+              "%d/%d corpus programs, %d edges total"
+              % (p["program"], len(p["edges_in"]), callers_in,
+                 len(p["edges_in"]), p["corpus_programs"], p["corpus_edges_total"]))
+        for e in p["edges_in"]:
+            print("   %-10s -> %-10s  line %-6d %-5s via %s%s"
+                  % (e["caller"], e["callee"], e["line"], e["verb"], e["how"],
+                     ("  commarea=" + e["commarea"]) if e["commarea"] else ""))
+        by_verdict: dict = {}
+        for d in p["directions"]:
+            by_verdict.setdefault(d["verdict"], []).append(d)
+        print("\n%d direction(s) examined" % len(p["directions"]))
+        for verdict, rows in sorted(by_verdict.items()):
+            print("   %-22s %d" % (verdict, len(rows)))
+        for d in by_verdict.get("caller-unreachable", []):
+            print("\n   CERTIFIED UNREACHABLE  %s ordinal %s %s direction=%s"
+                  % (d["paragraph"], d["ordinal"], d["kind"], d["direction"]))
+            print("      condition: %s" % d["condition"])
+            print("      field %s requires %r" % (d["field"], d["required_value"]))
+            print("      predecessors checked: %s"
+                  % (", ".join(d["predecessors_checked"]) or "(none)"))
+            for pname, vals in d["writers_found"].items():
+                print("         %-12s writes: %s" % (pname, vals or "(nothing resolvable)"))
+            if d.get("value_producers_in_corpus"):
+                print("      produced elsewhere in the corpus by: %s"
+                      % ", ".join(d["value_producers_in_corpus"]))
+    return _emit(payload, args.json, render)
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -2468,6 +2511,18 @@ def build_parser():
                     help="seed for the overlay draws, so a candidate's input "
                          "state is the same on every run")
     ex.set_defaults(func=cmd_export, precheck=True, worlds=True)
+
+    ca = sub.add_parser("callers", help="infeasibility certificates for "
+                        "commarea-gated missing directions: can any real "
+                        "caller in the corpus produce the value they need?")
+    ca.add_argument("--corpus", required=True, metavar="DIR",
+                    help="directory of .cbl files forming the caller corpus "
+                         "(the program itself may or may not be inside it)")
+    ca.add_argument("--baseline", metavar="FILE",
+                    help="witnesses.jsonl of what is already covered; "
+                         "everything on this program's own decision list "
+                         "that is not in it counts as missing")
+    ca.set_defaults(func=cmd_callers)
 
     b = sub.add_parser("bind", help="record a decision the agent made")
     b.add_argument("--bind", action="append", required=True, metavar="VAR=VALUE")
