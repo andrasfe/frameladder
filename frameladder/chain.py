@@ -1780,7 +1780,8 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
     # mode progression takes. Per-goal solving then starts from whatever
     # this left uncovered.
     if cycle_bases:
-        best = (-1, None, None, None)     # depth, base, world, screen
+        best = (-1, None, None, None, None)  # depth, base, world, screen, trace
+        variant_arms = []
         for number, screen in enumerate(screen_variants):
             probe_stubs: dict = {}
             for world_map in (success_world, screen):
@@ -1794,26 +1795,239 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                             "chain:cycle-probe:%d" % number)
                 if trace is not None:
                     depth = len({_direction_key(g) for g in trace.guards})
+                    variant_arms.append(frozenset(
+                        (g.paragraph, g.ordinal) for g in trace.guards
+                        if g.kind == "WHEN" and g.result))
                     if depth > best[0]:
-                        best = (depth, dict(base_state), world, screen)
-        # The one-field-spoiled family, over the deepest valid route: arm
-        # k of a first-match verdict chain needs fields 1..k-1 valid and
-        # field k alone failed one specific way. Everything is reused -
-        # the base that routed, the screen that passed - and each variant
-        # is one run.
+                        best = (depth, dict(base_state), world, screen,
+                                trace)
+        # Windowed spoiling with background repair. Under a first-match
+        # verdict chain, a background screen unmasks exactly the arms
+        # above wherever it first fails - so the machinery below (1)
+        # learns empirically which arms each (field, spoil) pair owns,
+        # (2) repairs the background field by field, adopting only
+        # candidates that extinguish the failing field's own arms, and
+        # (3) re-runs the spoiled family over every background it
+        # passed through, so each repair round's window is harvested,
+        # not just the last. Every run credits through `run` as usual;
+        # a stall - no evidence value fixes the failing field - is the
+        # honest residual classification and is reported by name.
+        window_report = {"rounds": 0, "repairs": [], "stalled": None,
+                         "mode_arms": 0}
         if best[3] is not None:
-            _depth, base_state, world, screen = best
-            for op, field, kind, value in _spoil_family(index, screen):
-                spoiled = {o: dict(f) for o, f in screen.items()}
-                spoiled[op][field] = value
+            _depth, base_state, world, screen, best_trace = best
+
+            def probe_run(the_screen, tag):
                 probe_stubs = {}
-                for world_map in (success_world, spoiled):
+                for world_map in (success_world, the_screen):
                     for o, fields in (world_map or {}).items():
                         for f, v in fields.items():
                             probe_stubs.setdefault(o, {}).setdefault(f, v)
-                run(dict(base_state), world,
+                return run(dict(base_state), world,
+                           _materialise(probe_stubs) or None, None, tag)
+
+            def probe_observe(the_screen):
+                """The same run, uncredited: the crediting closure dedups
+                by recipe, and a repair trial often IS a recipe an earlier
+                variant already credited - observation must still see its
+                trace."""
+                probe_stubs = {}
+                for world_map in (success_world, the_screen):
+                    for o, fields in (world_map or {}).items():
+                        for f, v in fields.items():
+                            probe_stubs.setdefault(o, {}).setdefault(f, v)
+                the_budget.spend()
+                try:
+                    interp = Interpreter(
+                        program, dict(base_state),
+                        stubs=_materialise(probe_stubs) or None,
+                        defaults=io_defaults(program, world))
+                    return interp.run(entry)
+                except Exception:                            # noqa: BLE001
+                    return None
+
+            def when_arms(trace):
+                return frozenset((g.paragraph, g.ordinal)
+                                 for g in trace.guards
+                                 if g.kind == "WHEN" and g.result)
+
+            def spoil_sweep(the_screen, label, background=None):
+                """Run the family; return which arms each field owns.
+
+                Ownership is empirical: the arms a spoil of field F
+                raises over the background are F's own verdict arms -
+                the NOT-OK and BLANK pair the repair walk must treat as
+                one field's two faces, not as progress past each other.
+                """
+                base_arms = when_arms(background) if background \
+                    else frozenset()
+                owned: dict = {}
+                for op, field, kind, value in _spoil_family(index,
+                                                            the_screen):
+                    spoiled = {o: dict(f) for o, f in the_screen.items()}
+                    spoiled[op][field] = value
+                    probe_run(spoiled, "chain:spoil:%s:%s:%s"
+                              % (label, field, kind))
+                    watched = probe_observe(spoiled) if background \
+                        else None
+                    if watched is not None:
+                        owned.setdefault(field, set()).update(
+                            when_arms(watched) - base_arms)
+                return owned
+
+            # A mode arm tests the commarea state the task carries - it
+            # routes. A verdict arm tests anything else: the per-field
+            # flags the edits wrote this cycle. The split is structural
+            # (which variables the arm's own condition names), because
+            # every screen variant shares the same failing field and no
+            # intersection can separate them.
+            verdict_cache: dict = {}
+
+            def is_verdict(guard):
+                key = (guard.paragraph, guard.ordinal)
+                if key in verdict_cache:
+                    return verdict_cache[key]
+                answer = False
+                text = str(guard.condition or "").strip()
+                if text.upper() not in ("OTHER", "ANY", ""):
+                    try:
+                        groups = condition_atoms(
+                            text, names=frozenset(
+                                index.model.condition_names or ()))
+                    except Exception:                        # noqa: BLE001
+                        groups = []
+                    for group in groups:
+                        for atom in group:
+                            for side in (atom.lhs, atom.rhs):
+                                if getattr(side, "kind", "") != "var":
+                                    continue
+                                name = str(side.name).upper()
+                                entry = (index.model.condition_names
+                                         or {}).get(name)
+                                parent = str(entry[0]).upper() if entry \
+                                    else name
+                                if parent not in cycle_fields \
+                                        and parent.split(" OF ")[0] \
+                                        not in cycle_fields:
+                                    answer = True
+                verdict_cache[key] = answer
+                return answer
+
+            def verdict_arms(trace):
+                return frozenset((g.paragraph, g.ordinal)
+                                 for g in trace.guards
+                                 if g.kind == "WHEN" and g.result
+                                 and is_verdict(g))
+            # A verdict arm that fires under EVERY variant screen is
+            # structural to the conversation, not to the screen - the
+            # filter-blank arm belongs to task 1, which SENDs its empty
+            # map before any input exists, and no screen bytes can move
+            # it. Excluded from the repair worklist; the walk targets
+            # arms the screen demonstrably owns.
+            arm_sets = [arms for arms in variant_arms if arms]
+            structural = frozenset.intersection(*arm_sets) if arm_sets \
+                else frozenset()
+            window_report["mode_arms"] = len(structural)
+            union = getattr(_valid_screen, "__evidence__", {}) or {}
+            current = {o: dict(f) for o, f in screen.items()}
+            # The ranked loop already ran this exact recipe; its trace is
+            # the background reading (the dedup would return None).
+            trace = best_trace
+            owned = spoil_sweep(current, "w0", background=trace)
+            seen_states = set()
+            for round_number in range(16):
+                if trace is None or the_budget.left() <= 0:
+                    break
+                verdict = verdict_arms(trace) - structural
+                if not verdict:
+                    break                  # nothing left to repair
+                seen_states.add(when_arms(trace))
+                repaired = False
+                depth_before = len({_direction_key(g)
+                                    for g in trace.guards})
+                fields = [(o, f) for o, held in current.items()
+                          for f in held]
+                overall = []
+                for holder, field in fields:
+                    held = current[holder][field]
+                    # Every alternate is evaluated and the BEST adopted,
+                    # not the first that moves anything: for a Y/N field
+                    # the blank comes earlier in the evidence than the
+                    # 'Y', and first-accept trades the NOT-OK arm for
+                    # the BLANK arm of the same field - a lateral that
+                    # both credits (the blank arm is a direction too)
+                    # and blocks. A clean pass extinguishes without
+                    # raising a new verdict arm; it wins on sight.
+                    scored = []
+                    for candidate in [v for v in union.get(field, ())
+                                      if isinstance(v, str)
+                                      and v != held][:5]:
+                        if the_budget.left() <= 0:
+                            break
+                        trial = {o: dict(f) for o, f in current.items()}
+                        trial[holder][field] = candidate
+                        probe_run(trial, "chain:cycle-probe:rep%d"
+                                  % round_number)      # credit if novel
+                        attempt = probe_observe(trial)
+                        if attempt is None:
+                            continue
+                        arms = when_arms(attempt)
+                        gone = verdict - arms
+                        fresh = (verdict_arms(attempt) - structural) \
+                            - verdict
+                        lateral = fresh & owned.get(field, set())
+                        depth_now = len({_direction_key(g)
+                                         for g in attempt.guards})
+                        # Slack of a few directions: a true repair swaps
+                        # one arm's direction for the next arm's and can
+                        # come back a direction or two short, while a
+                        # diversion (a blanked search key) collapses the
+                        # run by dozens.
+                        if gone and arms not in seen_states \
+                                and depth_now >= depth_before - 5:
+                            rank = 0 if not fresh else (2 if lateral
+                                                        else 1)
+                            scored.append(((rank, -depth_now),
+                                           candidate, trial, attempt,
+                                           gone))
+                    # (candidates collected; adoption is global below)
+                    for row in scored:
+                        overall.append(row + (field, held))
+                if overall:
+                    # Global best across every field, not the first field
+                    # with anything: a lateral on an early field must not
+                    # outrank a clean pass on a later one.
+                    overall.sort(key=lambda row: row[0])
+                    (_rank, candidate, trial, attempt, gone, field,
+                     held) = overall[0]
+                    current, trace = trial, attempt
+                    window_report["rounds"] = round_number + 1
+                    window_report["repairs"].append(
+                        {"field": field, "from": repr(held)[:14],
+                         "to": repr(candidate)[:14],
+                         "extinguished": sorted(
+                             list(a) for a in gone)[:2]})
+                    owned = spoil_sweep(current,
+                                        "w%d" % (round_number + 1),
+                                        background=trace)
+                    repaired = True
+                if not repaired:
+                    window_report["stalled"] = {
+                        "arms": sorted(list(a) for a in verdict)[:3],
+                        "note": "no evidence value moves these"}
+                    break
+            # The final background across every cycle base: a different
+            # attention key can route the confirm cycle that the deepest
+            # window needs.
+            for extra_state, extra_world in cycle_bases:
+                probe_stubs = {}
+                for world_map in (success_world, current):
+                    for o, fields in (world_map or {}).items():
+                        for f, v in fields.items():
+                            probe_stubs.setdefault(o, {}).setdefault(f, v)
+                run(dict(extra_state), extra_world,
                     _materialise(probe_stubs) or None, None,
-                    "chain:spoil:%s:%s" % (field, kind))
+                    "chain:cycle-probe:final")
         per_epoch.append({
             "epoch": 0, "witnessed_original": sum(
                 1 for g in original if g in ledger.witnesses),
@@ -1946,5 +2160,6 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
               "credited_directions": len(ledger.witnesses),
               "runs": the_budget.spent, "budget": budget,
               "epochs": per_epoch, "width1": dict(WIDTH1),
+              "window": locals().get("window_report"),
               "refusals": refusals, "ledger": ledger}
     return report
