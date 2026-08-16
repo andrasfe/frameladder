@@ -228,6 +228,13 @@ def _guard_evidence(index, members) -> dict:
                     if not index.width(name):
                         continue
                     rhs = getattr(other, "value", None)
+                    if isinstance(rhs, str) and rhs.upper() in (
+                            "NUMERIC", "ALPHABETIC", "ALPHABETIC-UPPER",
+                            "ALPHABETIC-LOWER"):
+                        # A class condition mis-read as a comparison
+                        # against its own keyword; the class-shape pass
+                        # below owns this case.
+                        continue
                     if rhs is not None and not isinstance(rhs, bool):
                         note(name, rhs)
 
@@ -540,7 +547,7 @@ def _from_state(state, name):
     return None
 
 
-def _attempts_for(index, prov, members, facts=()) -> list:
+def _attempts_for(index, prov, members, facts=(), pools=None) -> list:
     """The sweep, cheapest shape first: the bare state, donated fact
     states from earlier from-entry replays, guard-evidence values one at
     a time, staged stub codes one at a time, the mixed all-valid-plus-
@@ -553,11 +560,17 @@ def _attempts_for(index, prov, members, facts=()) -> list:
     evidence = _guard_evidence(index, members)
     pool = _pool_from_literals(index, prov)
     variables = sorted(set(evidence) | (
-        {v for m in members for v in index.live_in(m) if v in pool}
+        {v for m in members for v in index.live_in(m)
+         if v in pool or v in (pools or {})}
     ))[:MAX_VARIABLES]
 
     def candidates(name):
         merged = list(evidence.get(name, []))
+        # In-flight values first among the extras: bytes the program
+        # itself computed on an earlier run exist in no static pool.
+        for value in (pools or {}).get(name, []):
+            if value not in merged:
+                merged.append(value)
         for value in pool.get(name, []):
             if value not in merged:
                 merged.append(value)
@@ -672,7 +685,8 @@ def _attempts_for(index, prov, members, facts=()) -> list:
     return attempts
 
 
-def local_solve(index, prov, goal, budget, sweep_cache, facts=()) -> tuple:
+def local_solve(index, prov, goal, budget, sweep_cache, facts=(),
+                pools=None) -> tuple:
     """``(assignment, runs)`` firing the goal in the closure, or
     ``(None, runs)``.
 
@@ -703,6 +717,8 @@ def local_solve(index, prov, goal, budget, sweep_cache, facts=()) -> tuple:
             trace = interp.run(members[0])
         except Exception:                                    # noqa: BLE001
             return frozenset()
+        if pools is not None:
+            _donate_values(pools, trace)
         return frozenset(_direction_key(g) for g in trace.guards)
 
     cached = sweep_cache.get(paragraph)
@@ -742,7 +758,8 @@ def local_solve(index, prov, goal, budget, sweep_cache, facts=()) -> tuple:
         return out
 
     if not cached["done"]:
-        attempts = _attempts_for(index, prov, members, facts=facts)
+        attempts = _attempts_for(index, prov, members, facts=facts,
+                                 pools=pools)
         position = len(cached["states"])
         for state, staged in attempts[position:]:
             fired = observe(state, staged)
@@ -751,7 +768,40 @@ def local_solve(index, prov, goal, budget, sweep_cache, facts=()) -> tuple:
             cached["states"].append((dict(state), staged, fired))
         else:
             cached["done"] = True
-    return finish(), runs[0]
+    found = finish()
+    if not found and cached["done"] and not cached.get("width1") \
+            and budget.left() > WIDTH1_RESERVE:
+        # Exhaustive narrow-domain escalation, once per closure: a field
+        # of declared width 1 has 256 possible values; when no evidence
+        # value fires anything new, enumerating all of them over the
+        # deepest base is cheaper than refusing. Separate pass so it can
+        # never crowd the evidence sweep out of the run cap.
+        cached["width1"] = True
+        narrow = [name for name in
+                  sorted({v for m in members for v in index.live_in(m)})
+                  if index.width(str(name).split(" OF ")[0]) == 1][:2]
+        if narrow:
+            WIDTH1["closures"] += 1
+            deepest = max(cached["states"], key=lambda row: len(row[2]),
+                          default=({}, {}, frozenset()))
+            base_state, base_staged, _f = deepest
+            spent = 0
+            for name in narrow:
+                for byte in range(256):
+                    if spent >= WIDTH1_CAP or budget.left() <= 0:
+                        break
+                    state = dict(base_state)
+                    state[name] = chr(byte)
+                    fired = observe(state, base_staged)
+                    spent += 1
+                    WIDTH1["runs"] += 1
+                    if fired is None:
+                        break
+                    cached["states"].append((state, base_staged, fired))
+            found = finish()
+            if found:
+                WIDTH1["fired"] += 1
+    return found, runs[0]
 
 
 def _shrink(fires, assignment) -> dict:
@@ -784,7 +834,8 @@ def _satisfied(state, required) -> bool:
     return True
 
 
-def producer_solve(index, prov, producer, required, budget, memo) -> tuple:
+def producer_solve(index, prov, producer, required, budget, memo,
+                   pools=None) -> tuple:
     """``(assignment, runs)`` making ``producer`` write every pair in
     ``required``, judged on the post-state - or ``(None, runs)``.
 
@@ -816,7 +867,8 @@ def producer_solve(index, prov, producer, required, budget, memo) -> tuple:
             return False
         return _satisfied(interp.state, required)
 
-    for state, _terminals in _attempts_for(index, prov, members):
+    for state, _terminals in _attempts_for(index, prov, members,
+                                           pools=pools):
         verdict = produces(state)
         if verdict is None:
             break
@@ -887,6 +939,251 @@ class _Budget:
         return max(0, self.total - self.spent)
 
 
+MAX_POOLED = 12         # in-flight values kept per variable
+WIDTH1_CAP = 260        # exhaustive byte-enumeration runs per closure
+WIDTH1_RESERVE = 1500   # budget floor below which the lever stays off
+
+# Exhaustive narrow-domain lever accounting, reset per run_chain: a
+# one-byte field has 256 possible values, so when the evidence sweep
+# fails, enumerating them all is cheaper than being wrong.
+WIDTH1 = {"closures": 0, "runs": 0, "fired": 0}
+
+
+def _donate_values(pools, trace, prefer=()):
+    """Fold one trace's observed operand values into the shared pools.
+
+    These are bytes the *program computed* - a formatted date it built, a
+    key it assembled, a counter it advanced - which exist in no static
+    pool and are precisely the values a later solve of a nearby goal
+    needs. Capped per variable; values seen at a preferred guard (the
+    diverging one) evict from the back.
+    """
+    preferred = set(prefer)
+    for guard in trace.guards:
+        front = (guard.paragraph, guard.ordinal) in preferred
+        for name, value in (guard.values or {}).items():
+            if value is None or isinstance(value, bool):
+                continue
+            key = str(name).upper()
+            bucket = pools.setdefault(key, [])
+            if value in bucket:
+                if front:
+                    bucket.remove(value)
+                    bucket.insert(0, value)
+                continue
+            if front:
+                bucket.insert(0, value)
+            elif len(bucket) < MAX_POOLED:
+                bucket.append(value)
+            del bucket[MAX_POOLED:]
+
+
+def _success_world(index, prov) -> dict:
+    """``{op: {field: success_code}}`` for every status channel program-wide.
+
+    The world where every external operation *works*: each stub-written
+    status field gets its family's success value (the family's first
+    entry - '00', 0, spaces - by the ordering `faults.py` documents).
+    Staged under a goal's own staging with first-write-wins, so a goal
+    that needs a specific failure keeps it and everything else succeeds.
+    A cycle-1 fetch needs exactly this: the record arrives, the program
+    saves its fetched mode in the commarea, and the second task earns
+    the deep half of the program.
+    """
+    from .faults import _FAMILIES, channel_of
+    out: dict = {}
+    for name, writers in (getattr(prov, "writers", None) or {}).items():
+        for writer in writers:
+            if writer.kind != "STUB" or not writer.op_key:
+                continue
+            family = None
+            try:
+                family = channel_of(name, index.model, writer.op_key)
+            except Exception:                                # noqa: BLE001
+                continue
+            if not family:
+                continue
+            codes = _FAMILIES.get(family) or ()
+            if codes:
+                out.setdefault(writer.op_key, {}).setdefault(
+                    str(name).upper(), codes[0])
+    return out
+
+
+def _screen_variants(index, prov) -> list:
+    """Candidate all-valid screens, as ``[{op: {field: value}}]``.
+
+    The default screen holds every field's evidence tail - the complement
+    or class shape that passes format and not-blank gates. But a field
+    whose edit is a *membership* test (a status byte the program compares
+    against its own literal list) passes on a tested literal, and its
+    complement fails; which kind of gate a field faces cannot be told
+    statically. So: one default screen, one screen with every enumerated
+    field on its first tested literal, and one single-field override per
+    enumerated field. Linear in fields, and the two kinds compose - the
+    account number stays digits while the status byte tries 'Y'.
+    """
+    default = _valid_screen(index, prov)
+    figurative = set(_FIGURATIVE.values())
+
+    def literals_of(name):
+        out = []
+        for values in (_valid_screen.__evidence__.get(name, ()),):
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                if value in figurative or set(value) <= {"0"}:
+                    continue
+                if len(set(value)) == 1 and value[0] in "A9*~":
+                    continue           # an appended shape, not a literal
+                out.append(value)
+        return out
+
+    variants = [default]
+    enums = {}
+    for op, fields in default.items():
+        for field in fields:
+            for value in literals_of(field):
+                enums.setdefault((op, field), []).append(value)
+    if enums:
+        joined = {op: dict(fields) for op, fields in default.items()}
+        for (op, field), values in enums.items():
+            joined[op][field] = values[0]
+        variants.append(joined)
+        for (op, field), values in list(enums.items())[:8]:
+            for value in values[:2]:
+                one = {o: dict(f) for o, f in default.items()}
+                one[op][field] = value
+                variants.append(one)
+    return variants[:12]
+
+
+def _valid_screen(index, prov, pick=-1) -> dict:
+    """``{op: {field: pass_value}}`` for every operation-delivered input,
+    program-wide.
+
+    The pass-shaped value of a field is the tail of its own guard
+    evidence - the complement of everything the program tests it
+    against, or the digits a class condition demands. A goal's closure
+    computes this for its own gates; a *cycle* recipe needs it for the
+    gates of every earlier task too, because the mode a deep goal lives
+    in is only saved once the first task's input edits all pass.
+    Measured without this, every cycle-base run arrived at the dispatch
+    in not-fetched mode, whatever the goal staging held.
+    """
+    from .ir import parse_term
+    members = tuple(index.names)
+    evidence = _guard_evidence(index, members)
+    # One hop of value flow: a screen field is usually validated through
+    # a work copy (`MOVE SCREEN-FIELD TO WORK; IF WORK NOT NUMERIC`), so
+    # the shape constraint lives on the destination. The destination's
+    # evidence tail - its pass shape - speaks for the source.
+    flows: dict = {}
+    for dest, writers in (getattr(prov, "writers", None) or {}).items():
+        for writer in writers:
+            if writer.kind != "MOVE" or not getattr(writer, "source", None):
+                continue
+            try:
+                source = parse_term(writer.source)
+            except Exception:                                # noqa: BLE001
+                continue
+            if source.kind == "var" and not source.refmod:
+                flows.setdefault(str(source.name).upper().split(" OF ")[0],
+                                 []).append(str(dest).upper())
+    def chased(head, depth=3):
+        """Evidence along the MOVE chain, nearest hop first."""
+        out, frontier, seen = [], [head], {head}
+        for _hop in range(depth):
+            fresh = []
+            for name in frontier:
+                found = evidence.get(name) or evidence.get(
+                    name.split(" OF ")[0])
+                if found:
+                    out.append(list(found))
+                for dest in flows.get(name.split(" OF ")[0], ())[:4]:
+                    if dest not in seen:
+                        seen.add(dest)
+                        fresh.append(dest)
+            frontier = fresh
+            if not frontier:
+                break
+        return out
+
+    out: dict = {}
+    union: dict = {}
+    for name, values in evidence.items():
+        if not values:
+            continue
+        head = str(name).upper().split(" OF ")[0]
+        writers = [w for w in _writers(prov, head)
+                   if w.kind == "STUB" and w.op_key]
+        if not writers:
+            continue
+        hops = chased(head) or [list(values)]
+        # The default pass value: the first hop along the MOVE chain that
+        # shows a digits run is a field some validation demands numeric,
+        # and its tail (the widest digits shape, or the last 88 VALUE of
+        # a numeric range) is the pass; otherwise the field's own tail -
+        # its complement - passes the not-blank and format gates.
+        # Membership literals live in the union, which `_screen_variants`
+        # mines; a validation two MOVEs away still speaks for the screen.
+        merged = hops[0]
+        for hop in hops:
+            if any(isinstance(v, str) and len(v) > 1 and v.isdigit()
+                   for v in hop):
+                merged = hop
+                break
+        position = pick if -len(merged) <= pick < len(merged) else -1
+        out.setdefault(writers[0].op_key, {}).setdefault(
+            head, merged[position])
+        union[head] = [value for hop in hops for value in hop]
+    _valid_screen.__evidence__ = union
+    return out
+
+
+def _cycle_fields(program, index) -> set:
+    """Every field the program itself saves across the task boundary."""
+    try:
+        from .reentry import commarea_targets, return_commareas
+    except Exception:                                        # noqa: BLE001
+        return set()
+    out: set = set()
+    for area in return_commareas(program) + commarea_targets(program):
+        if not area:
+            continue
+        out.add(str(area).upper())
+        for child in (index.model.descendants(area) or []):
+            out.add(str(child).upper())
+    return out
+
+
+def _cycle_bases(program, index) -> list:
+    """Entry states shaped so cycle 1 runs fresh and cycle 2 re-enters.
+
+    ``EIBCALEN = 0`` puts the first task on its no-commarea path - the
+    task that validates a search key, fetches, saves its mode in the
+    commarea and RETURNs with TRANSID. The interpreter carries the
+    returned bytes into the next task within the same run, so one
+    from-entry recipe spans the whole pseudo-conversation; nothing here
+    snapshots or re-enters by hand, which keeps the witness recipe
+    self-contained under exactly the soundness argument `reentry` makes.
+    One attention key per base, constant across the conversation, drawn
+    from the program's own comparisons.
+    """
+    try:
+        from .reentry import aid_comparisons, return_commareas
+    except Exception:                                        # noqa: BLE001
+        return []
+    if not return_commareas(program):
+        return []
+    bases = [({"EIBCALEN": 0}, "populated")]
+    for field, values in sorted(aid_comparisons(program).items()):
+        for value in values[:4]:
+            bases.append(({"EIBCALEN": 0, str(field).upper(): value},
+                          "populated"))
+    return bases[:6]
+
+
 def _stage_stub(stub_fields, writer, name, value):
     """One operation is one delivery: a RECEIVE fills the whole screen in
     one call, so every staged field of an op belongs to *every* entry of
@@ -909,7 +1206,8 @@ def _materialise(stub_fields) -> dict:
 
 
 def solve(index, prov, goal, budget, memo, reentry_bases,
-          sweep_cache, facts=()) -> dict:
+          sweep_cache, facts=(), cycle_fields=frozenset(), cycle_bases=(),
+          success_world=None, valid_screen=None, pools=None) -> dict:
     """One goal in, ``{"recipe": ...}`` or ``{"refusal": ...}`` out.
 
     The recipe is not yet validated - validation is the caller's replay,
@@ -917,7 +1215,7 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
     mechanism uses.
     """
     candidates, _runs = local_solve(index, prov, goal, budget, sweep_cache,
-                                    facts=facts)
+                                    facts=facts, pools=pools)
     if not candidates:
         if budget.left() <= 0:
             return {"refusal": "budget-exhausted"}
@@ -986,7 +1284,7 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
                 break
             for producer, required in produced.items():
                 answer, _n = producer_solve(index, prov, producer, required,
-                                            budget, memo)
+                                            budget, memo, pools=pools)
                 if answer is None:
                     if budget.left() <= 0:
                         failed = "budget-exhausted"
@@ -1016,8 +1314,29 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
         if failed is not None:
             refusal = refusal or failed
             continue
+        recipe_bases = list(bases)
+        cycle_needs = sorted(
+            str(name).upper() for name in (full_state or assignment)
+            if str(name).upper() in cycle_fields
+            or str(name).upper().split(" OF ")[0] in cycle_fields)
+        if cycle_needs and cycle_bases:
+            # Cycle-controlled state: the program itself writes these
+            # fields before RETURN TRANSID, and no entry pin survives to
+            # them on a re-entered task. The bases that answer are runs
+            # whose *first* task earns the state - EIBCALEN 0, an
+            # attention key, and a world where every fetch succeeds - and
+            # they are tried first, because the generic bases measurably
+            # never reach the mode these goals live in.
+            for world in (success_world or {}, valid_screen or {}):
+                for op, fields in world.items():
+                    for field, value in fields.items():
+                        stub_fields.setdefault(op, {}).setdefault(field,
+                                                                  value)
+            recipe_bases = list(cycle_bases) + recipe_bases
         recipes.append({"pins": entry_pins,
-                        "stubs": _materialise(stub_fields), "bases": bases})
+                        "stubs": _materialise(stub_fields),
+                        "bases": recipe_bases,
+                        "cycle_needs": cycle_needs})
     if not recipes:
         return {"refusal": refusal or "producer-unsolvable"}
     return {"recipes": recipes, "local_fired": local_fired}
@@ -1105,7 +1424,7 @@ def _save_facts(path, facts):
 
 
 def run_chain(program, goals=None, budget=8000, baseline=None,
-              epochs=3, facts_path=None) -> dict:
+              epochs=3, facts_path=None, pools_path=None) -> dict:
     """Chain every goal, in epochs that learn from their own replays.
 
     One epoch solves every pending goal (default: every direction the
@@ -1133,6 +1452,26 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
     facts = _load_facts(facts_path)
     facts_seen = {para: {repr(sorted(fact.items())) for fact in facts_list}
                   for para, facts_list in facts.items()}
+    pools: dict = {}
+    if pools_path:
+        import os as _os
+        if _os.path.exists(pools_path):
+            try:
+                import json as _json
+                pools = {str(k).upper(): list(v)[:MAX_POOLED]
+                         for k, v in _json.load(open(pools_path)).items()}
+            except Exception:                                # noqa: BLE001
+                pools = {}
+    cycle_fields = _cycle_fields(program, index)
+    cycle_bases = _cycle_bases(program, index)
+    success_world = _success_world(index, prov)
+    screen_variants = _screen_variants(index, prov)
+    # The joined variant - every enumerated field on a tested literal,
+    # everything else on its format shape - is the best single all-valid
+    # guess, so it is what per-goal cycle staging gets.
+    valid_screen = screen_variants[1] if len(screen_variants) > 1 \
+        else (screen_variants[0] if screen_variants else {})
+    entered_paragraphs: set = set()
     para_vars_cache: dict = {}
     fact_watch: set = set()        # paragraphs whose facts are worth keeping
     new_fact_count = [0]
@@ -1166,6 +1505,8 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
             return None
         ledger.credit(trace, state or {}, world, stub_plan, terminals, source)
         donate(set(trace.entered) & fact_watch, interp)
+        _donate_values(pools, trace)
+        entered_paragraphs.update(trace.entered)
         return trace
 
     have = set(baseline or ())
@@ -1197,11 +1538,40 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
     except Exception:                              # noqa: BLE001
         reentry_bases = []
 
+    WIDTH1.update(closures=0, runs=0, fired=0)
     memo: dict = {}
     last_outcome: dict = {}
     pending = list(original)
-    fact_watch.update(goal[0] for goal in pending)
     per_epoch = []
+    fact_watch.update(goal[0] for goal in pending)
+    # Phase 0: the bare cycle probe. Before any per-goal solving, run each
+    # cycle base under the program-wide success world and all-valid screen
+    # - a handful of runs that walk the whole pseudo-conversation (fetch,
+    # mode save, re-entry, edit, dispatch) and credit every direction the
+    # mode progression takes. Per-goal solving then starts from whatever
+    # this left uncovered.
+    if cycle_bases:
+        for number, screen in enumerate(screen_variants):
+            probe_stubs: dict = {}
+            for world_map in (success_world, screen):
+                for op, fields in (world_map or {}).items():
+                    for field, value in fields.items():
+                        probe_stubs.setdefault(op, {}).setdefault(field,
+                                                                  value)
+            for base_state, world in cycle_bases:
+                run(dict(base_state), world,
+                    _materialise(probe_stubs) or None, None,
+                    "chain:cycle-probe:%d" % number)
+        per_epoch.append({
+            "epoch": 0, "witnessed_original": sum(
+                1 for g in original if g in ledger.witnesses),
+            "witnessed_delta": sum(
+                1 for g in original if g in ledger.witnesses),
+            "credited_delta": len(ledger.witnesses),
+            "paragraphs_entered": len(entered_paragraphs),
+            "paragraphs_delta": len(entered_paragraphs),
+            "new_facts": new_fact_count[0], "new_subgoals": 0,
+            "runs": the_budget.spent})
     for epoch in range(max(1, epochs)):
         sweep_cache: dict = {}    # facts changed; sweeps must re-run
         epoch_subgoals: list = []
@@ -1218,13 +1588,18 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                 continue
             answer = solve(index, prov, goal, the_budget, memo,
                            reentry_bases, sweep_cache,
-                           facts=facts.get(goal[0], ()))
+                           facts=facts.get(goal[0], ()),
+                           cycle_fields=cycle_fields,
+                           cycle_bases=cycle_bases,
+                           success_world=success_world,
+                           valid_screen=valid_screen, pools=pools)
             if "refusal" in answer:
                 last_outcome[goal] = answer["refusal"]
                 continue
             landed = False
             any_stubs = False
             diverged_trace = None
+            deepest = -1
             for recipe in answer["recipes"]:
                 any_stubs = any_stubs or bool(recipe["stubs"])
                 for base_state, world in recipe["bases"]:
@@ -1234,7 +1609,14 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                                 "chain:%s:%s:%s" % (goal[0], goal[1],
                                                     goal[3]))
                     if trace is not None:
-                        diverged_trace = trace
+                        # The subgoal well is the DEEPEST failure, not the
+                        # last: the run that got furthest names the gate
+                        # that actually matters.
+                        depth = len({_direction_key(g)
+                                     for g in trace.guards})
+                        if depth > deepest:
+                            deepest = depth
+                            diverged_trace = trace
                     if goal in ledger.witnesses:
                         landed = True
                         break
@@ -1248,6 +1630,9 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
             if diverged_trace is not None:
                 subgoal, observed = _first_divergence(
                     diverged_trace, answer.get("local_fired", set()))
+                if subgoal is not None:
+                    _donate_values(pools, diverged_trace,
+                                   prefer={(subgoal[0], subgoal[1])})
                 if subgoal is not None \
                         and subgoal not in ledger.witnesses \
                         and subgoal not in pending \
@@ -1268,11 +1653,15 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                                     donatable)
                                 new_fact_count[0] += 1
         witnessed_after = sum(1 for g in original if g in ledger.witnesses)
+        paragraphs_before = per_epoch[-1]["paragraphs_entered"] \
+            if per_epoch else 0
         per_epoch.append({
             "epoch": epoch + 1,
             "witnessed_original": witnessed_after,
             "witnessed_delta": witnessed_after - witnessed_before,
             "credited_delta": len(ledger.witnesses) - credited_before,
+            "paragraphs_entered": len(entered_paragraphs),
+            "paragraphs_delta": len(entered_paragraphs) - paragraphs_before,
             "new_facts": new_fact_count[0] - facts_before,
             "new_subgoals": len(epoch_subgoals),
             "runs": the_budget.spent - runs_before,
@@ -1286,6 +1675,13 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
         if the_budget.left() <= 0:
             break
     _save_facts(facts_path, facts)
+    if pools_path:
+        try:
+            import json as _json
+            with open(pools_path, "w") as handle:
+                _json.dump(pools, handle, indent=1, default=str)
+        except Exception:                                    # noqa: BLE001
+            pass
 
     refusals: dict = {}
     for goal in original:
@@ -1297,6 +1693,6 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
     report = {"goals": len(original), "witnessed": witnessed,
               "credited_directions": len(ledger.witnesses),
               "runs": the_budget.spent, "budget": budget,
-              "epochs": per_epoch,
+              "epochs": per_epoch, "width1": dict(WIDTH1),
               "refusals": refusals, "ledger": ledger}
     return report
