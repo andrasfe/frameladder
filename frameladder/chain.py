@@ -1134,10 +1134,57 @@ def _valid_screen(index, prov, pick=-1) -> dict:
                 merged = hop
                 break
         position = pick if -len(merged) <= pick < len(merged) else -1
+        # (A width/int-evidence reshaping of the chosen value was built
+        # and measured here: +0 on the program it targeted and -2 on a
+        # neighbour whose working screen it disturbed. Reverted; the
+        # shapes stay exactly what the evidence chase produced.)
         out.setdefault(writers[0].op_key, {}).setdefault(
             head, merged[position])
         union[head] = [value for hop in hops for value in hop]
     _valid_screen.__evidence__ = union
+    return out
+
+
+def _spoil_family(index, screen) -> list:
+    """``[(op, field, kind, value)]`` - one spoiled entry per way a field
+    can fail its own edit, everything else left valid.
+
+    The construction the attribute chain demands: arm k of a first-match
+    chain over per-field verdicts fires only when fields 1..k-1 passed
+    and field k alone failed, and failed *in the right way* - the BLANK
+    arm and the NOT-OK arm are different directions. The spoils come
+    from the same evidence the pass shapes came from: blank and
+    LOW-VALUES for the not-supplied arms, a letters run against a digits
+    pass (the class-condition failure), zeros against a must-not-be-zero
+    check, and for an enumerated field a byte outside its own literal
+    set. Linear in fields; each variant is one run per base.
+    """
+    from .heuristics import complement_value
+    union = getattr(_valid_screen, "__evidence__", {}) or {}
+    figurative = set(_FIGURATIVE.values())
+    out = []
+    for op, fields in screen.items():
+        for field, pass_value in fields.items():
+            text = str(pass_value)
+            width = max(len(text), index.width(field) or 1)
+            spoils = [("blank", " " * width), ("low", "\x00" * width)]
+            if text.strip().isdigit():
+                spoils.append(("nonnum", "A" * width))
+                spoils.append(("zero", "0" * width))
+            literals = [v for v in union.get(field, ())
+                        if isinstance(v, str) and v.strip()
+                        and v not in figurative
+                        and not (len(set(v)) == 1 and v[0] in "A9*~")]
+            if literals:
+                outside = complement_value(field, index.model.pic_of(field),
+                                           literals) or "~" * width
+                spoils.append(("outside", outside))
+            seen = set()
+            for kind, value in spoils:
+                if value == pass_value or repr(value) in seen:
+                    continue
+                seen.add(repr(value))
+                out.append((op, field, kind, value))
     return out
 
 
@@ -1551,6 +1598,7 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
     # mode progression takes. Per-goal solving then starts from whatever
     # this left uncovered.
     if cycle_bases:
+        best = (-1, None, None, None)     # depth, base, world, screen
         for number, screen in enumerate(screen_variants):
             probe_stubs: dict = {}
             for world_map in (success_world, screen):
@@ -1559,9 +1607,31 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                         probe_stubs.setdefault(op, {}).setdefault(field,
                                                                   value)
             for base_state, world in cycle_bases:
+                trace = run(dict(base_state), world,
+                            _materialise(probe_stubs) or None, None,
+                            "chain:cycle-probe:%d" % number)
+                if trace is not None:
+                    depth = len({_direction_key(g) for g in trace.guards})
+                    if depth > best[0]:
+                        best = (depth, dict(base_state), world, screen)
+        # The one-field-spoiled family, over the deepest valid route: arm
+        # k of a first-match verdict chain needs fields 1..k-1 valid and
+        # field k alone failed one specific way. Everything is reused -
+        # the base that routed, the screen that passed - and each variant
+        # is one run.
+        if best[3] is not None:
+            _depth, base_state, world, screen = best
+            for op, field, kind, value in _spoil_family(index, screen):
+                spoiled = {o: dict(f) for o, f in screen.items()}
+                spoiled[op][field] = value
+                probe_stubs = {}
+                for world_map in (success_world, spoiled):
+                    for o, fields in (world_map or {}).items():
+                        for f, v in fields.items():
+                            probe_stubs.setdefault(o, {}).setdefault(f, v)
                 run(dict(base_state), world,
                     _materialise(probe_stubs) or None, None,
-                    "chain:cycle-probe:%d" % number)
+                    "chain:spoil:%s:%s" % (field, kind))
         per_epoch.append({
             "epoch": 0, "witnessed_original": sum(
                 1 for g in original if g in ledger.witnesses),
