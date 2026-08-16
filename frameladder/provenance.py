@@ -425,6 +425,23 @@ class Provenance:
                             self.literals.setdefault(a.name, set()).add(b.value)
                             if a.refmod:
                                 self._record_slice(a, b.value)
+                        elif (a.kind == "var" and b.kind == "var"
+                              and not b.func and not b.refmod):
+                            # `IF WS-A EQUAL WS-LIT` with `01 WS-LIT PIC X(4)
+                            # VALUE 'ABCD'` compares against a data-name, not a
+                            # literal - but the data-name's own VALUE clause
+                            # *is* the literal the program is asking about,
+                            # exactly as an 88's VALUE is for a condition-name.
+                            # Missing this, a field only ever compared to a
+                            # VALUE-carrying constant-holder never gets that
+                            # constant into its pool, and the direction it
+                            # gates has no witness.
+                            declared = self._declared_value(b.name)
+                            if declared is not None:
+                                self.literals.setdefault(a.name,
+                                                         set()).add(declared)
+                                if a.refmod:
+                                    self._record_slice(a, declared)
 
         def scan(stmt):
             attrs = stmt.get("attributes", {})
@@ -483,6 +500,17 @@ class Provenance:
                                self.model.look(self.model.sign, name, ""))
         except Exception:                                        # noqa: BLE001
             return 0
+
+    def _declared_value(self, name: str):
+        """The data-division VALUE clause a plain (non-88) item declares.
+
+        `model.condition_names` is the 88-level table; `model.initial` is its
+        01/77-level counterpart, populated the same way at parse time and
+        looked up the same way - through `model.look`, so a qualified
+        reference (`LIT-X OF SOME-GROUP`) still finds the declaration filed
+        under its base name.
+        """
+        return self.model.look(self.model.initial, name, None)
 
     def _class_candidates(self, name: str, klass: str) -> None:
         """A class condition names a shape, so offer a value of that shape.

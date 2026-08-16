@@ -4666,6 +4666,41 @@ class TestFreeInputSlots(unittest.TestCase):
         # has no value to be sampled into.
         self.assertGreater(len(pool.get("WS-A", [])), 1)
 
+    def test_a_value_carrying_data_name_seeds_the_other_operand(self):
+        # `IF WS-A = WS-LIT` compares against a data-name, not a literal - but
+        # `01 WS-LIT PIC X(4) VALUE 'ABCD'` declares what that data-name
+        # always holds unless something writes it, and that declared value is
+        # exactly the constant the comparison is asking about. Without it,
+        # WS-A's pool never gets 'ABCD' and the True direction of the
+        # comparison has no witness.
+        from frameladder.cli import _overlay_pool
+        prog = program(HEADER + """       01 WS-A PIC X(4).
+       01 WS-LIT PIC X(4) VALUE 'ABCD'.
+       PROCEDURE DIVISION.
+       OV-MAIN.
+           IF WS-A = WS-LIT
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        pool = _overlay_pool(prog)
+        self.assertIn("ABCD", pool.get("WS-A", []))
+        # The mirror direction: a literal-holder compared on the left names
+        # the field on the right as its own candidate value too.
+        prog2 = program(HEADER + """       01 WS-A PIC X(4).
+       01 WS-LIT PIC X(4) VALUE 'ABCD'.
+       PROCEDURE DIVISION.
+       OV-MAIN.
+           IF WS-LIT = WS-A
+              CONTINUE
+           END-IF
+           GOBACK
+           .
+""")
+        pool2 = _overlay_pool(prog2)
+        self.assertIn("ABCD", pool2.get("WS-A", []))
+
     def test_a_profile_that_cannot_inject_a_field_keeps_it_out(self):
         # An overlay the harness will drop in projection must never be the
         # reason a plan was called verified.
