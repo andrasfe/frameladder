@@ -68,6 +68,13 @@ _KIND = {"PERFORM_UNTIL": "LOOP", "PERFORM_VARYING": "LOOP",
 _THRU = re.compile(r"\s+(?:THRU|THROUGH)\s+", re.I)
 _CLASS = re.compile(r"([A-Z0-9][A-Z0-9-]*(?:\s+OF\s+[A-Z0-9-]+)?)"
                     r"\s+(?:IS\s+)?(?:NOT\s+)?NUMERIC\b", re.I)
+# `FUNCTION TEST-NUMVAL(-C)(X)` asks the shape question through an
+# intrinsic: digits satisfy it, letters do not. Added back as EVIDENCE
+# only - v5 used it to pick defaults and regressed; the v6 walk instead
+# arbitrates every candidate by measurement, where an extra digits
+# option can only win by winning.
+_NUMVAL = re.compile(r"TEST-NUMVAL(?:-C)?\s*\(\s*"
+                     r"([A-Z0-9][A-Z0-9-]*(?:\s+OF\s+[A-Z0-9-]+)?)", re.I)
 _FIGURATIVE = {
     "LOW-VALUES": "\x00", "LOW-VALUE": "\x00", "SPACES": " ", "SPACE": " ",
     "ZEROS": "0", "ZEROES": "0", "ZERO": "0",
@@ -319,17 +326,20 @@ def _guard_evidence(index, members) -> dict:
             attributes = stmt.get("attributes") or {}
             for field in ("condition", "value"):
                 text = str(attributes.get(field) or "")
-                for match in _CLASS.finditer(text):
-                    name = match.group(1).strip().upper()
-                    head = name.split(" OF ")[0].strip()
-                    if not index.model.knows(head):
-                        continue
-                    width = index.width(head) or 4
-                    bucket = values.setdefault(name, [])
-                    for shaped in ("A" * width, "9" * width):
-                        if shaped in bucket:
-                            bucket.remove(shaped)
-                        bucket.append(shaped)
+                for pattern in (_CLASS, _NUMVAL):
+                    for match in pattern.finditer(text):
+                        name = match.group(1).strip().upper()
+                        head = name.split(" OF ")[0].strip()
+                        if not index.model.knows(head):
+                            continue
+                        width = index.width(head) or 4
+                        bucket = values.setdefault(name, [])
+                        shapes = ("A" * width, "9" * width) \
+                            if pattern is _CLASS else ("9" * width,)
+                        for shaped in shapes:
+                            if shaped in bucket:
+                                bucket.remove(shaped)
+                            bucket.append(shaped)
     # Slice comparisons compose into whole-field candidates: a digits
     # buffer with each compared literal placed at its own offset. This is
     # what passes a format edit - `X(1:1) = '-'` and `X(2:8) NUMERIC`
@@ -884,13 +894,15 @@ def producer_solve(index, prov, producer, required, budget, memo,
     """
     key = (producer, tuple(sorted((k, repr(v)) for k, v in required.items())))
     if key in memo:
-        return memo[key], 0
+        answer, offers = memo[key]
+        return answer, 0, offers
     members = index.closure(producer)
     if producer not in index.paragraphs:
         memo[key] = None
         return None, 0
     sub = index.sub_program(members)
     runs = [0]
+    offers: dict = {}
 
     def produces(state):
         if runs[0] >= min(budget.left(), MAX_PRODUCER_RUNS):
@@ -904,7 +916,22 @@ def producer_solve(index, prov, producer, required, budget, memo,
             interp.run(members[0])
         except Exception:                                    # noqa: BLE001
             return False
-        return _satisfied(interp.state, required)
+        if _satisfied(interp.state, required):
+            return True
+        # The demand missed, but what the producer DID write is its
+        # offer: an achievable output, with the input assignment that
+        # achieved it. The caller intersects these with what the goal
+        # actually accepts - the demanded byte string is often one
+        # arbitrary member of a satisfying set.
+        for name in required:
+            try:
+                held = interp.state.get(str(name).upper())
+            except Exception:                                # noqa: BLE001
+                continue
+            if held is not None and str(held).strip():
+                offers.setdefault(str(name).upper(), {}).setdefault(
+                    repr(held), (held, dict(state)))
+        return False
 
     for state, _terminals in _attempts_for(index, prov, members,
                                            pools=pools):
@@ -913,10 +940,10 @@ def producer_solve(index, prov, producer, required, budget, memo,
             break
         if verdict:
             answer = _shrink(produces, state)
-            memo[key] = answer
-            return answer, runs[0]
-    memo[key] = None
-    return None, runs[0]
+            memo[key] = (answer, {})
+            return answer, runs[0], {}
+    memo[key] = (None, offers)
+    return None, runs[0], offers
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +1013,9 @@ WIDTH1_RESERVE = 1500   # budget floor below which the lever stays off
 # one-byte field has 256 possible values, so when the evidence sweep
 # fails, enumerating them all is cheaper than being wrong.
 WIDTH1 = {"closures": 0, "runs": 0, "fired": 0}
+
+# Offer-driven producer fallback accounting, reset per run_chain.
+OFFER_FALLBACK = {"converted": 0}
 
 
 def _donate_values(pools, trace, prefer=()):
@@ -1327,6 +1357,44 @@ def _valid_screen(index, prov, pick=-1) -> dict:
     return out
 
 
+def _different(value):
+    """A value of the same shape that is not byte-equal to ``value``.
+
+    For a same-or-different comparison against a record field, the
+    "different" side needs nothing from any vocabulary - only that its
+    first byte moves within its own character class, so the shape gates
+    it also faces keep passing.
+    """
+    text = str(value)
+    if not text:
+        return "#"
+    head = text[0]
+    if head.isdigit():
+        swapped = "1" if head == "9" else chr(ord(head) + 1)
+    elif head.isalpha():
+        swapped = "B" if head.upper() == "A" else             chr(ord(head) - 1) if head.upper() != "A" else "B"
+    else:
+        swapped = "#"
+    return swapped + text[1:]
+
+
+def _materialise_cycles(first, rest) -> dict:
+    """Stub series with a different delivery for the first call.
+
+    The pseudo-conversation reads its map once per task: the first
+    RECEIVE gets the fetch screen (the search key, so the mode
+    advances), every later one the update screen (the new values, or
+    the one spoiled field an arm needs). Ops staged in only one shape
+    deliver that shape throughout.
+    """
+    out: dict = {}
+    for op in set(first) | set(rest):
+        head = first.get(op, rest.get(op, {}))
+        tail = rest.get(op, first.get(op, {}))
+        out[op] = [{"set": dict(head)}] +             [{"set": dict(tail)} for _n in range(STUB_SERIES - 1)]
+    return out
+
+
 def _spoil_family(index, screen) -> list:
     """``[(op, field, kind, value)]`` - one spoiled entry per way a field
     can fail its own edit, everything else left valid.
@@ -1512,8 +1580,49 @@ def solve(index, prov, goal, budget, memo, reentry_bases,
             if failed is not None:
                 break
             for producer, required in produced.items():
-                answer, _n = producer_solve(index, prov, producer, required,
-                                            budget, memo, pools=pools)
+                answer, _n, offers = producer_solve(index, prov, producer,
+                                                    required, budget, memo,
+                                                    pools=pools)
+                if answer is None and offers:
+                    # Offer-driven fallback: demand asked for one exact
+                    # byte string; the goal usually accepts a set. Each
+                    # achievable output is tested against the goal's own
+                    # closure - a micro-run with the offer substituted -
+                    # and the first accepted offer continues the chain
+                    # with the input assignment that achieved it.
+                    goal_sub = index.sub_program(goal_members)
+                    for name, value in list(required.items()):
+                        for _mark, (held, producer_state) in list(
+                                offers.get(str(name).upper(),
+                                           {}).items())[:6]:
+                            if str(held).rstrip() == str(value).rstrip():
+                                continue
+                            if budget.left() <= 0:
+                                break
+                            budget.spend()
+                            probe_state = dict(full_state or assignment)
+                            probe_state[str(name).upper()] = held
+                            try:
+                                interp = Interpreter(
+                                    goal_sub, probe_state,
+                                    stubs={k: [dict(e) for e in v]
+                                           for k, v in
+                                           (staged_stubs or {}).items()}
+                                    or None,
+                                    defaults=io_defaults(index.program,
+                                                         "populated"))
+                                watched = interp.run(goal_members[0])
+                            except Exception:                # noqa: BLE001
+                                continue
+                            if goal in {_direction_key(g)
+                                        for g in watched.guards}:
+                                next_frontier.extend(
+                                    producer_state.items())
+                                OFFER_FALLBACK["converted"] += 1
+                                answer = {}
+                                break
+                        if answer is not None:
+                            break
                 if answer is None:
                     if budget.left() <= 0:
                         failed = "budget-exhausted"
@@ -1768,6 +1877,7 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
         reentry_bases = []
 
     WIDTH1.update(closures=0, runs=0, fired=0)
+    OFFER_FALLBACK.update(converted=0)
     memo: dict = {}
     last_outcome: dict = {}
     pending = list(original)
@@ -1933,6 +2043,22 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
             # The ranked loop already ran this exact recipe; its trace is
             # the background reading (the dedup would return None).
             trace = best_trace
+            def window_score(the_trace):
+                """How late this background's first failure lands.
+
+                Under first-match, exactly one verdict arm fires per
+                evaluation; the higher its ordinal the wider the window
+                above it. No verdict arm at all is the full pass. Run
+                depth cannot be the judge here - a BLANK lateral runs
+                *deeper* than the clean pass while masking more.
+                """
+                fired = verdict_arms(the_trace) - structural
+                if not fired:
+                    return (1, 0)
+                return (0, max(ordinal for _pg, ordinal in fired))
+
+            deepest_background = (window_score(trace),
+                                  {o: dict(f) for o, f in current.items()})
             owned = spoil_sweep(current, "w0", background=trace)
             seen_states = set()
             for round_number in range(16):
@@ -2001,6 +2127,11 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                     (_rank, candidate, trial, attempt, gone, field,
                      held) = overall[0]
                     current, trace = trial, attempt
+                    score_now = window_score(attempt)
+                    if score_now >= deepest_background[0]:
+                        deepest_background = (
+                            score_now,
+                            {o: dict(f) for o, f in trial.items()})
                     window_report["rounds"] = round_number + 1
                     window_report["repairs"].append(
                         {"field": field, "from": repr(held)[:14],
@@ -2016,18 +2147,84 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                         "arms": sorted(list(a) for a in verdict)[:3],
                         "note": "no evidence value moves these"}
                     break
+            def merged_with(screen_map, extra=None):
+                probe_stubs: dict = {}
+                for world_map in ((extra or {}), success_world,
+                                  screen_map):
+                    for o, fields in (world_map or {}).items():
+                        for f, v in fields.items():
+                            probe_stubs.setdefault(o, {}).setdefault(f, v)
+                return probe_stubs
+
+            # Two screens per conversation: the DEEPEST background the
+            # walk found (the last lateral repairs mask again; the walk's
+            # end state is not its best state) as the FETCH delivery, the
+            # spoiled screen as every later delivery. This is the shape
+            # the v6 stall named: a field can be valid in cycle 2 and
+            # spoiled in cycle 3 only if the deliveries differ per cycle.
+            current = deepest_background[1]
+            fetch_stubs = merged_with(current)
+            for op, field, kind, value in _spoil_family(index, current):
+                spoiled = {o: dict(f) for o, f in current.items()}
+                spoiled[op][field] = value
+                update_stubs = merged_with(spoiled)
+                run(dict(base_state), world,
+                    _materialise_cycles(fetch_stubs, update_stubs)
+                    or None, None,
+                    "chain:spoil2:%s:%s" % (field, kind))
+
+            # Var-vs-record constraints: where a comparison holds a
+            # stub-delivered record field against program state, the
+            # delivery is a free variable - stage it EQUAL to the other
+            # side's pass value for one direction and shape-different
+            # for the other. The screen side is already solved; this is
+            # the record side answering it.
+            union_all = getattr(_valid_screen, "__evidence__", {}) or {}
+            record_equal: dict = {}
+            record_diff: dict = {}
+            for stub_head, op, other in _mirror_pairs(
+                    index, prov, tuple(index.names)):
+                other_head = str(other).upper().split(" OF ")[0]
+                pool_vals = [v for v in union_all.get(other_head, ())
+                             if isinstance(v, str) and v.strip()]
+                anchor = pool_vals[-1] if pool_vals else                     "A" * (index.width(other_head) or 4)
+                record_equal.setdefault(op, {}).setdefault(stub_head,
+                                                           anchor)
+                record_diff.setdefault(op, {}).setdefault(
+                    stub_head, _different(anchor))
+            for tag, staging in (("req", record_equal),
+                                 ("rdiff", record_diff)):
+                if not staging:
+                    continue
+                stubs_map = merged_with(current, extra=staging)
+                run(dict(base_state), world, _materialise(stubs_map)
+                    or None, None, "chain:record:%s" % tag)
+                # and the record variants under the two-screen family,
+                # spoiling one update field at a time
+                for op, field, kind, value in _spoil_family(index,
+                                                            current):
+                    if the_budget.left() <= 0:
+                        break
+                    spoiled = {o: dict(f) for o, f in current.items()}
+                    spoiled[op][field] = value
+                    run(dict(base_state), world,
+                        _materialise_cycles(
+                            merged_with(current, extra=staging),
+                            merged_with(spoiled, extra=staging))
+                        or None, None,
+                        "chain:record:%s:%s:%s" % (tag, field, kind))
+
             # The final background across every cycle base: a different
             # attention key can route the confirm cycle that the deepest
             # window needs.
             for extra_state, extra_world in cycle_bases:
-                probe_stubs = {}
-                for world_map in (success_world, current):
-                    for o, fields in (world_map or {}).items():
-                        for f, v in fields.items():
-                            probe_stubs.setdefault(o, {}).setdefault(f, v)
                 run(dict(extra_state), extra_world,
-                    _materialise(probe_stubs) or None, None,
+                    _materialise(merged_with(current)) or None, None,
                     "chain:cycle-probe:final")
+                run(dict(extra_state), extra_world,
+                    _materialise_cycles(merged_with(current),
+                                        merged_with(current)) or None,
+                    None, "chain:cycle-probe:final2")
         per_epoch.append({
             "epoch": 0, "witnessed_original": sum(
                 1 for g in original if g in ledger.witnesses),
@@ -2160,6 +2357,7 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
               "credited_directions": len(ledger.witnesses),
               "runs": the_budget.spent, "budget": budget,
               "epochs": per_epoch, "width1": dict(WIDTH1),
+              "offer_fallback": dict(OFFER_FALLBACK),
               "window": locals().get("window_report"),
               "refusals": refusals, "ledger": ledger}
     return report

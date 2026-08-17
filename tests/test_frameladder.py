@@ -5306,12 +5306,12 @@ class TestChain(unittest.TestCase):
         index = self._index(prog)
         _graph, prov = self._analysed(prog)
         budget = chain._Budget(500)
-        answer, _runs = chain.producer_solve(index, prov, "1000-PRODUCE",
-                                             {"WS-FLAG": "Y"}, budget, {})
+        answer, _runs, _offers = chain.producer_solve(
+            index, prov, "1000-PRODUCE", {"WS-FLAG": "Y"}, budget, {})
         self.assertEqual(answer, {"WS-IN": "OK"})
         # the conjunction case: two required outputs at once
-        answer2, _runs = chain.producer_solve(index, prov, "1000-PRODUCE",
-                                              {"WS-FLAG": "N"}, budget, {})
+        answer2, _runs, _offers = chain.producer_solve(
+            index, prov, "1000-PRODUCE", {"WS-FLAG": "N"}, budget, {})
         self.assertIsNotNone(answer2)
         self.assertNotEqual(answer2.get("WS-IN"), "OK")
 
