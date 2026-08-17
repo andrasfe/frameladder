@@ -68,6 +68,31 @@ _KIND = {"PERFORM_UNTIL": "LOOP", "PERFORM_VARYING": "LOOP",
 _THRU = re.compile(r"\s+(?:THRU|THROUGH)\s+", re.I)
 _CLASS = re.compile(r"([A-Z0-9][A-Z0-9-]*(?:\s+OF\s+[A-Z0-9-]+)?)"
                     r"\s+(?:IS\s+)?(?:NOT\s+)?NUMERIC\b", re.I)
+# The accepting set of TEST-NUMVAL and its siblings is fixed by the
+# platform the way DFHRESP codes are: optionally signed, optionally
+# decimal, space-tolerant digit strings. Members are offered only to a
+# field the source itself passes through the intrinsic - the same
+# evidence gate every status channel obeys.
+_NUMVAL = re.compile(r"TEST-NUMVAL(?:-C|-F)?\s*\(\s*"
+                     r"([A-Z0-9][A-Z0-9-]*(?:\s+OF\s+[A-Z0-9-]+)?)", re.I)
+
+
+def _numval_members(width) -> list:
+    """Representative members of the TEST-NUMVAL accepting grammar,
+    rendered at the tested field's width: a plain digits run, a small
+    space-padded integer, and signed decimals both ways."""
+    width = max(int(width or 8), 4)
+    body = "1" * min(3, width - 1)
+    out = ["9" * width,
+           (body + " " * width)[:width],
+           ("+" + body + ".00" + " " * width)[:width],
+           ("-" + body + ".00" + " " * width)[:width]]
+    seen, kept = set(), []
+    for value in out:
+        if value not in seen:
+            seen.add(value)
+            kept.append(value)
+    return kept
 _FIGURATIVE = {
     "LOW-VALUES": "\x00", "LOW-VALUE": "\x00", "SPACES": " ", "SPACE": " ",
     "ZEROS": "0", "ZEROES": "0", "ZERO": "0",
@@ -319,17 +344,21 @@ def _guard_evidence(index, members) -> dict:
             attributes = stmt.get("attributes") or {}
             for field in ("condition", "value"):
                 text = str(attributes.get(field) or "")
-                for match in _CLASS.finditer(text):
-                    name = match.group(1).strip().upper()
-                    head = name.split(" OF ")[0].strip()
-                    if not index.model.knows(head):
-                        continue
-                    width = index.width(head) or 4
-                    bucket = values.setdefault(name, [])
-                    for shaped in ("A" * width, "9" * width):
-                        if shaped in bucket:
-                            bucket.remove(shaped)
-                        bucket.append(shaped)
+                for pattern in (_CLASS, _NUMVAL):
+                    for match in pattern.finditer(text):
+                        name = match.group(1).strip().upper()
+                        head = name.split(" OF ")[0].strip()
+                        if not index.model.knows(head):
+                            continue
+                        width = index.width(head) or 4
+                        bucket = values.setdefault(name, [])
+                        shaped_values = ("A" * width, "9" * width) \
+                            if pattern is _CLASS \
+                            else tuple(_numval_members(width))
+                        for shaped in shaped_values:
+                            if shaped in bucket:
+                                bucket.remove(shaped)
+                            bucket.append(shaped)
     # Slice comparisons compose into whole-field candidates: a digits
     # buffer with each compared literal placed at its own offset. This is
     # what passes a format edit - `X(1:1) = '-'` and `X(2:8) NUMERIC`
@@ -1959,9 +1988,14 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                     # and blocks. A clean pass extinguishes without
                     # raising a new verdict arm; it wins on sight.
                     scored = []
-                    for candidate in [v for v in union.get(field, ())
-                                      if isinstance(v, str)
-                                      and v != held][:5]:
+                    # Tail-first: the evidence union is built head-to-
+                    # tail from failing literals to pass shapes, and the
+                    # head-first slice measured as trying five ways to
+                    # fail before the first way to pass.
+                    ordered = [v for v in union.get(field, ())
+                               if isinstance(v, str) and v != held]
+                    ordered = list(dict.fromkeys(reversed(ordered)))
+                    for candidate in ordered[:5]:
                         if the_budget.left() <= 0:
                             break
                         trial = {o: dict(f) for o, f in current.items()}
