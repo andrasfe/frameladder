@@ -5504,3 +5504,111 @@ class TestSpoilFamily(unittest.TestCase):
         # no spoil ever equals the pass value it replaces
         for op, field, _kind, value in family:
             self.assertNotEqual(value, screen[op][field])
+
+
+class TestStringMultiOperand(unittest.TestCase):
+    """One DELIMITED phrase governs every operand listed before it."""
+
+    def test_two_operands_one_delimited_by_size(self):
+        prog = program(HEADER + """       01  WS-STATE     PIC X(2).
+       01  WS-ZIP       PIC X(5).
+       01  WS-COMBO     PIC X(4).
+         88  GOOD-COMBO  VALUE 'AL35'.
+       01  WS-OUT       PIC X.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           MOVE 'AL'    TO WS-STATE
+           MOVE '35999' TO WS-ZIP
+           STRING WS-STATE
+                  WS-ZIP(1:2)
+             DELIMITED BY SIZE
+             INTO WS-COMBO
+           IF GOOD-COMBO
+              MOVE 'Y' TO WS-OUT
+           ELSE
+              MOVE 'N' TO WS-OUT
+           END-IF
+           GOBACK.
+""")
+        interp = Interpreter(prog, {})
+        interp.run("0000-MAIN")
+        self.assertEqual(str(interp.state.get("WS-COMBO")).strip(), "AL35")
+        self.assertEqual(interp.state.get("WS-OUT"), "Y")
+
+    def test_single_operand_still_works(self):
+        prog = program(HEADER + """       01  WS-MSG   PIC X(20).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           STRING 'HELLO' DELIMITED BY SIZE
+             INTO WS-MSG
+           GOBACK.
+""")
+        interp = Interpreter(prog, {})
+        interp.run("0000-MAIN")
+        self.assertEqual(str(interp.state.get("WS-MSG")).strip(), "HELLO")
+
+
+class TestCoverChains(unittest.TestCase):
+    """Verdict-chain detection and the face-pair block structure."""
+
+    SRC = HEADER + """       01  WS-FLAGS.
+         05  WS-F1-FLG    PIC X.
+           88  F1-NOT-OK   VALUE '0'.
+           88  F1-BLANK    VALUE 'B'.
+         05  WS-F2-FLG    PIC X.
+           88  F2-NOT-OK   VALUE '0'.
+           88  F2-BLANK    VALUE 'B'.
+         05  WS-F3-FLG    PIC X.
+           88  F3-NOT-OK   VALUE '0'.
+           88  F3-BLANK    VALUE 'B'.
+         05  WS-F4-FLG    PIC X.
+           88  F4-NOT-OK   VALUE '0'.
+           88  F4-BLANK    VALUE 'B'.
+       01  WS-CUR         PIC S9(4).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           EVALUATE TRUE
+              WHEN F1-NOT-OK
+              WHEN F1-BLANK
+                  MOVE 1 TO WS-CUR
+              WHEN F2-NOT-OK
+              WHEN F2-BLANK
+                  MOVE 2 TO WS-CUR
+              WHEN F3-NOT-OK
+              WHEN F3-BLANK
+                  MOVE 3 TO WS-CUR
+              WHEN F4-NOT-OK
+              WHEN F4-BLANK
+                  MOVE 4 TO WS-CUR
+              WHEN OTHER
+                  MOVE 9 TO WS-CUR
+           END-EVALUATE
+           GOBACK.
+"""
+
+    def test_face_pairs_group_into_blocks(self):
+        from frameladder import cover, chain
+        prog = program(self.SRC)
+        index = chain._Index(prog)
+        chains = cover._find_chains(index, cycle_fields=frozenset())
+        self.assertEqual(len(chains), 1)
+        chain_info = chains[0]
+        self.assertEqual(len(chain_info["arms"]), 9)
+        # the two faces of one field share a body, so they share a block
+        self.assertEqual(len(chain_info["blocks"]), 5)
+        self.assertEqual([len(b) for b in chain_info["blocks"]],
+                         [2, 2, 2, 2, 1])
+
+    def test_mode_dispatchers_are_not_chains(self):
+        from frameladder import cover, chain
+        prog = program(self.SRC)
+        index = chain._Index(prog)
+        # with every flag parent carried across the task boundary the
+        # same EVALUATE is a mode dispatcher, not a verdict chain
+        cycle = frozenset({"WS-F1-FLG", "WS-F2-FLG", "WS-F3-FLG",
+                           "WS-F4-FLG"})
+        self.assertEqual(cover._find_chains(index, cycle_fields=cycle), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

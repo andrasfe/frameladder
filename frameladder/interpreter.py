@@ -2326,20 +2326,32 @@ class Interpreter:
             return
         out = []
         for operand, delimiter in pieces:
-            term = parse_term(operand.strip())
-            value = self.value_of(term)
-            body = "" if value is None else str(value)
-            if term.kind == "var" and not term.refmod and not term.func:
-                body = self._text_of(term.name, value)
-            upper = delimiter.upper()
-            if upper == "SIZE":
-                out.append(body)
-            elif upper in ("SPACE", "SPACES"):
-                out.append(body.split(" ")[0])
-            else:
-                stop = self.value_of(parse_term(delimiter))
-                stop = "" if stop is None else str(stop)
-                out.append(body.split(stop)[0] if stop else body)
+            # One DELIMITED phrase governs every operand listed before it:
+            # `STRING A B(1:2) DELIMITED BY SIZE` sends both A and the
+            # slice. Read as a single term, the pair parsed as nothing and
+            # the receiver stayed empty - so every 88 on a STRING-composed
+            # work field (a state+zip combo, an assembled key) was
+            # unsatisfiable however right the screen bytes were.
+            operands = re.findall(
+                r"'[^']*'|\"[^\"]*\"|FUNCTION\s+[A-Z0-9-]+\s*\([^)]*\)"
+                r"|[A-Z0-9][A-Z0-9-]*(?:\s+OF\s+[A-Z0-9-]+)?"
+                r"(?:\s*\([^)]*\))?|\S+",
+                operand.strip(), re.I)
+            for one in operands:
+                term = parse_term(one.strip())
+                value = self.value_of(term)
+                body = "" if value is None else str(value)
+                if term.kind == "var" and not term.refmod and not term.func:
+                    body = self._text_of(term.name, value)
+                upper = delimiter.upper()
+                if upper == "SIZE":
+                    out.append(body)
+                elif upper in ("SPACE", "SPACES"):
+                    out.append(body.split(" ")[0])
+                else:
+                    stop = self.value_of(parse_term(delimiter))
+                    stop = "" if stop is None else str(stop)
+                    out.append(body.split(stop)[0] if stop else body)
         name = target.split("(")[0].strip().upper()
         width = self._width(name)
         joined = "".join(out)
