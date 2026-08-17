@@ -2281,9 +2281,15 @@ def cmd_chain(args):
 
     facts_path = (args.out + ".facts.json") if args.out else None
     pools_path = (args.out + ".pools.json") if args.out else None
-    report = run_chain(program, goals=goals, budget=args.budget,
-                       baseline=baseline, epochs=args.epochs,
-                       facts_path=facts_path, pools_path=pools_path)
+    if getattr(args, "walk", False):
+        from .walk import run_walk
+        report = run_walk(program, goals=goals, budget=args.budget,
+                          baseline=baseline, facts_path=facts_path,
+                          pools_path=pools_path)
+    else:
+        report = run_chain(program, goals=goals, budget=args.budget,
+                           baseline=baseline, epochs=args.epochs,
+                           facts_path=facts_path, pools_path=pools_path)
     ledger = report.pop("ledger")
     report["program"] = program.name
     if args.out:
@@ -2305,6 +2311,9 @@ def cmd_chain(args):
         for reason, count in sorted(report["refusals"].items(),
                                     key=lambda kv: -kv[1]):
             print("  refused %-24s %d" % (reason, count))
+        for reason, count in sorted(report.get("hop_refusals", {}).items(),
+                                    key=lambda kv: -kv[1]):
+            print("  at a hop %-24s %d" % (reason, count))
     return 0
 
 
@@ -2567,6 +2576,10 @@ def build_parser():
                     help="solve-replay-learn cycles; each epoch consults "
                          "the facts and subgoals the previous one donated; "
                          "stops early when an epoch adds nothing")
+    ch.add_argument("--walk", action="store_true",
+                    help="use the single upstream-walking loop "
+                         "(frameladder.walk) instead of the jump-to-writer "
+                         "solver and its specials; no epochs")
     ch.add_argument("--out", metavar="FILE",
                     help="write credited witnesses as JSONL")
     ch.set_defaults(func=cmd_chain)

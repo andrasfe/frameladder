@@ -5504,3 +5504,112 @@ class TestSpoilFamily(unittest.TestCase):
         # no spoil ever equals the pass value it replaces
         for op, field, _kind, value in family:
             self.assertNotEqual(value, screen[op][field])
+
+
+class WalkLoopTest(unittest.TestCase):
+    """The single upstream-walking loop (`frameladder.walk`)."""
+
+    SOURCE = """
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. WALKT.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01  WS-IN        PIC X(2).
+       01  WS-FLAG      PIC X.
+           88  FLAG-ON      VALUE 'Y'.
+           88  FLAG-OFF     VALUE 'N'.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-PRODUCE THRU 1000-PRODUCE-EXIT
+           PERFORM 2000-DECIDE THRU 2000-DECIDE-EXIT
+           GOBACK.
+       1000-PRODUCE.
+           IF WS-IN EQUAL 'OK'
+              SET FLAG-ON       TO TRUE
+           ELSE
+              SET FLAG-OFF      TO TRUE
+           END-IF
+           .
+       1000-PRODUCE-EXIT.
+           EXIT.
+       2000-DECIDE.
+           IF FLAG-ON
+              CONTINUE
+           ELSE
+              CONTINUE
+           END-IF
+           .
+       2000-DECIDE-EXIT.
+           EXIT.
+"""
+
+    def test_route_is_execution_order_not_call_ancestry(self):
+        """A paragraph that merely runs earlier is a hop.
+
+        `1000-PRODUCE` never calls `2000-DECIDE`, so it is not on its call
+        chain - but it runs before it and writes the flag it decides on. A
+        walk that only climbed callers would never meet the writer.
+        """
+        from frameladder import walk
+        from frameladder.graph import build_graph
+        prog = program(self.SOURCE)
+        hops = walk.route_to(build_graph(prog), "0000-MAIN", "2000-DECIDE")
+        self.assertIn("1000-PRODUCE", hops)
+        self.assertIn("0000-MAIN", hops)
+        # nearest first: the sibling that just ran comes before the caller
+        self.assertLess(hops.index("1000-PRODUCE"), hops.index("0000-MAIN"))
+
+    def test_canonical_orders_every_mapping(self):
+        """Recipes are order-canonical, because COBOL storage overlaps.
+
+        The ledger freezes (and therefore sorts) what it stores, so a run
+        applying the same fields in another order is a different run and its
+        witness does not replay.
+        """
+        from frameladder import walk
+        plan = {"B": [{"set": {"Z": 1, "A": 2}}], "A": [{"set": {"Y": 3}}]}
+        out = walk._canonical(plan)
+        self.assertEqual(list(out), ["A", "B"])
+        self.assertEqual(list(out["B"][0]["set"]), ["A", "Z"])
+
+    def test_requirement_sets_are_measured_not_assumed(self):
+        """Every value in a satisfying set was observed to fire the goal."""
+        from frameladder import chain, walk
+        from frameladder.coverage import branches_of
+        prog = program(self.SOURCE)
+        index, (_g, prov) = chain._Index(prog), __import__(
+            "frameladder.ladder", fromlist=["analyse"]).analyse(prog)
+        branch = next(b for b in branches_of(prog)
+                      if b.paragraph == "1000-PRODUCE")
+        goal = (branch.paragraph, branch.ordinal, branch.kind, True)
+        cache: dict = {}
+        starts, _fired = walk.requirements_at_goal(
+            index, prov, goal, chain._Budget(600), cache)
+        self.assertTrue(starts)
+        fired = [state for state, _s, f in cache[goal[0]]["states"]
+                 if goal in f]
+        for R, _background, _staged in starts:
+            for name, wanted in R.items():
+                for value in wanted:
+                    self.assertTrue(
+                        any(walk._same(state.get(name), value)
+                            for state in fired),
+                        "%s=%r was never observed to fire" % (name, value))
+
+    def test_walk_witnesses_through_a_producer_and_replays(self):
+        """End to end: the loop reaches entry and every witness replays."""
+        from frameladder import chain, walk
+        prog = program(self.SOURCE)
+        report = walk.run_walk(prog, budget=2000)
+        ledger = report["ledger"]
+        decide = {k[3] for k in ledger.witnesses if k[0] == "2000-DECIDE"}
+        self.assertEqual(decide, {True, False})
+        self.assertNotIn("epochs", report)
+        for key, recipe in ledger.witnesses.items():
+            payload = recipe.payload()
+            interp = Interpreter(prog, dict(payload["input_state"]),
+                                 stubs=payload["stubs"] or None,
+                                 terminals=payload["terminals"] or None)
+            took = {chain._direction_key(g)
+                    for g in interp.run("0000-MAIN").guards}
+            self.assertIn(key, took, "recipe for %s does not replay" % (key,))
