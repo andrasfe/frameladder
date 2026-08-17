@@ -2308,6 +2308,61 @@ def cmd_chain(args):
     return 0
 
 
+def cmd_cover(args):
+    """Per-arm background construction, then the chain: the cover phase
+    builds one all-passing background per verdict chain and expresses
+    every arm's face against it; the chain run then works whatever the
+    construction left, starting from a baseline that already includes
+    the cover's witnesses. One merged JSONL out."""
+    import json as _json
+    program = _program(args)
+    from .chain import run_chain
+    from .cover import run_cover
+    from .ledger import Ledger
+
+    baseline = set()
+    if args.baseline:
+        for line in open(args.baseline):
+            if not line.strip():
+                continue
+            row = _json.loads(line)
+            baseline.add((row["paragraph"], row["ordinal"], row["kind"],
+                          row["direction"]))
+
+    cover_budget = args.cover_budget \
+        or min(int(args.budget * 0.4), 16000)
+    covered = run_cover(program, budget=cover_budget, baseline=baseline)
+    cover_ledger = covered["ledger"]
+    cover_report = covered["report"]
+
+    facts_path = (args.out + ".facts.json") if args.out else None
+    pools_path = (args.out + ".pools.json") if args.out else None
+    chain_budget = max(0, args.budget - cover_report.get("runs", 0))
+    report = run_chain(program, goals=None, budget=chain_budget,
+                       baseline=baseline | cover_ledger.covered(),
+                       epochs=args.epochs,
+                       facts_path=facts_path, pools_path=pools_path)
+    chain_ledger = report.pop("ledger")
+
+    merged = Ledger()
+    merged.witnesses.update(cover_ledger.witnesses)
+    for key, recipe in chain_ledger.witnesses.items():
+        merged.witnesses.setdefault(key, recipe)
+    report["program"] = program.name
+    report["cover"] = cover_report
+    report["witnessed_total"] = len(merged.witnesses)
+    if args.out:
+        merged.write(args.out, program.name)
+        report["written"] = args.out
+    if args.json:
+        print(_json.dumps(report, indent=1, default=str))
+    else:
+        print("%s: cover %d runs, chain %d runs, %d directions credited"
+              % (program.name, cover_report.get("runs", 0),
+                 report.get("runs", 0), len(merged.witnesses)))
+    return 0
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -2570,6 +2625,24 @@ def build_parser():
     ch.add_argument("--out", metavar="FILE",
                     help="write credited witnesses as JSONL")
     ch.set_defaults(func=cmd_chain)
+
+    cvr = sub.add_parser("cover", help="per-arm background construction "
+                                       "for first-match verdict chains, "
+                                       "then the chain on the residual")
+    cvr.add_argument("--baseline", metavar="JSONL",
+                     help="witnesses JSONL whose directions are already "
+                          "covered")
+    cvr.add_argument("--budget", type=int, default=8000, metavar="N",
+                     help="total interpreter runs, cover and chain "
+                          "together")
+    cvr.add_argument("--cover-budget", type=int, default=0, metavar="N",
+                     help="runs reserved for the cover phase (default: "
+                          "40%% of --budget, capped at 16000)")
+    cvr.add_argument("--epochs", type=int, default=3, metavar="N",
+                     help="chain solve-replay-learn cycles")
+    cvr.add_argument("--out", metavar="FILE",
+                     help="write credited witnesses as JSONL")
+    cvr.set_defaults(func=cmd_cover)
 
     dr = sub.add_parser("directions", help="how a harness's work list lands "
                                            "on this program's decisions")
