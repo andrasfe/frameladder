@@ -92,24 +92,67 @@ because the run lands in the next loop with the same root cause.
 Baseline A is a from-entry sampler (entry states from the program's own
 literal pool, every I/O world, standard ledger): **171 directions in 36
 seconds**. The full battery, for comparison, credited **141 after 50
-minutes** and was still in its first phase — per-direction planning does
+minutes** and was still in its first phase - per-direction planning does
 not earn its cost on a program of this size.
 
-The bridge over 14 stuck pairs, sweep only (12 reported; two pairs with
-very large closures had not finished fuzzing within the hour, so every
-figure below is a floor):
+The bridge over **296 pairs**, one per paragraph holding uncovered
+directions, each paired with the prior paragraph writing the most of what
+its guards read:
 
-- **236 directions driven**, verified by real execution of both paragraphs
-- **236 of 236 absent from A** — these paragraphs are unreachable from
-  entry at all
-- 27 distinct paragraphs touched
-- **244/244 independently reproduced** from the stored rows alone, by a
-  fresh interpreter that consults none of the generator's bookkeeping
+| | directions | of 3,386 |
+|---|---|---|
+| from-entry sampler (A) | 171 | 5.05% |
+| bridge (B) | 1,693 | 50.00% |
+| A ∪ B | **1,864** | **55.05%** |
+| ∪ stitched walk (below) | **1,944** | **57.41%** |
 
-So the bridge more than doubles the verified-direction count (171 → 407,
-5.0% → 12.0%), and every direction it adds is one no from-entry run
-reaches. As a per-paragraph test-input generator it works; as a source of
-whole-program witnesses it is capped by §3, not by method.
+Paragraphs holding at least one covered direction: **399 of 441 (90.5%)**,
+against the 53 a from-entry run even enters.
+
+**Every one of the 4,326 bridged claims reproduced independently** - each
+rebuilt from its stored row by a fresh interpreter consulting none of the
+generator's bookkeeping. (4,326 counts every claim; 1,693 is the
+deduplicated union, since a direction recurs across overlapping closures.)
+
+All 4,326 were credited by the **sweep**. Across the whole run the inverse
+model and the per-goal search contributed nothing at all; see §5.
+
+### What this coverage is, and is not
+
+Two different claims are being added together, and conflating them would
+overstate the result:
+
+- **171 directions have from-entry witnesses** - a complete recipe that
+  drives the direction when the whole program runs from its entry point.
+- **1,693 are bridged**: an input state for paragraph P such that running
+  P and handing its post-state to paragraph N drives the direction. Both
+  executions are real and reproducible, but execution *starts mid-program*
+  at P. Nothing shows that state is reachable from entry.
+
+The second is a per-paragraph test input, not a program-level one. It is
+the honest ceiling for this program: **92.7% of directions live in
+paragraphs a from-entry run never enters**, because of §3.
+
+### Stitching: paragraphs in order, carrying state
+
+A single from-entry run dies where one paragraph traps, and takes the
+whole program with it. Running paragraph by paragraph in source order and
+carrying the state forward changes what a trap costs - it ends that
+paragraph's segment, and the walk continues.
+
+**1,090 directions (32.19%) in 52 seconds**, entering 1,033 of 1,035
+paragraphs. It converges immediately: pass 1 adds 1,074, pass 2 adds 14,
+pass 3 adds 2.
+
+Per unit of compute that is roughly a hundred times the bridge's yield,
+and the two are complementary rather than redundant: the walk finds 111
+directions the 296-pair fleet never did, the fleet holds 780 the walk
+misses. The walk gives every paragraph one *realistic* accumulated state;
+the bridge gives one paragraph thousands of deliberately varied ones.
+
+Same caveat as the bridge: each hop starts a fresh interpreter with
+carried state, so this is a plausible execution history, not a proven
+reachable one.
 
 ### Seeding the producer from the consumer
 
