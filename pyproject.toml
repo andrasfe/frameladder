@@ -5,6 +5,9 @@ description = "Derive inputs that reach a deep target by lifting its obligations
 requires-python = ">=3.9"
 dependencies = []
 
+[project.optional-dependencies]
+learn = ["numpy", "scikit-learn"]
+
 [project.scripts]
 frameladder = "frameladder.cli:main"
 

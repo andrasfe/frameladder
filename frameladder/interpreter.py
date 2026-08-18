@@ -42,6 +42,7 @@ def _decimals(spec: str) -> int:
 # generous ceiling only means a non-terminating plan burns
 # seconds before saying so.
 MAX_STEPS = 20_000
+STEPS_PER_STATEMENT = 8      # the floor above scales by program size
 MAX_DEPTH = 64
 MAX_LOOP = 200
 RUNAWAY = 400        # one paragraph running this often is a loop, not progress
@@ -470,13 +471,75 @@ class GuardEvent:
     origins: dict = field(default_factory=dict)
 
 
+class _GuardLog(list):
+    """The guard events, and the distinct directions among them.
+
+    A plain list would have to be re-scanned to answer "has this run taken
+    anything new lately", which the runaway detector asks on every
+    paragraph entry. Keeping the set here means every site that appends a
+    guard event maintains it, including the ones added later.
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.directions: set = set()
+        for event in self:
+            self._note(event)
+
+    def _note(self, event) -> None:
+        self.directions.add((getattr(event, "paragraph", None),
+                             getattr(event, "ordinal", -1),
+                             getattr(event, "kind", ""),
+                             bool(getattr(event, "result", False))))
+
+    def append(self, event) -> None:
+        super().append(event)
+        self._note(event)
+
+    def extend(self, events) -> None:
+        events = list(events)
+        super().extend(events)
+        for event in events:
+            self._note(event)
+
+
+def _statement_count(program) -> int:
+    """Statements in the whole program, nested ones included.
+
+    Cached on the program itself: the count is a property of the source and
+    every run of the same program would otherwise re-walk the whole tree.
+
+    Not keyed on ``id(program)`` in a module-level dict, which is what this
+    did first. CPython reuses the address of a collected object, so a fresh
+    program could be handed a dead one's count - a suite that builds many
+    small programs then failed intermittently, on whichever test happened
+    to land on a recycled address.
+    """
+    cached = getattr(program, "_fl_statements", None)
+    if cached is not None:
+        return cached
+    total = 0
+    stack = [stmt for para in program.paragraphs
+             for stmt in para.get("statements", [])]
+    while stack:
+        stmt = stack.pop()
+        total += 1
+        stack.extend(stmt.get("children") or [])
+    try:
+        program._fl_statements = total
+    except Exception:                                        # noqa: BLE001
+        pass                      # a program type that forbids attributes
+    return total
+
+
 @dataclass
 class Trace:
     entered: list = field(default_factory=list)
-    guards: list = field(default_factory=list)
+    guards: list = field(default_factory=lambda: _GuardLog())
     steps: int = 0
     stopped: str = ""
     runaway: str = ""
+    exhausted: bool = False        # the step cap ended it, not the program
     approximations: list = field(default_factory=list)
 
     @property
@@ -501,6 +564,15 @@ class Interpreter:
                  sequential: bool = True, track_origins: bool = False):
         self.program = program
         self.model = program.model
+        # A fixed step budget is a budget per *program size*: 20,000 steps
+        # is a whole run of a 500-line program and half a mainline pass of a
+        # 35,000-line one, where it truncated the trace before the batch had
+        # finished its first control group. Scaled by the statement count it
+        # means the same thing everywhere, and `max` keeps every smaller
+        # program on exactly the budget it had. The runaway detector, not
+        # this cap, is what stops a genuine loop.
+        self.max_steps = max(MAX_STEPS, STEPS_PER_STATEMENT
+                             * _statement_count(program))
         # The layout is a property of the data division, so it is computed
         # once per program and shared; only the bytes belong to this run.
         from .storage import ByteMemory, FieldMap, layout_of
@@ -550,6 +622,9 @@ class Interpreter:
         self._delivered: dict = {}
         self._selector_cache: dict = {}
         self._visits: dict = {}
+        # What the distinct-direction counter held at each paragraph's
+        # last visit: the runaway detector's definition of progress.
+        self._marks: dict = {}
         self._layouts: dict = {}
         self.calls: dict = {}
         # ALTER rewrites another paragraph's GO TO at run time. A dispatcher
@@ -1283,9 +1358,12 @@ class Interpreter:
                 return True
             except _Stop:
                 if not self.trace.stopped:
-                    self.trace.stopped = ("runaway loop in %s" % self.trace.runaway
-                                          if self.trace.runaway
-                                          else "STOP RUN / GOBACK")
+                    self.trace.stopped = (
+                        "runaway loop in %s" % self.trace.runaway
+                        if self.trace.runaway
+                        else "step limit (%d) reached" % self.max_steps
+                        if self.trace.exhausted
+                        else "STOP RUN / GOBACK")
                 return False
             except _Goto as jump:
                 if jump.target in self._names:
@@ -1307,7 +1385,26 @@ class Interpreter:
         actual finding, which is that one paragraph ran thousands of times -
         usually a read loop with no end-of-file, or an abend handler that
         returns. Naming it turns a timeout into a diagnosis.
+
+        What makes it a runaway is *repetition without progress*, not the
+        repetition alone. Counted cumulatively over the whole run, any
+        paragraph a batch program performs per record trips the limit as a
+        matter of course: a shared date-conversion error handler, called
+        once per conversion and interleaved with fresh work every time,
+        ended a 35,000-line program's only run after 400 legitimate calls
+        and left 90% of the program unentered. So the count resets whenever
+        the run has reached somewhere new since this paragraph's last
+        visit, and only a paragraph re-entered ``RUNAWAY`` times while the
+        run learns nothing is stopped.
         """
+        # Progress is a *new direction taken*, not a new paragraph
+        # entered: once every date-conversion paragraph has been visited
+        # once, further calls enter nothing new while still doing real,
+        # differently-branching work.
+        reached = len(getattr(self.trace.guards, "directions", ()))
+        if self._marks.get(name) != reached:
+            self._marks[name] = reached
+            self._visits[name] = 0
         self._visits[name] = self._visits.get(name, 0) + 1
         if self._visits[name] > RUNAWAY:
             self.trace.runaway = name
@@ -1328,6 +1425,17 @@ class Interpreter:
         if not end or end not in self._names or start not in self._names:
             para = self.program.paragraph(start)
             if para is None:
+                # A target the program performs but this source does not
+                # define. Returning silently is indistinguishable from a
+                # paragraph that ran and did nothing, and the difference
+                # decides whether a result is trustworthy: on one 35k-line
+                # AST, 28 such paragraphs were missing across 162 sites,
+                # and the absent one behind 31 of them was the date
+                # converter every downstream guard tests - so every
+                # conversion "failed" and the mainline never got past it.
+                note = "performed but not defined: %s" % start
+                if note not in self.trace.approximations:
+                    self.trace.approximations.append(note)
                 return
             self.trace.entered.append(start)
             self._tick(start)
@@ -1367,7 +1475,13 @@ class Interpreter:
 
     def step(self, stmt, para: str, depth: int) -> None:
         self.trace.steps += 1
-        if self.trace.steps > MAX_STEPS:
+        if self.trace.steps > self.max_steps:
+            # Distinct from a clean GOBACK on purpose. Both used to land in
+            # `stopped` as "STOP RUN / GOBACK", so a run truncated halfway
+            # read exactly like one that finished - and on a large program,
+            # where the cap is the common ending, that silently understated
+            # every trace that followed.
+            self.trace.exhausted = True
             raise _Stop()
         kind = stmt.get("type", "")
         attrs = stmt.get("attributes", {})

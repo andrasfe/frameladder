@@ -103,6 +103,23 @@ class _Index:
         self._live: dict = {}
         self._width: dict = {}
         self._closure: dict = {}
+        self._declares = None
+
+    @property
+    def declares_anything(self) -> bool:
+        """Whether the data division is available at all.
+
+        A pre-parsed AST may arrive without one. Everything keyed on a
+        declared width then reads as "width 0", which is indistinguishable
+        from "not a field" - and a filter that drops unknown-width names
+        silently discards every variable in the program. Judging nothing
+        must mean no evidence, never evidence against.
+        """
+        if self._declares is None:
+            model = self.model
+            self._declares = bool(getattr(model, "pic", None)
+                                  or getattr(model, "declared", None))
+        return self._declares
 
     def width(self, name: str) -> int:
         key = str(name).upper()
@@ -263,7 +280,7 @@ def _guard_evidence(index, members) -> dict:
                         parent = str(entry[0]).upper()
                         note_88(parent, list(entry[1] or []))
                         continue
-                    if not index.width(name):
+                    if index.declares_anything and not index.width(name):
                         continue
                     rhs = getattr(other, "value", None)
                     if isinstance(rhs, str) and rhs.upper() in (
