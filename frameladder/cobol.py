@@ -1347,6 +1347,97 @@ def find_copybooks(source: str) -> list:
     return found
 
 
+_WHEN_TEXT = re.compile(r"^(?:WHEN\s+)+", re.I)
+
+
+def _reparse_attributes(stmt: dict):
+    """Attributes re-derived from a statement's own text, or None.
+
+    An AST producer may type a statement correctly and still record none
+    of what it says: in one 35k-line program every ``SET``, ``WHEN``,
+    ``GO TO ... DEPENDING`` and ``SEARCH`` arrived with an empty attribute
+    map. The handlers read attributes, so each was a silent no-op - 128
+    ``SET``s that never set a flag, 41 ``WHEN`` arms that compared against
+    the empty string. Re-parsing the text through this module's own parser
+    keeps one definition of what a statement means, rather than a second
+    approximate one living in the adoption layer.
+
+    Only ever *adds* what was missing: a statement that already carries
+    attributes is left alone, and a re-parse that disagrees about the
+    statement's type is discarded.
+    """
+    text = " ".join(str(stmt.get("text") or "").split())
+    kind = stmt.get("type")
+    if not text or not kind:
+        return None
+    if kind == "WHEN":
+        # A WHEN arm parses only inside its EVALUATE, and its text may
+        # repeat the keyword the producer already consumed.
+        value = _WHEN_TEXT.sub("", text).strip()
+        return {"value": value} if value else None
+    try:
+        parsed = _Parser(tokenize([Line(stmt.get("line_start", 0) or 0,
+                                        text)])).statements(set())
+    except Exception:                                        # noqa: BLE001
+        return None
+    if not parsed or parsed[0].get("type") != kind:
+        return None
+    return parsed[0].get("attributes") or None
+
+
+def _adopt_ast(paragraphs: list) -> list:
+    """Bring a pre-parsed AST to the shape the parser itself produces.
+
+    Two gaps, both silent when left open. Some AST producers write
+    ``PERFORM A THRU B`` as its own statement type, ``PERFORM_THRU``, with
+    the range in ``attributes.target``/``attributes.thru`` - but every
+    consumer here (interpreter, graph, closures) matches ``PERFORM`` with
+    the range in the target text, so the unrecognised type executes as a
+    no-op and the program's callees never run: a 1,035-paragraph batch
+    program measured 2 reachable. And such ASTs carry no ordinals, so
+    every decision of a kind in a paragraph collapses onto one coverage
+    key (the same failure `_stamp_ordinals` exists to prevent on COPY
+    expansion).
+    """
+    def adopt(stmt: dict) -> None:
+        if not (stmt.get("attributes") or {}) and stmt.get("text"):
+            recovered = _reparse_attributes(stmt)
+            if recovered:
+                stmt["attributes"] = recovered
+        if stmt.get("type") == "PERFORM_THRU":
+            stmt["type"] = "PERFORM"
+            attrs = stmt.get("attributes") or {}
+            target = (attrs.get("target") or "").strip()
+            thru = (attrs.pop("thru", "") or "").strip()
+            if thru:
+                attrs["target"] = target + " THRU " + thru
+            condition = attrs.get("condition")
+            if condition:
+                # An inline `*>` comment swallowed into the clause text
+                # runs to what was the end of its source line; the clause
+                # resumes at the next connective. Best effort - a comment
+                # containing OR/AND would survive, none measured did.
+                condition = re.sub(r"\*>.*?(?=\bOR\b|\bAND\b|$)", " ",
+                                   condition, flags=re.I | re.S)
+                condition = condition.strip()
+                m = re.match(r"(?:WITH\s+)?TEST\s+AFTER\s+", condition, re.I)
+                if m:
+                    attrs["test_after"] = True
+                    condition = condition[m.end():]
+                condition = re.sub(r"^UNTIL\s+", "", condition, flags=re.I)
+                attrs["condition"] = " ".join(condition.split())
+            stmt["attributes"] = attrs
+        for child in stmt.get("children") or []:
+            adopt(child)
+
+    for para in paragraphs:
+        statements = para.get("statements") or []
+        for stmt in statements:
+            adopt(stmt)
+        _stamp_ordinals(statements)
+    return paragraphs
+
+
 def load_program(path: str, copybooks: str | None = None) -> Program:
     """Load COBOL source, or a pre-parsed cobalt AST, into one shape."""
     model = DataModel()
@@ -1354,7 +1445,7 @@ def load_program(path: str, copybooks: str | None = None) -> Program:
         with open(path, "r", errors="replace") as fh:
             raw = json.load(fh)
         program = Program(raw.get("program_id", os.path.basename(path)),
-                          raw["paragraphs"], model, path)
+                          _adopt_ast(raw["paragraphs"]), model, path)
         sibling = re.sub(r"\.(cbl\.)?ast$", "", path, flags=re.I)
         for candidate in (sibling, sibling + ".cbl", sibling + ".CBL"):
             if os.path.isfile(candidate) and not candidate.endswith(".ast"):

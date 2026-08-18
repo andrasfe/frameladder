@@ -1880,6 +1880,38 @@ def cmd_export(args):
     return _emit(payload, args.json, render)
 
 
+def _heartbeat(args):
+    """A stderr line every ``--progress`` seconds, for runs that take hours.
+
+    The battery writes nothing until it finishes, so on a large program its
+    silence is indistinguishable from a hang - and the decision an operator
+    actually faces (wait, or kill it and cut the budget) needs the phase and
+    the rate, not a spinner. Time-based rather than count-based: a phase slow
+    enough to matter still reports, and a fast one does not flood.
+    """
+    import time
+    every = getattr(args, "progress", 0) or 0
+    start = time.time()
+    last = [0.0]
+
+    def tick(phase, done=None, total=None, witnessed=None, force=False,
+             unit="directions"):
+        if not every:
+            return
+        now = time.time()
+        if not force and now - last[0] < every:
+            return
+        last[0] = now
+        parts = ["[%7.1fm] %-22s" % ((now - start) / 60.0, phase)]
+        if total:
+            parts.append("%6d/%-6d (%4.1f%%)"
+                         % (done or 0, total, 100.0 * (done or 0) / total))
+        if witnessed is not None:
+            parts.append("%5d %s" % (witnessed, unit))
+        print("  ".join(parts), file=sys.stderr, flush=True)
+    return tick
+
+
 def cmd_witnesses(args):
     """Harvest a witness per direction from every run the battery makes.
 
@@ -1934,7 +1966,12 @@ def cmd_witnesses(args):
     #    each plan derived is kept: the staged-stub phase re-uses it as a base
     #    when the plan got near its branch but the outside world said no.
     plan_recipes: dict = {}
-    for branch in branches_of(program):
+    tick = _heartbeat(args)
+    all_branches = branches_of(program)
+    tick("start: %d directions" % total, force=True)
+    for position, branch in enumerate(all_branches):
+        tick("1 branch plans", position, len(all_branches),
+             len(ledger.witnesses))
         for direction in (True, False):
             try:
                 plan = plan_for_branch(program, branch.paragraph, branch.line,
@@ -1963,7 +2000,10 @@ def cmd_witnesses(args):
     #     one program the branch battery alone was 12 directions short of
     #     what these add.
     from .ladder import build_plan
-    for target in program.paragraph_names[1:]:
+    targets = program.paragraph_names[1:]
+    for position, target in enumerate(targets):
+        tick("1.2 paragraph plans", position, len(targets),
+             len(ledger.witnesses))
         try:
             plan = build_plan(program, target, entry=args.entry)
         except Exception:                                    # noqa: BLE001
@@ -1987,6 +2027,7 @@ def cmd_witnesses(args):
     _rng = _random.Random(args.seed)
     from .conformance_defaults import WORLDS as _W
     for index in range(args.sample):
+        tick("1.5 sampling", index, args.sample, len(ledger.witnesses))
         state = {n: _rng.choice(v) for n, v in overlay_pool.items()}
         run(state, _W[index % len(_W)], None, None, "sample:%d" % index)
 
@@ -1997,7 +2038,9 @@ def cmd_witnesses(args):
     from .reentry import reentry_states, resp_fault_worlds
     worlds = sequence_worlds(program, prov, prov.literals) +         fault_worlds(program, prov, prov.literals) + \
         resp_fault_worlds(program, overlay_pool)
-    for spec in worlds:
+    for position, spec in enumerate(worlds):
+        tick("2 outside worlds", position, len(worlds),
+             len(ledger.witnesses))
         states = [{}] + [{n: _rng_choice(v, args.seed + i) for n, v in
                           overlay_pool.items()}
                          for i in range(max(0, args.overlays))]
@@ -2017,8 +2060,10 @@ def cmd_witnesses(args):
     #     the file and RESP faults are actually tested. Before the stub and
     #     frontier phases on purpose: a second-cycle recipe is a base the
     #     stub search can stage against and a seed the lift can extend.
-    for index, (name, state) in enumerate(
-            reentry_states(program, overlay_pool, draws=args.overlays)):
+    entries = list(reentry_states(program, overlay_pool,
+                                  draws=args.overlays))
+    for index, (name, state) in enumerate(entries):
+        tick("2.2 re-entry", index, len(entries), len(ledger.witnesses))
         for world in WORLDS:
             run(state, world, {}, {}, "reentry:%s" % name)
         # The outside worlds multiply, so only the completed-screen states
@@ -2040,6 +2085,7 @@ def cmd_witnesses(args):
     #     is a new base recipe for a deeper stub-gated one.
     stub_report = None
     if args.stub_search:
+        tick("2.5 stub search", witnessed=len(ledger.witnesses), force=True)
         from .stubsearch import search as _stub_search
         stub_report = _stub_search(program, prov, graph, ledger, run,
                                    budget=args.stub_search,
@@ -2060,6 +2106,7 @@ def cmd_witnesses(args):
     #    absorbed.
     lift_report = None
     if args.lift:
+        tick("3 frontier lift", witnessed=len(ledger.witnesses), force=True)
         from .lift import direction_key, lift as _lift
         repro = {"recipes": 0, "recipes_exact": 0,
                  "directions_attempted": 0, "directions_reproduced": 0}
@@ -2363,6 +2410,98 @@ def cmd_cover(args):
     return 0
 
 
+def cmd_bridge(args):
+    """Fuzz one paragraph massively, learn its inverse, feed the next.
+
+    A separate component: the stuck paragraph and its successor in, a
+    table of machine-verified pass-values, an optional learned inverse,
+    and per-goal bridged facts (or named refusals) out. With --to-entry
+    the bridged facts seed a chain run so the walk can carry them to
+    program entry and credit real witnesses."""
+    import json as _json
+    program = _program(args)
+    from .bridge import run_bridge
+
+    baseline = set()
+    if args.baseline:
+        for line in open(args.baseline):
+            if not line.strip():
+                continue
+            row = _json.loads(line)
+            baseline.add((row["paragraph"], row["ordinal"], row["kind"],
+                          row["direction"]))
+
+    base_state = None
+    if args.defaults:
+        base_state = {str(k).upper(): v
+                      for k, v in _json.load(open(args.defaults)).items()}
+
+    table_path = (args.out + ".table.jsonl") if args.out else None
+    report = run_bridge(program, args.current, args.next, baseline=baseline,
+                        runs=args.runs, seed=args.seed, budget=args.budget,
+                        use_model=not args.no_model, base_state=base_state,
+                        table_path=table_path, progress=_heartbeat(args),
+                        search_goals=args.search_goals,
+                        max_seconds=args.max_seconds,
+                        seed_from_consumer=args.seed_from_consumer,
+                        model_hidden=tuple(
+                            int(n) for n in args.model_hidden.split(",")
+                            if n.strip()),
+                        model_iter=args.model_iter,
+                        model_fields=args.model_fields,
+                        proposals=args.proposals,
+                        verify_cap=args.verify_cap)
+    facts = report.pop("facts")
+    results = report.pop("results")
+    if args.out:
+        with open(args.out, "w") as handle:
+            for row in results:
+                handle.write(_json.dumps(row, default=str) + "\n")
+        facts_path = args.out + ".facts.json"
+        with open(facts_path, "w") as handle:
+            _json.dump(facts, handle, indent=1, default=str)
+        report["written"] = args.out
+        if args.to_entry:
+            from .chain import run_chain
+            # Only the directions the bridge actually demonstrated are worth
+            # walking: those are the ones its facts can help with. Left at
+            # every direction in the program, the walk spends its whole
+            # budget on goals no fact in this file speaks to.
+            reached = [tuple(row["goal"]) for row in results
+                       if row.get("outcome") == "bridged"]
+            reached = [(p, int(o), k, bool(d)) for p, o, k, d in reached]
+            chained = run_chain(program, goals=reached or None,
+                                budget=args.budget,
+                                baseline=baseline, facts_path=facts_path)
+            ledger = chained.pop("ledger")
+            ledger.write(args.out + ".witnesses.jsonl", program.name)
+            report["to_entry"] = {
+                "witnessed": chained["witnessed"],
+                "credited_directions": chained["credited_directions"],
+                "written": args.out + ".witnesses.jsonl"}
+    if args.json:
+        print(_json.dumps(report, indent=1, default=str))
+    else:
+        print("%s: %s -> %s, %d fuzz rows (%d signatures), model %s"
+              % (program.name, report["current"], report["next"],
+                 report["fuzz_rows"], report["distinct_signatures"],
+                 report["model"]))
+        print("  %d goals, %d swept states, %d bridged "
+              "(%d sweep, %d direct, %d via model)"
+              % (report["goals"], report["swept_states"], report["bridged"],
+                 report["bridged_sweep"], report["bridged_direct"],
+                 report["bridged_model"]))
+        for reason, count in sorted(report["refusals"].items(),
+                                    key=lambda kv: -kv[1]):
+            print("  refused %-24s %d" % (reason, count))
+        if "to_entry" in report:
+            print("  to entry: %d witnessed, %d directions credited -> %s"
+                  % (report["to_entry"]["witnessed"],
+                     report["to_entry"]["credited_directions"],
+                     report["to_entry"]["written"]))
+    return 0
+
+
 def cmd_bind(args):
     journal = Journal(args.work_dir)
     if not args.work_dir:
@@ -2599,6 +2738,11 @@ def build_parser():
                          "returns each code the arms name, at one position "
                          "in its series, over a run that already got near; "
                          "0 disables")
+    wt.add_argument("--progress", type=int, default=0, metavar="SECONDS",
+                    help="print a phase/position heartbeat to stderr no more "
+                         "often than every SECONDS; 0 is silent. The battery "
+                         "writes nothing until it finishes, so on a large "
+                         "program this is the only sign it is alive")
     wt.add_argument("--proxy", nargs="?", const="status",
                     choices=["status", "outputs"])
     wt.add_argument("--minimize", type=int, default=None, metavar="N",
@@ -2683,6 +2827,81 @@ def build_parser():
                     help="seed for the overlay draws, so a candidate's input "
                          "state is the same on every run")
     ex.set_defaults(func=cmd_export, precheck=True, worlds=True)
+
+    br = sub.add_parser("bridge", help="fuzz one paragraph massively, learn "
+                                       "its inverse, and try everything it "
+                                       "was seen to produce as input to the "
+                                       "next paragraph")
+    br.add_argument("current", metavar="CURRENT-PARA",
+                    help="the stuck paragraph, fuzzed in isolation")
+    br.add_argument("next", metavar="NEXT-PARA",
+                    help="the paragraph the outputs are offered to")
+    br.add_argument("--baseline", metavar="JSONL",
+                    help="witnesses JSONL whose directions are already "
+                         "covered; the work list is what the next "
+                         "paragraph's closure lacks")
+    br.add_argument("--runs", type=int, default=20000, metavar="N",
+                    help="fuzz budget for the current paragraph's closure")
+    br.add_argument("--budget", type=int, default=8000, metavar="N",
+                    help="interpreter runs for the goal-solving and "
+                         "verification stages")
+    br.add_argument("--seed", type=int, default=7,
+                    help="fuzz and model seed, so a run is reproducible")
+    br.add_argument("--no-model", action="store_true",
+                    help="skip the learned inverse; direct table matching "
+                         "only - the attribution arm")
+    br.add_argument("--defaults", metavar="FILE.json",
+                    help="JSON of variable -> initial value applied under "
+                         "every run, for programs whose data division is "
+                         "not available")
+    br.add_argument("--to-entry", action="store_true", dest="to_entry",
+                    help="hand the bridged facts to a chain run so the "
+                         "walk carries them to program entry and credits "
+                         "real witnesses")
+    br.add_argument("--search-goals", type=int, default=40, metavar="N",
+                    dest="search_goals",
+                    help="goals the per-goal search stage attempts after "
+                         "the sweep; one solve builds a whole closure's "
+                         "attempt set, so this is the expensive half. What "
+                         "the cap drops is reported as a named refusal, "
+                         "never dropped silently; 0 disables the stage")
+    br.add_argument("--max-seconds", type=int, default=0, metavar="N",
+                    dest="max_seconds",
+                    help="wall-clock budget for the fuzz and sweep stages. "
+                         "Per-run execution cost varies thirtyfold across "
+                         "closures, so a run count is a poor unit of cost "
+                         "and a fixed one leaves slow paragraphs producing "
+                         "nothing at all; 0 is unbounded")
+    br.add_argument("--seed-from-consumer", action="store_true",
+                    dest="seed_from_consumer",
+                    help="add the next paragraph's compared literals to the "
+                         "current paragraph's fuzz pools, aiming the fuzz at "
+                         "values the consumer distinguishes; producers "
+                         "routinely move an input straight through")
+    br.add_argument("--model-hidden", default="64", metavar="A,B",
+                    dest="model_hidden",
+                    help="hidden layer sizes of the inverse model, comma "
+                         "separated (default 64)")
+    br.add_argument("--model-iter", type=int, default=300, metavar="N",
+                    dest="model_iter",
+                    help="training iterations for the inverse model")
+    br.add_argument("--model-fields", type=int, default=24, metavar="N",
+                    dest="model_fields",
+                    help="fields encoded, and models fitted, at most")
+    br.add_argument("--proposals", type=int, default=24, metavar="N",
+                    help="candidate input states the model proposes per goal")
+    br.add_argument("--verify-cap", type=int, default=40, metavar="N",
+                    dest="verify_cap",
+                    help="candidates actually executed per goal, table "
+                         "matches and model proposals together")
+    br.add_argument("--progress", type=int, default=0, metavar="SECONDS",
+                    help="print a phase heartbeat to stderr no more often "
+                         "than every SECONDS; 0 is silent")
+    br.add_argument("--out", metavar="FILE",
+                    help="write per-goal results as JSONL (plus .table.jsonl"
+                         ", .facts.json, and with --to-entry "
+                         ".witnesses.jsonl)")
+    br.set_defaults(func=cmd_bridge)
 
     b = sub.add_parser("bind", help="record a decision the agent made")
     b.add_argument("--bind", action="append", required=True, metavar="VAR=VALUE")

@@ -5610,5 +5610,478 @@ class TestCoverChains(unittest.TestCase):
         self.assertEqual(cover._find_chains(index, cycle_fields=cycle), [])
 
 
+class TestAstAdoption(unittest.TestCase):
+    """A pre-parsed AST whose calls are ``PERFORM_THRU`` statements.
+
+    Unrecognised, the type executes as a no-op: the callees never run,
+    the graph has no edges, and the closure is one paragraph deep - a
+    1,035-paragraph program measured 2 reachable before adoption.
+    """
+
+    def ast(self, paragraphs):
+        import json
+        handle = tempfile.NamedTemporaryFile("w", suffix=".ast", delete=False)
+        json.dump({"program_id": "T", "paragraphs": paragraphs}, handle)
+        handle.close()
+        return cobol.load_program(handle.name)
+
+    def stmt(self, kind, text="", **attrs):
+        return {"type": kind, "text": text, "line_start": 1, "line_end": 1,
+                "attributes": attrs, "children": []}
+
+    def range_program(self):
+        return self.ast([
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 2,
+             "statements": [
+                 self.stmt("PERFORM_THRU", target="1000-WORK",
+                           thru="1000-EXIT"),
+                 self.stmt("GOBACK")]},
+            {"name": "1000-WORK", "line_start": 3, "line_end": 4,
+             "statements": [
+                 self.stmt("IF", condition="WS-FLAG = 'Y'")]},
+            {"name": "1000-MIDDLE", "line_start": 5, "line_end": 6,
+             "statements": [
+                 self.stmt("IF", condition="WS-FLAG = 'N'")]},
+            {"name": "1000-EXIT", "line_start": 7, "line_end": 7,
+             "statements": [self.stmt("EXIT")]},
+        ])
+
+    def test_perform_thru_becomes_a_range_perform(self):
+        prog = self.range_program()
+        stmt = prog.paragraph("0000-MAIN")["statements"][0]
+        self.assertEqual(stmt["type"], "PERFORM")
+        self.assertEqual(stmt["attributes"]["target"],
+                         "1000-WORK THRU 1000-EXIT")
+
+    def test_the_interpreter_runs_the_whole_range(self):
+        prog = self.range_program()
+        trace = Interpreter(prog, {}).run("0000-MAIN")
+        # the middle of the range is where the interesting code usually is
+        self.assertIn("1000-MIDDLE", trace.entered)
+        self.assertEqual(len(trace.guards), 2)
+
+    def test_the_closure_holds_the_whole_range(self):
+        from frameladder import chain
+        prog = self.range_program()
+        members = chain._Index(prog).closure("0000-MAIN")
+        self.assertIn("1000-MIDDLE", members)
+        self.assertIn("1000-EXIT", members)
+
+    def test_ordinals_are_stamped(self):
+        prog = self.range_program()
+        for para in prog.paragraphs:
+            self.assertTrue(all("ordinal" in s for s in para["statements"]))
+        ords = [s["ordinal"]
+                for s in prog.paragraph("1000-WORK")["statements"]]
+        self.assertEqual(ords, sorted(set(ords)))
+
+    def test_until_prefix_and_inline_comment_are_stripped(self):
+        prog = self.ast([
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 2,
+             "statements": [
+                 self.stmt("PERFORM_THRU", target="1000-WORK",
+                           thru="1000-EXIT",
+                           condition="UNTIL WS-A NOT LESS WS-B "
+                                     "*> a swallowed comment "
+                                     "OR WS-EOF EQUAL 1")]},
+            {"name": "1000-WORK", "line_start": 3, "line_end": 3,
+             "statements": [self.stmt("EXIT")]},
+            {"name": "1000-EXIT", "line_start": 4, "line_end": 4,
+             "statements": [self.stmt("EXIT")]},
+        ])
+        attrs = prog.paragraph("0000-MAIN")["statements"][0]["attributes"]
+        self.assertEqual(attrs["condition"],
+                         "WS-A NOT LESS WS-B OR WS-EOF EQUAL 1")
+
+    def test_an_attributeless_set_is_recovered_from_its_text(self):
+        # 128 SETs arrived with an empty attribute map on one program; the
+        # handler reads attributes, so every one of them set nothing
+        prog = self.ast([
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 1,
+             "statements": [
+                 {"type": "SET", "text": "SET WS-DONE TO TRUE",
+                  "line_start": 1, "line_end": 1, "attributes": {},
+                  "children": []}]},
+        ])
+        attrs = prog.paragraph("0000-MAIN")["statements"][0]["attributes"]
+        self.assertEqual(attrs.get("names"), ["WS-DONE"])
+        self.assertEqual(attrs.get("value"), "TRUE")
+
+    def test_a_when_arm_recovers_its_value(self):
+        prog = self.ast([
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 3,
+             "statements": [
+                 {"type": "EVALUATE", "text": "EVALUATE WS-CODE",
+                  "line_start": 1, "line_end": 3,
+                  "attributes": {"subject": "WS-CODE"},
+                  "children": [
+                      # the producer repeats the keyword it already consumed
+                      {"type": "WHEN", "text": "WHEN WHEN '01'",
+                       "line_start": 2, "line_end": 2, "attributes": {},
+                       "children": []},
+                      {"type": "WHEN", "text": "WHEN OTHER",
+                       "line_start": 3, "line_end": 3, "attributes": {},
+                       "children": []}]}]},
+        ])
+        arms = prog.paragraph("0000-MAIN")["statements"][0]["children"]
+        self.assertEqual(arms[0]["attributes"]["value"], "'01'")
+        self.assertEqual(arms[1]["attributes"]["value"], "OTHER")
+
+    def test_recovery_never_overwrites_what_the_ast_stated(self):
+        prog = self.ast([
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 1,
+             "statements": [
+                 {"type": "MOVE", "text": "MOVE 'IGNORED' TO WS-WRONG",
+                  "line_start": 1, "line_end": 1,
+                  "attributes": {"source": "'KEPT'", "targets": "WS-RIGHT"},
+                  "children": []}]},
+        ])
+        attrs = prog.paragraph("0000-MAIN")["statements"][0]["attributes"]
+        self.assertEqual(attrs["targets"], "WS-RIGHT")
+        self.assertEqual(attrs["source"], "'KEPT'")
+
+    def test_test_after_survives_adoption(self):
+        prog = self.ast([
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 2,
+             "statements": [
+                 self.stmt("PERFORM_THRU", target="1000-WORK",
+                           thru="1000-EXIT",
+                           condition="WITH TEST AFTER UNTIL WS-DONE = 'Y'")]},
+            {"name": "1000-WORK", "line_start": 3, "line_end": 3,
+             "statements": [self.stmt("EXIT")]},
+            {"name": "1000-EXIT", "line_start": 4, "line_end": 4,
+             "statements": [self.stmt("EXIT")]},
+        ])
+        attrs = prog.paragraph("0000-MAIN")["statements"][0]["attributes"]
+        self.assertTrue(attrs["test_after"])
+        self.assertEqual(attrs["condition"], "WS-DONE = 'Y'")
+
+
+class TestEvidenceWithoutADataDivision(unittest.TestCase):
+    """An AST with no data division still has conditions to harvest.
+
+    Everything keyed on a declared width reads as width 0 when the data
+    division is absent, which is indistinguishable from "not a field": the
+    evidence harvest dropped every variable in a 35k-line program and the
+    fuzzer had nothing to vary.
+    """
+
+    def ast(self, statements):
+        import json
+        handle = tempfile.NamedTemporaryFile("w", suffix=".ast", delete=False)
+        json.dump({"program_id": "T", "paragraphs": [
+            {"name": "0000-MAIN", "line_start": 1, "line_end": 9,
+             "statements": statements}]}, handle)
+        handle.close()
+        return cobol.load_program(handle.name)
+
+    def test_a_compared_literal_survives_an_unknown_width(self):
+        from frameladder import chain
+        prog = self.ast([
+            {"type": "IF", "text": "IF WS-CODE = '07'", "line_start": 1,
+             "line_end": 1, "attributes": {"condition": "WS-CODE = '07'"},
+             "children": []}])
+        index = chain._Index(prog)
+        self.assertFalse(index.declares_anything)
+        evidence = chain._guard_evidence(index, index.closure("0000-MAIN"))
+        self.assertIn("07", [str(v) for v in evidence.get("WS-CODE", [])])
+
+    def test_a_declared_program_still_filters_on_width(self):
+        from frameladder import chain
+        prog = program(HEADER + """       01 WS-CODE PIC X(2).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           IF WS-CODE = '07'
+               CONTINUE
+           END-IF.
+""")
+        index = chain._Index(prog)
+        self.assertTrue(index.declares_anything)
+        evidence = chain._guard_evidence(index, index.closure("0000-MAIN"))
+        self.assertIn("WS-CODE", evidence)
+
+
+class TestStepBudget(unittest.TestCase):
+    """The cap is a budget per program size, and says when it ended a run."""
+
+    LOOP = HEADER + """       01 WS-I PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-STEP 100000 TIMES
+           GOBACK.
+       1000-STEP.
+           ADD 1 TO WS-I.
+"""
+
+    def test_a_truncated_run_does_not_report_a_clean_goback(self):
+        interp = Interpreter(program(self.LOOP), {})
+        interp.max_steps = 10             # truncate deliberately
+        trace = interp.run("0000-MAIN")
+        self.assertTrue(trace.exhausted)
+        self.assertIn("step limit", trace.stopped)
+
+    def test_a_run_the_program_ended_is_not_marked_truncated(self):
+        trace = Interpreter(program(self.LOOP), {}).run("0000-MAIN")
+        self.assertFalse(trace.exhausted)
+        self.assertEqual(trace.stopped, "STOP RUN / GOBACK")
+
+    def test_a_small_program_keeps_the_flat_budget(self):
+        interp = Interpreter(program(self.LOOP), {})
+        self.assertEqual(interp.max_steps, interpreter.MAX_STEPS)
+
+    def test_the_budget_scales_with_statement_count(self):
+        body = "\n".join("           MOVE %d TO WS-I" % i
+                         for i in range(4000))
+        big = HEADER + """       01 WS-I PIC 9(4).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+""" + body + "\n           GOBACK.\n"
+        interp = Interpreter(program(big), {})
+        self.assertGreater(interp.max_steps, interpreter.MAX_STEPS)
+        self.assertFalse(Interpreter(program(big), {}).run("0000-MAIN")
+                         .exhausted)
+
+
+def bridge_module():
+    from frameladder import bridge
+    return bridge
+
+
+class TestGuardLog(unittest.TestCase):
+    """The guard log maintains its own set of distinct directions.
+
+    The runaway detector asks "has this run taken anything new lately" on
+    every paragraph entry; re-scanning the list each time would be
+    quadratic. Keeping the set in the container means every site that adds
+    an event maintains it, whichever method it uses.
+    """
+
+    def event(self, para, ordinal, result):
+        from frameladder.interpreter import GuardEvent
+        return GuardEvent(para, 1, "IF", "X = 1", result, {}, ordinal)
+
+    def test_append_and_extend_both_track_directions(self):
+        from frameladder.interpreter import _GuardLog
+        log = _GuardLog()
+        log.append(self.event("A", 0, True))
+        log.extend([self.event("A", 0, False), self.event("B", 1, True)])
+        self.assertEqual(len(log), 3)
+        self.assertEqual(len(log.directions), 3)
+
+    def test_the_same_direction_twice_is_one(self):
+        from frameladder.interpreter import _GuardLog
+        log = _GuardLog()
+        for _ in range(5):
+            log.append(self.event("A", 0, True))
+        self.assertEqual(len(log), 5)
+        self.assertEqual(len(log.directions), 1)
+
+
+class TestBridge(unittest.TestCase):
+    """Fuzz the current paragraph, feed its outputs to the next."""
+
+    SRC = HEADER + """       01 WS-IN       PIC X(2).
+       01 WS-CODE     PIC X(2).
+       01 WS-OTHER    PIC X(2).
+       01 WS-ELSEWHERE PIC X(2).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 1000-PRODUCE
+           PERFORM 2000-CONSUME
+           GOBACK.
+       1000-PRODUCE.
+           IF WS-IN = 'AA'
+               MOVE 'OK' TO WS-CODE
+           ELSE
+               MOVE 'NO' TO WS-CODE
+           END-IF.
+       2000-CONSUME.
+           IF WS-CODE = 'OK'
+               MOVE 'YY' TO WS-OTHER
+           END-IF
+           IF WS-ELSEWHERE = 'ZZ'
+               MOVE 'XX' TO WS-OTHER
+           END-IF.
+"""
+
+    def report(self, **kwargs):
+        from frameladder.bridge import run_bridge
+        prog = program(self.SRC)
+        merged = dict(runs=200, seed=7, budget=400)
+        merged.update(kwargs)
+        return run_bridge(prog, "1000-PRODUCE", "2000-CONSUME", **merged)
+
+    def test_a_produced_value_bridges_the_dependent_direction(self):
+        report = self.report()
+        rows = {tuple(r["goal"]): r for r in report["results"]}
+        hit = rows[("2000-CONSUME", 0, "IF", True)]
+        # WS-CODE = 'OK' exists in no entry state; only the producer's own
+        # observed output can satisfy the consumer's guard
+        self.assertEqual(hit["outcome"], "bridged")
+        self.assertEqual(hit["state"].get("WS-IN"), "AA")
+
+    def test_the_sweep_drives_both_sides_of_the_dependent_guard(self):
+        # one run per distinct output, each credited for whatever it takes:
+        # 'OK' drives the true side and 'NO' the false side, and neither
+        # needed a goal-directed search
+        report = self.report()
+        rows = {tuple(r["goal"]): r for r in report["results"]}
+        for direction in (True, False):
+            row = rows[("2000-CONSUME", 0, "IF", direction)]
+            self.assertEqual(row["outcome"], "bridged")
+            self.assertEqual(row["via"], "sweep")
+
+    def test_a_goal_the_producer_cannot_help_is_named(self):
+        # WS-ELSEWHERE is read by the consumer and written by nobody, so no
+        # output of the producer can put it anywhere: a named refusal, not
+        # a silent absence
+        report = self.report()
+        rows = {tuple(r["goal"]): r for r in report["results"]}
+        row = rows[("2000-CONSUME", 2, "IF", True)]
+        self.assertNotEqual(row["outcome"], "bridged")
+        self.assertIn(row["outcome"], ("independent-of-current",
+                                       "next-local-unsolvable",
+                                       "no-output-satisfies",
+                                       "candidates-refuted",
+                                       "budget-exhausted"))
+
+    def test_verified_bridges_become_chain_facts(self):
+        report = self.report()
+        facts = report["facts"]
+        self.assertTrue(any(f.get("WS-IN") == "AA"
+                            for f in facts["1000-PRODUCE"]))
+        self.assertTrue(any(f.get("WS-CODE") == "OK"
+                            for f in facts["2000-CONSUME"]))
+
+    def test_the_table_records_what_the_paragraph_writes(self):
+        report = self.report()
+        self.assertEqual(report["written_fields"], 1)   # WS-CODE, nothing else
+
+    def test_same_seed_same_report(self):
+        one, two = self.report(), self.report()
+        self.assertEqual(one["fuzz_rows"], two["fuzz_rows"])
+        self.assertEqual(one["distinct_signatures"],
+                         two["distinct_signatures"])
+        self.assertEqual([r["outcome"] for r in one["results"]],
+                         [r["outcome"] for r in two["results"]])
+
+    def test_no_model_still_bridges(self):
+        # the attribution arm: the sweep is model-free, so disabling the
+        # model must not cost the directions the table alone can drive
+        report = self.report(use_model=False)
+        self.assertEqual(report["model"], "disabled")
+        self.assertEqual(report["bridged_model"], 0)
+        self.assertGreaterEqual(report["bridged"], 2)
+
+    def test_consumer_literals_reach_the_producers_pools(self):
+        """The next paragraph's compared literals seed this one's fuzz.
+
+        A producer that moves an input straight through can only emit a
+        value the fuzzer actually tried at its input, so a literal only the
+        consumer compares against was previously unreachable by
+        construction. Measured worth +42% bridged directions on one pair.
+        """
+        from frameladder import bridge, chain
+        prog = program(self.SRC)
+        index = chain._Index(prog)
+        rng = __import__("random").Random(7)
+        producer = chain._guard_evidence(index,
+                                         index.closure("1000-PRODUCE"))
+        consumer = chain._guard_evidence(index,
+                                         index.closure("2000-CONSUME"))
+        plain = bridge._pools(index, producer, rng)
+        seeded = bridge._pools(index, producer, rng, downstream=consumer)
+        # 'OK' is compared only by the consumer; the producer never tests it
+        self.assertNotIn("OK", plain.get("WS-CODE", []))
+        self.assertIn("OK", seeded.get("WS-CODE", []))
+        # and nothing the producer already had is lost
+        for name, values in plain.items():
+            for value in values:
+                self.assertIn(value, seeded[name])
+
+    def test_seeding_is_reported_so_an_arm_is_attributable(self):
+        report = self.report(seed_from_consumer=True)
+        self.assertTrue(report["seeded_from_consumer"])
+        self.assertFalse(self.report()["seeded_from_consumer"])
+
+    def test_a_passed_deadline_stops_the_fuzz(self):
+        """Run count is a poor unit of cost: per-run time varies 30x across
+        closures, so a fixed count leaves slow paragraphs reporting nothing
+        at all.
+
+        Asserted against a deadline already in the past rather than a short
+        one: racing a real timeout against the novelty stall made this test
+        depend on which fired first, and on a fast machine the stall won.
+        """
+        import time as _time
+        from frameladder import bridge, chain
+        prog = program(self.SRC)
+        index = chain._Index(prog)
+        _graph, prov = __import__("frameladder.ladder", fromlist=["analyse"]
+                                  ).analyse(prog)
+        table = bridge.fuzz(prog, index, prov, "1000-PRODUCE",
+                            ["WS-CODE"], 10 ** 6, 7,
+                            deadline=_time.time() - 1)
+        self.assertEqual(table.rows, [])
+
+    def test_rows_are_capped_but_new_behaviour_always_kept(self):
+        """Memory has to track distinct behaviour, not run count: a row per
+        run, each holding the whole entry state, exhausted a 28GB machine
+        at twelve concurrent jobs."""
+        table = bridge_module().Table("P", ["WS-CODE"], cap=2)
+        for index in range(6):          # same signature every time
+            table.record({"WS-IN": "AA"}, {}, frozenset(), {"WS-CODE": "OK"})
+        self.assertEqual(len(table.rows), 2)
+        self.assertEqual(table.dropped, 4)
+        table.record({"WS-IN": "ZZ"}, {}, frozenset(), {"WS-CODE": "NO"})
+        self.assertEqual(len(table.rows), 3)   # new behaviour is never dropped
+
+    def test_a_row_stores_only_its_delta_from_the_base_state(self):
+        report = self.report(base_state={"WS-UNRELATED": "QQ"})
+        for fact in report["facts"]["1000-PRODUCE"]:
+            self.assertNotIn("WS-UNRELATED", fact)
+
+    def test_no_budget_means_no_timeout_flag(self):
+        self.assertFalse(self.report()["timed_out"])
+
+    def test_the_model_size_is_reported(self):
+        report = self.report(model_hidden=(32, 16))
+        self.assertIn("32x16", report["model"])
+
+    def test_a_dropped_goal_is_named_not_silently_lost(self):
+        """A cap that truncates without saying so reads, in the report,
+        exactly like a paragraph whose every direction was considered."""
+        from frameladder import bridge
+        prog = program(self.SRC)
+        original = bridge.MAX_GOALS
+        bridge.MAX_GOALS = 1
+        try:
+            report = bridge.run_bridge(prog, "1000-PRODUCE", "2000-CONSUME",
+                                       runs=80, budget=200)
+        finally:
+            bridge.MAX_GOALS = original
+        self.assertEqual(report["goals"], 1)
+        self.assertGreater(report["goals_beyond_cap"], 0)
+        self.assertEqual(report["refusals"].get("not-worked (goal cap)"),
+                         report["goals_beyond_cap"])
+        # and every dropped goal appears in the results, with a reason
+        named = [r for r in report["results"]
+                 if r["outcome"] == "not-worked (goal cap)"]
+        self.assertEqual(len(named), report["goals_beyond_cap"])
+
+    def test_a_covered_baseline_empties_the_work_list(self):
+        prog = program(self.SRC)
+        from frameladder.bridge import run_bridge
+        from frameladder.coverage import branches_of
+        covered = set()
+        for branch in branches_of(prog):
+            for direction in (True, False):
+                covered.add((branch.paragraph, branch.ordinal, branch.kind,
+                             direction))
+        report = run_bridge(prog, "1000-PRODUCE", "2000-CONSUME",
+                            baseline=covered, runs=50, budget=100)
+        self.assertEqual(report["goals"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
