@@ -42,6 +42,7 @@ field the source itself put in that channel.
 from __future__ import annotations
 
 import copy
+import os
 import re
 
 from .cobol import Program
@@ -51,6 +52,7 @@ from .coverage import branches_of
 from .interpreter import Interpreter
 from .ledger import Ledger, _freeze
 from .liveness import live_in
+
 
 MAX_DEPTH = 6           # producer hops per goal
 MAX_LOCAL_RUNS = 420    # interpreter runs per local solve
@@ -1451,6 +1453,89 @@ def _materialise(stub_fields) -> dict:
             for op, fields in stub_fields.items()}
 
 
+# ---------------------------------------------------------------------------
+# Per-delivery fault scheduling
+# ---------------------------------------------------------------------------
+#
+# Everything above stages an operation's outcome UNIFORMLY: every delivery
+# of the series carries the same fields. That expresses "every READ fails"
+# and "every READ succeeds", and nothing in between - but the error arms
+# behind the SECOND delivery of an operation (the re-read that fails after
+# the fetch succeeded) fire only under a *schedule*: success up to
+# delivery k, the failure code at k, success after. A uniform failure dies
+# at the first delivery's own handler, so those arms were unreachable by
+# construction, whatever the budget.
+
+SCHED_CODES = 3         # failure codes tried per status field
+
+
+def _sched_enabled() -> bool:
+    return os.environ.get("FRAMELADDER_STUB_SCHED", "1") != "0"
+
+
+def _delivered_counts(interp) -> dict:
+    """``{op_key: deliveries consumed}``, read off one finished run."""
+    out: dict = {}
+    for key, index in getattr(interp, "_delivered", {}) or {}:
+        if index + 1 > out.get(key, 0):
+            out[key] = index + 1
+    return out
+
+
+def _fault_codes(index, field, op_key, success) -> list:
+    """The platform family's failure codes for one status channel field,
+    most useful first, never the success value. Family membership is
+    exact (`faults.channel_of`), so a field only ever gets codes the
+    source itself put it in the channel for."""
+    from .faults import codes_for
+    return [code for code in codes_for(field, index.model, op_key)
+            if code != success][:SCHED_CODES]
+
+
+def _reschedule(plan, op, fail_fields, success_fields, k) -> dict:
+    """One materialised plan with ``op``'s delivery ``k`` alone carrying
+    the failure, every other delivery carrying the success values -
+    payload fields (a RECEIVE's screen bytes) arrive unchanged at every
+    delivery, exactly as the uniform base staged them."""
+    out = {o: [dict(entry, set=dict(entry.get("set") or {}))
+               for entry in entries]
+           for o, entries in (plan or {}).items()}
+    for i, entry in enumerate(out.get(op) or []):
+        entry["set"].update(fail_fields if i == k else success_fields)
+    return out
+
+
+def _goal_schedules(stubs, success_world, counts) -> list:
+    """``[(op, k, plan)]`` - a recipe's staged failure moved to one
+    delivery index at a time, the operation succeeding either side.
+
+    Which fields are "the failure" is read off the recipe itself: any
+    staged field the success world also stages, held at a different
+    value. Only operations a base run demonstrably delivered more than
+    once are rescheduled, one variant per observed index - so the
+    fan-out is bounded by the trace, not the series length - and k walks
+    DEEPEST FIRST, because k=0 is the near-uniform schedule whose arms
+    the uniform staging usually already witnessed.
+    """
+    out = []
+    for op, entries in (stubs or {}).items():
+        n = min(counts.get(op, 0), len(entries))
+        if n < 2:
+            continue        # one delivery: uniform already expresses it
+        success = (success_world or {}).get(op) or {}
+        staged: dict = {}
+        for entry in entries:
+            staged.update(entry.get("set") or {})
+        fail = {f: v for f, v in staged.items()
+                if f in success and v != success[f]}
+        if not fail:
+            continue
+        fixed = {f: success[f] for f in fail}
+        for k in range(n - 1, -1, -1):
+            out.append((op, k, _reschedule(stubs, op, fail, fixed, k)))
+    return out
+
+
 def solve(index, prov, goal, budget, memo, reentry_bases,
           sweep_cache, facts=(), cycle_fields=frozenset(), cycle_bases=(),
           success_world=None, valid_screen=None, pools=None) -> dict:
@@ -1735,6 +1820,13 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
             facts.setdefault(paragraph, []).append(fact)
             new_fact_count[0] += 1
 
+    # How many deliveries each operation has been seen to consume, a
+    # high-water mark over every credited run. The mark is what bounds
+    # per-delivery fault scheduling: a failing run undercounts (its own
+    # failure truncates the series), so the bound comes from the deepest
+    # run so far - typically the success-world cycle probe.
+    deliveries: dict = {}
+
     def run(state, world, stub_plan, terminals, source):
         key = (_freeze(state or {}), world, _freeze(stub_plan or {}),
                _freeze(terminals or {}))
@@ -1753,6 +1845,9 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
         donate(set(trace.entered) & fact_watch, interp)
         _donate_values(pools, trace)
         entered_paragraphs.update(trace.entered)
+        for op, count in _delivered_counts(interp).items():
+            if count > deliveries.get(op, 0):
+                deliveries[op] = count
         return trace
 
     have = set(baseline or ())
@@ -2045,6 +2140,39 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                 run(dict(extra_state), extra_world,
                     _materialise(probe_stubs) or None, None,
                     "chain:cycle-probe:final")
+            # Per-delivery fault scheduling over the finished background:
+            # for every status channel the background stages, put each of
+            # the family's failure codes at each delivery index the runs
+            # above actually consumed, success either side. This is the
+            # only construction that reaches an error arm behind the
+            # SECOND delivery of an operation - the re-read of the update
+            # cycle failing after the first fetch succeeded - which no
+            # uniform staging can express.
+            if _sched_enabled() and the_budget.left() > 0:
+                probe_stubs = {}
+                for world_map in (success_world, current):
+                    for o, fields in (world_map or {}).items():
+                        for f, v in fields.items():
+                            probe_stubs.setdefault(o, {}).setdefault(f, v)
+                base_plan = _materialise(probe_stubs)
+                for op, staged in probe_stubs.items():
+                    count = min(deliveries.get(op, 0), STUB_SERIES)
+                    if count < 2:
+                        continue   # one delivery: uniform expresses it
+                    channel_fields = (success_world or {}).get(op) or {}
+                    for field, success in staged.items():
+                        if field not in channel_fields:
+                            continue   # payload, not a status channel
+                        for code in _fault_codes(index, field, op,
+                                                 success):
+                            for k in range(count - 1, -1, -1):
+                                if the_budget.left() <= 0:
+                                    break
+                                run(dict(base_state), world,
+                                    _reschedule(base_plan, op,
+                                                {field: code}, {}, k),
+                                    None, "chain:sched:%s:%s:%d"
+                                    % (op, field, k))
         per_epoch.append({
             "epoch": 0, "witnessed_original": sum(
                 1 for g in original if g in ledger.witnesses),
@@ -2085,6 +2213,7 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
             deepest = -1
             for recipe in answer["recipes"]:
                 any_stubs = any_stubs or bool(recipe["stubs"])
+                recipe_best = (-1, None, None)   # depth, base, world
                 for base_state, world in recipe["bases"]:
                     state = dict(base_state)
                     state.update(recipe["pins"])
@@ -2100,9 +2229,39 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                         if depth > deepest:
                             deepest = depth
                             diverged_trace = trace
+                        if depth > recipe_best[0]:
+                            recipe_best = (depth, base_state, world)
                     if goal in ledger.witnesses:
                         landed = True
                         break
+                if not landed and recipe["stubs"] and _sched_enabled() \
+                        and recipe_best[1] is not None:
+                    # The uniform series said "every delivery fails" and
+                    # the replay still missed - which is exactly what a
+                    # failure handled by leaving does: it dies at the
+                    # FIRST delivery, and the deeper call this goal's arm
+                    # hangs off never happens. Reschedule the same
+                    # failure per delivery index, success either side,
+                    # over the base that got furthest.
+                    _depth, sched_base, sched_world = recipe_best
+                    for op, k, plan in _goal_schedules(
+                            recipe["stubs"], success_world, deliveries):
+                        if the_budget.left() <= 0:
+                            break
+                        state = dict(sched_base)
+                        state.update(recipe["pins"])
+                        trace = run(state, sched_world, plan, None,
+                                    "chain:sched:%s:%s:%s"
+                                    % (goal[0], goal[1], goal[3]))
+                        if trace is not None:
+                            depth = len({_direction_key(g)
+                                         for g in trace.guards})
+                            if depth > deepest:
+                                deepest = depth
+                                diverged_trace = trace
+                        if goal in ledger.witnesses:
+                            landed = True
+                            break
                 if landed:
                     break
             if landed:

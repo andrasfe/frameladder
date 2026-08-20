@@ -6081,6 +6081,116 @@ class TestBridge(unittest.TestCase):
         report = run_bridge(prog, "1000-PRODUCE", "2000-CONSUME",
                             baseline=covered, runs=50, budget=100)
         self.assertEqual(report["goals"], 0)
+class TestDeliverySchedules(unittest.TestCase):
+    """Per-delivery stub-fault scheduling (chain._goal_schedules).
+
+    A uniform outcome series can say "every READ fails" or "every READ
+    succeeds"; an error arm behind the SECOND delivery - the re-read
+    failing after the first fetch succeeded - fires only when the failure
+    is scheduled at one delivery index with success either side.
+    """
+
+    SRC = HEADER + """       01  WS-RC PIC S9(8) COMP VALUE 0.
+       01  WS-REC-A PIC X(10).
+       01  WS-REC-B PIC X(10).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           PERFORM 9100-READ-A
+           PERFORM 9200-READ-B
+           GOBACK.
+       9100-READ-A.
+           EXEC CICS READ DATASET('AFILE') INTO(WS-REC-A) RESP(WS-RC)
+           END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN OTHER
+                   GOBACK
+           END-EVALUATE
+           .
+       9200-READ-B.
+           EXEC CICS READ DATASET('BFILE') INTO(WS-REC-B) RESP(WS-RC)
+           END-EXEC
+           EVALUATE WS-RC
+               WHEN DFHRESP(NORMAL)
+                   CONTINUE
+               WHEN DFHRESP(NOTFND)
+                   CONTINUE
+               WHEN OTHER
+                   CONTINUE
+           END-EVALUATE
+           .
+"""
+
+    def test_schedules_place_the_failure_at_each_observed_index(self):
+        from frameladder import chain
+        stubs = {"EXEC:CICS:READ": [{"set": {"WS-RC": 13}}
+                                    for _n in range(chain.STUB_SERIES)]}
+        success_world = {"EXEC:CICS:READ": {"WS-RC": 0}}
+        variants = chain._goal_schedules(stubs, success_world,
+                                         {"EXEC:CICS:READ": 2})
+        self.assertEqual([(op, k) for op, k, _p in variants],
+                         [("EXEC:CICS:READ", 1), ("EXEC:CICS:READ", 0)])
+        _op, _k, plan = variants[0]         # the failure at delivery 1
+        series = [entry["set"]["WS-RC"]
+                  for entry in plan["EXEC:CICS:READ"]]
+        self.assertEqual(series[:2], [0, 13])
+        self.assertTrue(all(code == 0 for code in series[2:]))
+
+    def test_an_unobserved_or_single_delivery_op_is_not_rescheduled(self):
+        from frameladder import chain
+        stubs = {"EXEC:CICS:READ": [{"set": {"WS-RC": 13}}
+                                    for _n in range(chain.STUB_SERIES)]}
+        success_world = {"EXEC:CICS:READ": {"WS-RC": 0}}
+        self.assertEqual(chain._goal_schedules(stubs, success_world, {}),
+                         [])
+        self.assertEqual(chain._goal_schedules(
+            stubs, success_world, {"EXEC:CICS:READ": 1}), [])
+
+    def test_payload_fields_arrive_at_every_delivery(self):
+        # A record area filled by the operation is payload, not a status
+        # channel: rescheduling the RESP must not take the payload away
+        # from the success deliveries.
+        from frameladder import chain
+        stubs = {"EXEC:CICS:READ": [{"set": {"WS-RC": 13,
+                                             "WS-REC-B": "RECORD"}}
+                                    for _n in range(chain.STUB_SERIES)]}
+        success_world = {"EXEC:CICS:READ": {"WS-RC": 0}}
+        _op, k, plan = chain._goal_schedules(
+            stubs, success_world, {"EXEC:CICS:READ": 2})[0]
+        self.assertEqual(k, 1)
+        for entry in plan["EXEC:CICS:READ"]:
+            self.assertEqual(entry["set"]["WS-REC-B"], "RECORD")
+
+    def test_the_second_read_failure_arm_is_witnessed_from_entry(self):
+        # Uniform failure dies at 9100-READ-A's own OTHER arm (GOBACK),
+        # so 9200-READ-B's NOTFND arm needs delivery 0 to succeed and
+        # delivery 1 to fail - only the schedule expresses it.
+        from frameladder import chain
+        prog = program(self.SRC)
+        report = chain.run_chain(prog, budget=4000)
+        ledger = report["ledger"]
+        key = ("9200-READ-B", 4, "WHEN", True)   # the NOTFND arm
+        self.assertIn(key, ledger.witnesses)
+        # and the witness replays from its stored recipe alone
+        from frameladder.conformance_defaults import io_defaults
+        payload = ledger.witnesses[key].payload()
+        interp = Interpreter(prog, dict(payload["input_state"]),
+                             stubs=payload["stubs"] or None,
+                             terminals=payload["terminals"] or None,
+                             defaults=io_defaults(prog, payload["world"]))
+        trace = interp.run("0000-MAIN")
+        self.assertIn(key, {chain._direction_key(g) for g in trace.guards})
+
+    def test_scheduling_is_off_under_the_control_gate(self):
+        import os
+        from frameladder import chain
+        os.environ["FRAMELADDER_STUB_SCHED"] = "0"
+        try:
+            self.assertFalse(chain._sched_enabled())
+        finally:
+            del os.environ["FRAMELADDER_STUB_SCHED"]
+        self.assertTrue(chain._sched_enabled())
 
 
 if __name__ == "__main__":
