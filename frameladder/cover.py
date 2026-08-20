@@ -47,15 +47,19 @@ from .conditions import condition_atoms
 from .conformance_defaults import WORLDS, io_defaults
 from .interpreter import Interpreter
 from .ledger import Ledger, _freeze
-from .chain import (_Budget, _Index, _cycle_bases, _cycle_fields,
-                    _direction_key, _materialise, _screen_variants,
-                    _spoil_family, _statements, _success_world,
-                    _valid_screen)
+from .chain import (MAX_VALUES, _Budget, _Index, _cycle_bases,
+                    _cycle_fields, _direction_key, _materialise,
+                    _screen_variants, _spoil_family, _statements,
+                    _success_world, _valid_screen)
 
 MIN_ARMS = 8            # WHEN arms before an EVALUATE counts as a chain
 MAX_ROUNDS_EXTRA = 16   # repair rounds past one-per-block
-MAX_CANDIDATES = 8      # values tried per field per repair round
-MAX_TRIALS_PER_ROUND = 160
+# Values tried per field per repair round: the chain's sweep cap, so a
+# field whose accepting set is wide (a message pool, an attention-key
+# enumeration) is fully sweepable here exactly when it is there. The
+# trials ceiling scales with it - it was 160 at the old cap of 8.
+MAX_CANDIDATES = MAX_VALUES
+MAX_TRIALS_PER_ROUND = 20 * MAX_CANDIDATES
 DEPTH_SLACK = 12        # direction-count collapse that voids an adoption
 SWEEP_KINDS_PER_ROUND = 2   # spoil kinds per field on interim harvests
 
