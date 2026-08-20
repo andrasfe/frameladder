@@ -54,10 +54,27 @@ from .ledger import Ledger, _freeze
 from .liveness import live_in
 
 
+def _cap(name: str, default: int) -> int:
+    """An integer cap, env-overridable so a control run can reproduce an
+    older bound exactly."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
 MAX_DEPTH = 6           # producer hops per goal
 MAX_LOCAL_RUNS = 420    # interpreter runs per local solve
 MAX_PRODUCER_RUNS = 220 # interpreter runs per output-constrained solve
-MAX_VALUES = 8          # candidate values per variable
+# Candidate values per variable. The old cap of 8 left wide shared slots
+# - a return-message pool of 9-14 tested literals, an attention-key set
+# of 18 - only ever part-swept, so every direction gated on a value past
+# the cap was unreachable by construction; 20 admits every pool the
+# COACTUPC residual census observed. FRAMELADDER_SWEEP_CAP=8 restores
+# the old bound for a control run.
+MAX_VALUES = _cap("FRAMELADDER_SWEEP_CAP", 20)
+REPAIR_VALUES = max(5, MAX_VALUES * 5 // 8)  # window-repair candidates
+                                             # per field (5 at cap 8)
 MAX_VARIABLES = 24      # variables swept per closure
 MAX_SPOILS = 40         # mixed-construction variants per closure
 STUB_SERIES = 6         # deliveries staged per operation, one per call
@@ -997,7 +1014,7 @@ class _Budget:
         return max(0, self.total - self.spent)
 
 
-MAX_POOLED = 12         # in-flight values kept per variable
+MAX_POOLED = max(12, MAX_VALUES)   # in-flight values kept per variable
 WIDTH1_CAP = 260        # exhaustive byte-enumeration runs per closure
 WIDTH1_RESERVE = 1500   # budget floor below which the lever stays off
 
@@ -2073,7 +2090,7 @@ def run_chain(program, goals=None, budget=8000, baseline=None,
                     scored = []
                     for candidate in [v for v in union.get(field, ())
                                       if isinstance(v, str)
-                                      and v != held][:5]:
+                                      and v != held][:REPAIR_VALUES]:
                         if the_budget.left() <= 0:
                             break
                         trial = {o: dict(f) for o, f in current.items()}

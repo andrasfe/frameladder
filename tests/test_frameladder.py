@@ -6193,5 +6193,46 @@ class TestDeliverySchedules(unittest.TestCase):
         self.assertTrue(chain._sched_enabled())
 
 
+class TestSweepCaps(unittest.TestCase):
+    """Wide shared slots are fully sweepable: the candidate caps admit at
+    least 20 values per slot (a return-message pool of 9-14, an
+    attention-key set of 18 all fit), and the dependent trial ceiling
+    scales with them."""
+
+    def test_chain_cap_admits_twenty_values(self):
+        from frameladder import chain
+        self.assertGreaterEqual(chain.MAX_VALUES, 20)
+        self.assertGreaterEqual(chain.MAX_POOLED, chain.MAX_VALUES)
+
+    def test_cover_caps_admit_twenty_candidates(self):
+        from frameladder import cover
+        self.assertGreaterEqual(cover.MAX_CANDIDATES, 20)
+        self.assertEqual(cover.MAX_TRIALS_PER_ROUND,
+                         20 * cover.MAX_CANDIDATES)
+
+    def test_wide_evidence_survives_the_guard_harvest(self):
+        # 12 tested literals on one field: with the old cap of 8 the
+        # harvest kept only the tail and the first literals' directions
+        # were unreachable by construction.
+        from frameladder import chain
+        whens = "\n".join(
+            "               WHEN '%02d'\n                   CONTINUE"
+            % n for n in range(12))
+        src = HEADER + """       01  WS-K PIC X(2).
+       PROCEDURE DIVISION.
+       0000-MAIN.
+           EVALUATE WS-K
+""" + whens + """
+           END-EVALUATE
+           GOBACK.
+"""
+        prog = program(src)
+        index = chain._Index(prog)
+        evidence = chain._guard_evidence(index, ("0000-MAIN",))
+        values = [v for v in evidence.get("WS-K", ())
+                  if isinstance(v, str) and v.isdigit()]
+        self.assertGreaterEqual(len(values), 12)
+
+
 if __name__ == "__main__":
     unittest.main()
